@@ -493,8 +493,30 @@ fn build_inner(
             on,
             filter,
         } => {
-            if filter.is_some() {
-                return Err(BuildError::Unsupported("non-equi join condition".into()));
+            // `Left`/`Right`/`Full` need the residual to survive a failed
+            // pair as an unmatched, NULL-extended row rather than drop it —
+            // `HashJoin` has no path for that (see its module docs' own
+            // "Residual filter" section), so this is refused here, by name,
+            // rather than built into something that runs and returns wrong
+            // rows. `Inner`/`Cross`/`LeftSemi`/`LeftAnti` are the kinds
+            // `basin-plan`'s decorrelation of `EXISTS`/`IN` actually
+            // produces a residual for (`opt/decorrelate.rs`'s transforms
+            // 1-3); an outer join carrying one would have to come from a
+            // hand-written `ON`-clause residual on an explicit outer join,
+            // which is real SQL but not the case this task exists for.
+            if filter.is_some()
+                && matches!(
+                    kind,
+                    basin_plan::JoinKind::Left
+                        | basin_plan::JoinKind::Right
+                        | basin_plan::JoinKind::Full
+                )
+            {
+                return Err(BuildError::Unsupported(format!(
+                    "{kind:?} join with a non-equi residual condition — a pair that fails the \
+                     residual must survive as an unmatched, NULL-extended row, and there is no \
+                     physical operator that implements that today"
+                )));
             }
             let l = build_inner(left, tables, dml, budget, ctes, outer)?;
             let r = build_inner(right, tables, dml, budget, ctes, outer)?;
@@ -506,7 +528,27 @@ fn build_inner(
                 lk.push(column_index(&a).ok_or(BuildError::NonColumnKey("join"))?);
                 rk.push(column_index(&b).ok_or(BuildError::NonColumnKey("join"))?);
             }
-            Ok(Box::new(HashJoin::new(l, r, *kind, lk, rk, budget)?))
+            // `filter` mixes relation-0 (left, sometimes flat over
+            // left++right — see `join.rs`'s `flatten_filter`) and
+            // relation-1 (right, decorrelation's own convention) column
+            // refs; `bind_outer` only ever substitutes `relation ==
+            // OUTER_REF` (1) columns when this join sits inside a LATERAL's
+            // per-row closure (`outer` is `Some`). A decorrelated filter's
+            // own relation-1 tags are a different thing entirely (the
+            // join's own right side, not the enclosing LATERAL row) that
+            // happens to reuse the same tag value — see `on`'s existing
+            // `bind_outer(b, ...)` call just above, which has carried this
+            // same ambiguity for `on`'s right-hand pairs since before this
+            // change. Not resolved here — this join arm is not the place to
+            // fix a relation-tag collision that predates it — but real: a
+            // decorrelated Semi/Anti nested inside a LATERAL would mis-bind.
+            let filter = filter
+                .as_ref()
+                .map(|f| bind_outer(f, outer, tables, dml, budget, ctes))
+                .transpose()?;
+            Ok(Box::new(HashJoin::with_filter(
+                l, r, *kind, lk, rk, filter, budget,
+            )?))
         }
 
         // `LATERAL` — the inner side is rebuilt fresh per outer row via a

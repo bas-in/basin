@@ -46,18 +46,257 @@
 //! `sort_reports_out_of_memory_past_its_budget` in `sort.rs` for the sibling
 //! operator this mirrors. As with [`crate::sort::Sort`], there is no disk
 //! spill; exceeding budget fails clean with [`ExecError::OutOfMemory`].
+//!
+//! # Residual filter
+//!
+//! `on` is only ever equality — a hash table cannot test anything else — so
+//! any other conjunct in the original condition (`a.x = b.y AND b.z > 5`)
+//! rides along separately as `filter`, evaluated over the *concatenated*
+//! left++right row (`eval::eval` addresses it as one flat batch: the
+//! constructor rewrites any `relation == 1` column in `filter` to a flat
+//! index — `left_schema.len() + index` — before storing it, so this module
+//! never has to special-case a per-side tag at evaluation time; see
+//! `flatten_filter`'s doc comment for why `relation == 1` shows up in
+//! `filter` at all).
+//!
+//! Three-valued like every other SQL predicate — a NULL residual excludes
+//! the pair, exactly like `WHERE` (`project.rs`'s `Filter` module docs cover
+//! the same rule; this does not reinvent it, `eval_residual_mask` below just
+//! applies it by hand instead of going through `filter_record_batch`, since
+//! semi/anti needs to inspect the mask rather than use it to filter rows).
+//!
+//! **Getting the kind wrong here does not error — it returns the wrong
+//! rows**, silently:
+//!
+//! - `Inner`/`Cross`: the residual is a plain post-join predicate — evaluate
+//!   it over the already-built output batch and keep only the TRUE rows,
+//!   same as [`crate::project::Filter`] would if it sat above the join.
+//! - `LeftSemi`/`LeftAnti`: the residual is part of the *match test*, not an
+//!   output filter. A left row is semi-matched only if some right row both
+//!   shares its key AND passes the residual; anti is the negation of that
+//!   combined test, not "no key match" alone. Filtering semi/anti's output
+//!   *after* the fact cannot express this at all — semi/anti's output never
+//!   carries the right-side columns the residual needs, and anti's rows are
+//!   exactly the ones that would fail such a filter, which would delete the
+//!   rows anti exists to keep.
+//! - `Left`/`Right`/`Full`: the residual is part of the join condition
+//!   itself. A pair that fails it does not vanish — the row survives as
+//!   unmatched, NULL-extended on the other side, same as a pair that never
+//!   shared a key at all. Filtering the output afterwards would instead
+//!   *delete* that row, which is not what an outer join with an `ON`-clause
+//!   residual means. **Not implemented** — see `build.rs`'s join arm, which
+//!   refuses these by name rather than let this module guess.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
+use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::row::{OwnedRow, RowConverter, SortField};
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 use arrow_select::take::take;
-use basin_plan::JoinKind;
+use basin_plan::{ColumnRef, Expr, JoinKind};
 
+use crate::eval;
 use crate::operator::{ExecError, Operator};
+
+/// Rewrite `filter` so every column it reads is a flat index into the
+/// concatenated left++right row, ready for direct use with `eval::eval`.
+///
+/// `Join::filter` reaches this module in one of two shapes depending on
+/// which pass produced it (see `basin-plan`'s `opt/decorrelate.rs` and
+/// `opt/projection.rs`'s "BOTH conventions are live in this codebase and
+/// both must work" comment on its own `Join` handling — this function is
+/// `basin-exec`'s side of the same fact):
+///
+/// - An ordinary multi-table `WHERE` clause (`lower/select.rs`) lowers the
+///   whole `FROM` scope as one flat relation before a `Join` node ever
+///   splits it, and the leftover (non-equijoin) conjuncts are never
+///   rebased — so a right-side column already carries `relation: 0` with
+///   `index >= left_len`, i.e. already the flat index this module needs.
+/// - A decorrelated `EXISTS`/`IN` (`opt/decorrelate.rs`'s
+///   `split_join_conjuncts`) tags each side the way `Join::on` always has —
+///   `relation: 0` for the join's own left, 0-based; `relation: 1` for its
+///   right, *also* 0-based, per `ColumnRef::relation`'s doc comment ("0/1
+///   for the sides of a join"). That right-side index needs `left_len`
+///   added before it means anything against a concatenated batch.
+///
+/// One rewrite handles both without telling them apart: a `relation == 0`
+/// column's index is left untouched (correct for a shape-A left OR
+/// right-side reference, and for a shape-B left reference — all three are
+/// already the correct flat/left-relative index), and a `relation == 1`
+/// column gets `left_len` added (shape B's right-side reference; shape A
+/// never produces `relation == 1` in `filter` at all, so this arm is
+/// unreachable for it). See this module's own tests
+/// (`flatten_filter_leaves_a_flat_relation_zero_index_alone` and
+/// `flatten_filter_offsets_a_relation_one_index_by_left_len`) for the two
+/// cases nailed down independently of the rest of this file.
+fn flatten_filter(filter: &Expr, left_len: usize) -> Expr {
+    walk(filter, left_len)
+}
+
+/// The actual rewrite. `Expr` has no generic rewrite helper — only the
+/// read-only, non-rebuilding `for_each_child` — so this mirrors the
+/// exhaustive-match shape `build.rs`'s `bind_outer_rec` already uses for the
+/// same reason (a `match` that must name every variant to compile is the
+/// safety net here: an `Expr` shape added later and left off this list is a
+/// compile error, not a column that silently stops getting flattened).
+/// Unlike `bind_outer_rec`, this never touches a nested `Subquery`'s own
+/// `subplan` — same rule for the same reason: a subquery's body is a
+/// separate scope with its own relation-0/1 meaning, not part of this
+/// join's concatenated row.
+fn walk(e: &Expr, left_len: usize) -> Expr {
+    let b = |e: &Expr| Box::new(walk(e, left_len));
+    let v = |es: &[Expr]| es.iter().map(|e| walk(e, left_len)).collect::<Vec<_>>();
+    let ob = |o: &Option<Box<Expr>>| o.as_deref().map(b);
+    match e {
+        Expr::Column(c) if c.relation == 1 => Expr::Column(ColumnRef {
+            relation: 0,
+            index: c.index + left_len as u16,
+            name: c.name.clone(),
+        }),
+        Expr::Column(_) | Expr::Literal(..) | Expr::Parameter { .. } => e.clone(),
+        Expr::Unary { op, arg } => Expr::Unary {
+            op: *op,
+            arg: b(arg),
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: b(lhs),
+            rhs: b(rhs),
+        },
+        Expr::Cast { arg, to, kind } => Expr::Cast {
+            arg: b(arg),
+            to: *to,
+            kind: *kind,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: ob(operand),
+            whens: whens
+                .iter()
+                .map(|(w, t)| (walk(w, left_len), walk(t, left_len)))
+                .collect(),
+            else_: ob(else_),
+        },
+        Expr::Coalesce(xs) => Expr::Coalesce(v(xs)),
+        Expr::IsNull { arg, negated } => Expr::IsNull {
+            arg: b(arg),
+            negated: *negated,
+        },
+        Expr::BoolTest { arg, test } => Expr::BoolTest {
+            arg: b(arg),
+            test: *test,
+        },
+        Expr::DistinctFrom { lhs, rhs, negated } => Expr::DistinctFrom {
+            lhs: b(lhs),
+            rhs: b(rhs),
+            negated: *negated,
+        },
+        Expr::InList { arg, list, negated } => Expr::InList {
+            arg: b(arg),
+            list: v(list),
+            negated: *negated,
+        },
+        Expr::Between {
+            arg,
+            low,
+            high,
+            symmetric,
+            negated,
+        } => Expr::Between {
+            arg: b(arg),
+            low: b(low),
+            high: b(high),
+            symmetric: *symmetric,
+            negated: *negated,
+        },
+        Expr::Like {
+            arg,
+            pattern,
+            escape,
+            case_insensitive,
+            negated,
+        } => Expr::Like {
+            arg: b(arg),
+            pattern: b(pattern),
+            escape: ob(escape),
+            case_insensitive: *case_insensitive,
+            negated: *negated,
+        },
+        Expr::ScalarFn { func, args } => Expr::ScalarFn {
+            func: *func,
+            args: v(args),
+        },
+        Expr::Aggregate {
+            func,
+            args,
+            distinct,
+            filter,
+            order_by,
+        } => Expr::Aggregate {
+            func: *func,
+            args: v(args),
+            distinct: *distinct,
+            filter: ob(filter),
+            order_by: order_by.clone(),
+        },
+        Expr::Window {
+            func,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        } => Expr::Window {
+            func: *func,
+            args: v(args),
+            partition_by: v(partition_by),
+            order_by: order_by.clone(),
+            frame: frame.clone(),
+        },
+        Expr::SetReturning { func, args } => Expr::SetReturning {
+            func: *func,
+            args: v(args),
+        },
+        // Left entirely untouched: `subplan` is a separate query level with
+        // its own relation-0/1 meaning (same rule `bind_outer_rec` follows),
+        // and `operand` — the one part that does belong to this level — is
+        // recursed into like everything else.
+        Expr::Subquery {
+            kind,
+            subplan,
+            operand,
+        } => Expr::Subquery {
+            kind: *kind,
+            subplan: subplan.clone(),
+            operand: ob(operand),
+        },
+        Expr::ArrayLit(xs) => Expr::ArrayLit(v(xs)),
+        Expr::RowLit(xs) => Expr::RowLit(v(xs)),
+        Expr::Subscript { arg, indices } => Expr::Subscript {
+            arg: b(arg),
+            indices: indices
+                .iter()
+                .map(|s| match s {
+                    basin_plan::Subscript::Index(e) => {
+                        basin_plan::Subscript::Index(walk(e, left_len))
+                    }
+                    basin_plan::Subscript::Slice { lower, upper } => basin_plan::Subscript::Slice {
+                        lower: lower.as_ref().map(|e| walk(e, left_len)),
+                        upper: upper.as_ref().map(|e| walk(e, left_len)),
+                    },
+                })
+                .collect(),
+        },
+        Expr::FieldSelect { arg, field } => Expr::FieldSelect {
+            arg: b(arg),
+            field: *field,
+        },
+    }
+}
 
 fn arrow_err(e: ArrowError) -> ExecError {
     ExecError::Internal(e.to_string())
@@ -178,6 +417,19 @@ pub struct HashJoin {
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     row_converter: RowConverter,
+    /// The residual (non-equijoin) condition, already flattened by
+    /// [`flatten_filter`] so every column is a direct index into the
+    /// concatenated left++right row — see the module docs' "Residual
+    /// filter" section for what this means per join kind. `None` for the
+    /// overwhelming majority of joins, which have no residual at all.
+    filter: Option<Expr>,
+    /// left_schema ++ right_schema, unmodified nullability. Only built (and
+    /// only used) when `filter.is_some()` and `kind` is `LeftSemi`/
+    /// `LeftAnti` — those need a real left++right batch to evaluate the
+    /// residual against even though the join's own *output* schema
+    /// (`schema` above) is left-only. `Inner`/`Cross` reuse `schema`
+    /// directly instead, since for them `schema` already *is* left++right.
+    filter_schema: SchemaRef,
 
     phase: Phase,
     right_bytes: usize,
@@ -217,6 +469,40 @@ impl HashJoin {
         right_keys: Vec<usize>,
         memory_budget: usize,
     ) -> Result<Self, ExecError> {
+        Self::with_filter(
+            left,
+            right,
+            kind,
+            left_keys,
+            right_keys,
+            None,
+            memory_budget,
+        )
+    }
+
+    /// Same as [`Self::new`], plus a residual `filter` — see the module's
+    /// "Residual filter" docs for the concatenated-row semantics and how
+    /// they differ by `kind`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Internal`] if `filter.is_some()` and `kind` is
+    /// `Left`/`Right`/`Full` — an outer join's residual has to survive a
+    /// failed pair as an unmatched (NULL-extended) row rather than drop it,
+    /// which this operator does not implement (see the module docs). This
+    /// is a defence-in-depth check, not the primary guard: `build.rs`'s
+    /// join arm is expected to refuse these by name, with a message a user
+    /// can act on, before ever constructing a `HashJoin`. Reaching this
+    /// error means that guard was skipped — a planner bug, not user error.
+    pub fn with_filter(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        kind: JoinKind,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        filter: Option<Expr>,
+        memory_budget: usize,
+    ) -> Result<Self, ExecError> {
         let left_schema = left.schema();
         let right_schema = right.schema();
         let schema = join_output_schema(&left_schema, &right_schema, kind);
@@ -241,12 +527,32 @@ impl HashJoin {
             }
         }
 
+        if filter.is_some() && matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full) {
+            return Err(ExecError::Internal(format!(
+                "HashJoin: a residual filter on a {kind:?} join is not implemented — a failed \
+                 pair must survive as an unmatched, NULL-extended row rather than be dropped, \
+                 and this operator has no path for that. build.rs's join arm is expected to \
+                 refuse this before construction; reaching here means it did not."
+            )));
+        }
+
         let key_fields: Vec<SortField> = right_keys
             .iter()
             .map(|&i| SortField::new(right_schema.field(i).data_type().clone()))
             .collect();
         let row_converter =
             RowConverter::new(key_fields).expect("join key columns support row encoding");
+
+        let filter = filter.map(|f| flatten_filter(&f, left_schema.fields().len()));
+        let filter_schema = {
+            let mut fields: Vec<Field> = left_schema
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
+            fields.extend(right_schema.fields().iter().map(|f| f.as_ref().clone()));
+            Arc::new(Schema::new(fields))
+        };
 
         Ok(Self {
             left,
@@ -259,6 +565,8 @@ impl HashJoin {
             left_schema,
             right_schema,
             row_converter,
+            filter,
+            filter_schema,
             phase: Phase::Building,
             right_bytes: 0,
             right_batches: Vec::new(),
@@ -337,6 +645,74 @@ impl HashJoin {
         self.hash_table.get(key).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Evaluate `filter` (already flattened by [`flatten_filter`] — every
+    /// column is a direct index into `batch`) and return the resulting
+    /// mask. Downcast failure is a planner bug, not user error: `filter` is
+    /// only ever produced from a boolean-typed predicate.
+    fn eval_filter(&self, filter: &Expr, batch: &RecordBatch) -> Result<BooleanArray, ExecError> {
+        let array = eval::eval(filter, batch)?;
+        let bools = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                ExecError::TypeMismatch(format!(
+                    "join residual filter must evaluate to boolean, got {:?} — a planner bug, not \
+                 user error",
+                    array.data_type()
+                ))
+            })?;
+        Ok(bools.clone())
+    }
+
+    /// `Inner`/`Cross` only: apply `self.filter` as a plain post-join
+    /// predicate over `batch` (already shaped left++right, since that is
+    /// `self.schema` for both these kinds — see `join_output_schema`). A
+    /// no-op when there is no filter, which is every `Left`/`Right`/`Full`
+    /// call site that (harmlessly) routes through this same helper, since
+    /// the constructor refuses to pair a filter with those kinds at all.
+    fn apply_residual_filter(&self, batch: RecordBatch) -> Result<RecordBatch, ExecError> {
+        let Some(filter) = &self.filter else {
+            return Ok(batch);
+        };
+        let mask = self.eval_filter(filter, &batch)?;
+        // `filter_record_batch` treats a null mask entry as false — the
+        // same three-valued "NULL excludes the row" rule `WHERE` uses (see
+        // `project.rs`'s `Filter` module docs; this mirrors it rather than
+        // reimplementing it).
+        filter_record_batch(&batch, &mask).map_err(arrow_err)
+    }
+
+    /// `LeftSemi`/`LeftAnti` only, when a residual filter is present:
+    /// whether `left_row` has at least one right-side row, among
+    /// `right_rows` (already known to share the join key), that ALSO
+    /// passes the residual. One small left++right candidate batch per left
+    /// row rather than one batch-wide evaluation, because the residual can
+    /// only be evaluated once a *specific pair* is known — Inner's
+    /// "evaluate once over the whole matched batch" approach does not apply
+    /// here, since semi/anti's own output never carries the right-side
+    /// columns the residual reads.
+    fn residual_passes_any(
+        &self,
+        filter: &Expr,
+        left_batch: &RecordBatch,
+        left_row: u32,
+        right_rows: &[u32],
+    ) -> Result<bool, ExecError> {
+        let left_idx = UInt32Array::from(vec![left_row; right_rows.len()]);
+        let right_idx = UInt32Array::from(right_rows.to_vec());
+        let mut cols = take_by_indices(left_batch, &left_idx)?;
+        cols.extend(take_by_indices(self.right_table(), &right_idx)?);
+        let candidate =
+            RecordBatch::try_new(Arc::clone(&self.filter_schema), cols).map_err(arrow_err)?;
+        let mask = self.eval_filter(filter, &candidate)?;
+        // A NULL residual for one candidate right row must not stop a
+        // DIFFERENT right row from deciding the answer — so this reads as
+        // "is there any candidate whose mask entry is definitely TRUE",
+        // exactly `WHERE`'s three-valued rule (NULL and FALSE both count as
+        // "does not pass") applied per candidate rather than to filter rows.
+        Ok(mask.iter().any(|v| v == Some(true)))
+    }
+
     /// Process one left (probe) batch under an equijoin kind (everything but
     /// `Cross`). Returns the output batch for this input batch, which may be
     /// empty (e.g. an `Inner` join batch where nothing matched).
@@ -355,7 +731,19 @@ impl HashJoin {
             let mut left_idx: Vec<u32> = Vec::new();
             for (j, &key_is_null) in mask.iter().enumerate() {
                 let key = rows.row(j).owned();
-                let has_match = !self.probe_matches(key_is_null, &key).is_empty();
+                let key_matches = self.probe_matches(key_is_null, &key);
+                // A residual, when present, is part of the MATCH TEST, not
+                // an output filter — a left row is semi-matched only if
+                // some key-matching right row also passes it (see the
+                // module docs' "Residual filter" section for why filtering
+                // the output afterwards is a different, wrong, query).
+                let has_match = if key_matches.is_empty() {
+                    false
+                } else if let Some(filter) = &self.filter {
+                    self.residual_passes_any(filter, left_batch, j as u32, key_matches)?
+                } else {
+                    true
+                };
                 let emit = match self.kind {
                     JoinKind::LeftSemi => has_match,
                     JoinKind::LeftAnti => !has_match,
@@ -403,7 +791,13 @@ impl HashJoin {
             }
         }
 
-        self.combine_left_right(left_batch, &left_idx, &right_idx)
+        // Inner is the one equijoin kind a residual can attach to here (see
+        // the constructor's guard: `Left`/`Right`/`Full` never carry one).
+        // For Inner the residual is a plain post-join predicate — apply it
+        // to the whole matched batch, same as a `Filter` sitting above the
+        // join would. A no-op for Left/Right/Full, where `self.filter` is
+        // always `None`.
+        self.apply_residual_filter(self.combine_left_right(left_batch, &left_idx, &right_idx)?)
     }
 
     /// One left batch's worth of `Cross` output: every left row paired with
@@ -426,7 +820,13 @@ impl HashJoin {
         let right_idx = UInt32Array::from(right_idx);
         let mut cols = take_by_indices(left_batch, &left_idx)?;
         cols.extend(take_by_indices(self.right_table(), &right_idx)?);
-        RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)
+        let out = RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)?;
+        // In practice `basin-plan` always relabels a `Cross` carrying a
+        // condition to `Inner` before it reaches this builder (see
+        // `lower/select.rs`), so `self.filter` is `None` here today — this
+        // is a no-op call, kept for symmetry with the Inner path above
+        // rather than because it is currently exercised.
+        self.apply_residual_filter(out)
     }
 
     fn combine_left_right(
@@ -517,6 +917,8 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field};
+    use basin_pgtype::Oid;
+    use basin_plan::OpId;
     use std::collections::VecDeque;
 
     /// A child operator that replays a fixed list of batches, one per
@@ -1229,5 +1631,333 @@ mod tests {
         assert_eq!(out.num_rows(), 1);
         assert_eq!(col_i32(&out, 1), vec![Some(2)]);
         assert_eq!(col_i32(&out, 3), vec![Some(20)]);
+    }
+
+    // ─── Residual filter ────────────────────────────────────────────────
+    //
+    // Shapes and expected rows verified against a live PostgreSQL 18.2
+    // before writing any of this: `l(lk,lv)` = (1,10),(2,20),(3,30);
+    // `r(rk,rv)` = (1,100),(1,200),(2,5),(2,999); residual `r.rv < l.lv`.
+    //
+    //   key=1: both right rows fail (100<10, 200<10 both false) — the
+    //          right rows exist but neither passes.
+    //   key=2: one right row passes (5<20), one fails (999<20).
+    //   key=3: no right row shares the key at all.
+    //
+    // Postgres:
+    //   INNER ................ only (lk=2, rv=5)
+    //   SEMI  (EXISTS) ....... only lk=2
+    //   ANTI  (NOT EXISTS) ... lk=1 and lk=3
+    //
+    // A NULL residual (`r.rv` itself NULL) behaves like FALSE everywhere —
+    // also checked against the live server, in
+    // `null_residual_is_treated_as_not_passing`.
+    //
+    // These build `filter` with `relation: 1` on the right-side column —
+    // the shape `opt/decorrelate.rs`'s `split_join_conjuncts` actually
+    // produces for a decorrelated `EXISTS`/`IN` (see
+    // `a_non_equality_correlation_stays_in_filter_not_on` in that module),
+    // which is the shape this module's `flatten_filter` exists to handle —
+    // rather than the already-flat `relation: 0` shape an ordinary `WHERE`
+    // clause produces, so a broken `flatten_filter` is exercised, not
+    // sidestepped.
+
+    fn rel_col(relation: u16, index: u16, name: &str) -> Expr {
+        Expr::Column(ColumnRef {
+            relation,
+            index,
+            name: name.to_string(),
+        })
+    }
+
+    fn op(oid_val: u32) -> OpId {
+        OpId(Oid(oid_val))
+    }
+
+    /// `r.rv < l.lv`, addressed the way a decorrelated join's `filter`
+    /// actually is: `relation: 0` for the join's own left (`l`, 0-based),
+    /// `relation: 1` for its right (`r`, ALSO 0-based — not yet offset by
+    /// `left_len`, which is exactly what `flatten_filter` must do before
+    /// this is usable against a concatenated batch).
+    fn rv_lt_lv() -> Expr {
+        Expr::Binary {
+            op: op(97),                         // int4 <
+            lhs: Box::new(rel_col(1, 1, "rv")), // r.rv, right-relative index 1
+            rhs: Box::new(rel_col(0, 1, "lv")), // l.lv, left-relative index 1
+        }
+    }
+
+    /// `l(lk,lv)`/`r(rk,rv)` fixture shared by the Inner/Semi/Anti residual
+    /// tests below, matching the psql session in this section's own doc
+    /// comment exactly.
+    fn residual_fixture() -> (Box<dyn Operator>, Box<dyn Operator>) {
+        let left_schema = int_schema(&["lk", "lv"]);
+        let right_schema = int_schema(&["rk", "rv"]);
+        let left = feed_one(
+            left_schema.clone(),
+            int_batch(
+                &left_schema,
+                vec![
+                    vec![Some(1), Some(2), Some(3)],
+                    vec![Some(10), Some(20), Some(30)],
+                ],
+            ),
+        );
+        let right = feed_one(
+            right_schema.clone(),
+            int_batch(
+                &right_schema,
+                vec![
+                    vec![Some(1), Some(1), Some(2), Some(2)],
+                    vec![Some(100), Some(200), Some(5), Some(999)],
+                ],
+            ),
+        );
+        (left, right)
+    }
+
+    #[test]
+    fn inner_join_residual_filters_the_matched_output() {
+        let (left, right) = residual_fixture();
+        let mut join = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::Inner,
+            vec![0],
+            vec![0],
+            Some(rv_lt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        let out = collect_all(&mut join);
+        // Only (lk=2, rv=5) passes both the key equality and the residual —
+        // a naive equijoin-only Inner would additionally emit (2,999),
+        // (1,100), (1,200).
+        assert_eq!(out.num_rows(), 1, "psql: only one row survives");
+        assert_eq!(col_i32(&out, 0), vec![Some(2)]);
+        assert_eq!(col_i32(&out, 3), vec![Some(5)]);
+    }
+
+    // Trap: a naive "filter the output afterwards" LeftSemi implementation
+    // would build the same left-only rows an unfiltered semi join does and
+    // then have nothing left-side-only to filter by (the residual reads
+    // `r.rv`, which never reaches semi's output) — this only passes if the
+    // residual is applied as part of the MATCH TEST itself, per right-side
+    // candidate, before the left row is ever admitted.
+    #[test]
+    fn left_semi_residual_requires_a_matching_right_row_to_also_pass_it() {
+        let (left, right) = residual_fixture();
+        let mut join = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::LeftSemi,
+            vec![0],
+            vec![0],
+            Some(rv_lt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        let out = collect_all(&mut join);
+        assert_eq!(
+            col_i32(&out, 0),
+            vec![Some(2)],
+            "psql: only lk=2 has a key-matching right row that also passes the residual; lk=1's \
+             two right-side matches both fail it, lk=3 has no right-side match at all"
+        );
+    }
+
+    // Trap: a naive "filter the output afterwards" LeftAnti implementation
+    // inverts the meaning entirely — it would EXCLUDE exactly the rows anti
+    // must INCLUDE (lk=1, whose right-side matches all fail the residual)
+    // and, since anti's output never carries `r.rv`, has no column left to
+    // filter by at all.
+    #[test]
+    fn left_anti_residual_includes_a_left_row_whose_matches_all_fail_it() {
+        let (left, right) = residual_fixture();
+        let mut join = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::LeftAnti,
+            vec![0],
+            vec![0],
+            Some(rv_lt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        let out = collect_all(&mut join);
+        let mut got = col_i32(&out, 0);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![Some(1), Some(3)],
+            "psql: lk=1 (matches exist, all fail the residual) and lk=3 (no match at all) are \
+             anti; lk=2 (a match exists AND passes) is not"
+        );
+    }
+
+    /// Same fixture, asymmetric column *widths* on top of the asymmetric
+    /// relation tagging `rv_lt_lv` already exercises — `l` has 2 columns,
+    /// `r` has 3 (an extra leading throwaway column), so `left_len` (2) and
+    /// `right_len` (3) actually differ. If `flatten_filter` used the wrong
+    /// offset (or no offset — treating `relation: 1, index: 1` as already a
+    /// flat position instead of adding `left_len`), the residual would
+    /// silently read `l`'s own column 1 (`lv`) instead of `r.rv`, making
+    /// the predicate `l.lv < l.lv` — always false — rather than `r.rv <
+    /// l.lv`. That wrong predicate would make every right-side match fail,
+    /// which for THIS fixture (unlike `residual_fixture`, where key=2 has a
+    /// row that passes) produces a *different, wrong* anti/semi split this
+    /// test asserts against, so an off-by-`left_len` bug fails loudly
+    /// rather than by coincidence.
+    #[test]
+    fn residual_filter_respects_asymmetric_left_right_widths() {
+        let left_schema = int_schema(&["lk", "lv"]);
+        let right_schema = int_schema(&["junk", "rk", "rv"]);
+        let left = feed_one(
+            left_schema.clone(),
+            int_batch(&left_schema, vec![vec![Some(1)], vec![Some(10)]]),
+        );
+        // key=1 has two right-side matches: rv=100 (fails 100<10) and
+        // rv=5 (passes 5<10) — same "one passes" shape as key=2 in
+        // `residual_fixture`, just relocated to a 3-column right side with
+        // the key now in the MIDDLE column (index 1), not the first.
+        //
+        // `junk` is deliberately always 999 (never < lv=10), NOT some value
+        // that would coincidentally satisfy the residual too — a version of
+        // this test caught reading the wrong column (`junk` at flat index 2
+        // instead of `rv` at flat index 4) only after this was tightened:
+        // an earlier `junk = -1` happened to also read as "always < lv",
+        // so the wrong column silently produced the same pass/fail split as
+        // the right one and the test passed for the wrong reason.
+        let right = feed_one(
+            right_schema.clone(),
+            int_batch(
+                &right_schema,
+                vec![
+                    vec![Some(999), Some(999)],
+                    vec![Some(1), Some(1)],
+                    vec![Some(100), Some(5)],
+                ],
+            ),
+        );
+        // `r.rv` is now right-relative index 2, not 1.
+        let filter = Expr::Binary {
+            op: op(97), // int4 <
+            lhs: Box::new(rel_col(1, 2, "rv")),
+            rhs: Box::new(rel_col(0, 1, "lv")),
+        };
+
+        let mut semi = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::LeftSemi,
+            vec![0],
+            vec![1], // right's join key is its middle column
+            Some(filter),
+            1 << 30,
+        )
+        .unwrap();
+        let out = collect_all(&mut semi);
+        assert_eq!(
+            out.num_rows(),
+            1,
+            "the rv=5 match passes the residual, so lk=1 must be semi-included — a wrong \
+             offset would compare l.lv (10) against itself and find no passing match"
+        );
+    }
+
+    /// `WHERE r.rv < l.lv` when `r.rv` is itself NULL is NULL, not TRUE or
+    /// FALSE — and NULL must count as "does not pass", the same rule
+    /// `WHERE` uses (`project.rs`'s `Filter` docs), confirmed against a
+    /// live Postgres in this section's own doc comment. Checked through
+    /// LeftSemi/LeftAnti since Inner's NULL handling is already
+    /// `filter_record_batch`'s well-tested job, not new code this task
+    /// added.
+    #[test]
+    fn null_residual_is_treated_as_not_passing() {
+        let left_schema = int_schema(&["lk", "lv"]);
+        let right_schema = int_schema(&["rk", "rv"]);
+        let left = feed_one(
+            left_schema.clone(),
+            int_batch(&left_schema, vec![vec![Some(1)], vec![Some(10)]]),
+        );
+        let right = feed_one(
+            right_schema.clone(),
+            int_batch(&right_schema, vec![vec![Some(1)], vec![None]]),
+        );
+        let left_a = feed_one(
+            left_schema.clone(),
+            int_batch(&left_schema, vec![vec![Some(1)], vec![Some(10)]]),
+        );
+        let right_a = feed_one(
+            right_schema.clone(),
+            int_batch(&right_schema, vec![vec![Some(1)], vec![None]]),
+        );
+
+        let mut semi = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::LeftSemi,
+            vec![0],
+            vec![0],
+            Some(rv_lt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        assert_eq!(
+            collect_all(&mut semi).num_rows(),
+            0,
+            "psql: a NULL residual excludes the row from SEMI, same as FALSE"
+        );
+
+        let mut anti = HashJoin::with_filter(
+            left_a,
+            right_a,
+            JoinKind::LeftAnti,
+            vec![0],
+            vec![0],
+            Some(rv_lt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        assert_eq!(
+            collect_all(&mut anti).num_rows(),
+            1,
+            "psql: the same NULL residual leaves lk=1 in ANTI, since no right-side match \
+             actually passed"
+        );
+    }
+
+    /// `build.rs`'s join arm is expected to refuse a residual on
+    /// `Left`/`Right`/`Full` before ever constructing a `HashJoin` (see the
+    /// module docs) — this is the defence-in-depth check inside the
+    /// constructor itself, proving the operator does not silently accept
+    /// (and misexecute) a combination it has no correct implementation for.
+    #[test]
+    fn constructor_refuses_a_residual_filter_on_an_outer_join() {
+        for kind in [JoinKind::Left, JoinKind::Right, JoinKind::Full] {
+            let left_schema = int_schema(&["lk", "lv"]);
+            let right_schema = int_schema(&["rk", "rv"]);
+            let left = empty_feed(left_schema);
+            let right = empty_feed(right_schema);
+            // `HashJoin` does not implement `Debug` (nothing else needs
+            // it), so `Result::unwrap_err` — which requires the `Ok` side
+            // to be `Debug` for its panic message — cannot be used here;
+            // `.err()` discards the `Ok` side entirely instead.
+            let err = HashJoin::with_filter(
+                left,
+                right,
+                kind,
+                vec![0],
+                vec![0],
+                Some(rv_lt_lv()),
+                1 << 30,
+            )
+            .err()
+            .expect("a residual on an outer join must be refused");
+            assert!(
+                matches!(err, ExecError::Internal(_)),
+                "{kind:?} with a residual must be refused, got {err:?}"
+            );
+        }
     }
 }
