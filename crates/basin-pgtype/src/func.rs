@@ -42,19 +42,52 @@
 //!
 //! Postgres ships well over a thousand builtin functions; this module covers
 //! the categories needed to unblock planner resolution and `pg_proc`
-//! fidelity for common queries: string, math, date/time, aggregate, window
-//! and set-returning functions. Anything else resolves to `None` today, same
-//! as it would if the name were simply misspelled.
+//! fidelity for common queries: string, math, date/time, array, regex,
+//! hashing, aggregate, window and set-returning functions. Anything else
+//! resolves to `None` today, same as it would if the name were simply
+//! misspelled.
 //!
-//! `date_trunc`'s three-argument (timezone-name) overload, and `age(xid)`
-//! (transaction-id wraparound, not a date/time function despite the name)
-//! are real `pg_proc` rows this table does not include. Not covered wrongly,
-//! just not covered yet. Same for `substring(text, text[, text])` (POSIX
-//! regex extraction — a different feature, needs a regex engine),
-//! `trunc(macaddr)`/`trunc(macaddr8)` (network-address functions sharing the
-//! `trunc` name, not math), and the `bytea` overloads of `btrim`/`ltrim`/
-//! `rtrim`/`position` (this table's string family is `text`-only, matching
-//! the scope every other string row here already keeps to).
+//! Scope grew once for a specific, measured reason. Commit `c9bd3a68`
+//! enumerated the 79 `pg_catalog` functions Basin answers *only* because
+//! DataFusion's builtin registry answers them, and found that 73 of the 79
+//! were not merely unimplemented but **unresolvable**: [`resolve`] returned
+//! `None`, so the owned planner could not even build the call and an
+//! implementation in `crates/basin-exec/src/eval.rs` would have been
+//! unreachable code. The catalog row has to land before the implementation.
+//! Every overload of those 79 names that this crate's type vocabulary can
+//! represent is therefore tabulated below — see the `The DataFusion orphans`
+//! block, and the two categories under "What is deliberately absent" that it
+//! could not represent.
+//!
+//! `age(xid)` (transaction-id wraparound, not a date/time function despite
+//! the name), `trunc(macaddr)`/`trunc(macaddr8)` (network-address functions
+//! sharing the `trunc` name, not math) and the `bytea` overloads of
+//! `btrim`/`ltrim`/`rtrim` are real `pg_proc` rows this table does not
+//! include. Not covered wrongly, just not covered yet.
+//!
+//! Two categories are absent for reasons stronger than "not yet", and both
+//! were established while adding the DataFusion-orphan rows below:
+//!
+//!   * **Anything typed `bit`/`bit varying` (`pg_type` oid 1560).**
+//!     [`crate::oid`] has no constant for it and [`crate::physical`] no
+//!     mapping, so a row would have to name a type this crate cannot
+//!     represent. That excludes `bit_length(bit)` (1812),
+//!     `octet_length(bit)` (1682), `position(bit, bit)` (1698),
+//!     `substring(bit, ...)` (1680, 1699), `overlay(bit, ...)` (3030, 3031)
+//!     and the `bit` overloads of the `bit_and`/`bit_or`/`bit_xor`
+//!     aggregates (2242, 2243, 6167) — 10 real rows, named here so their
+//!     absence is a decision rather than an oversight.
+//!   * **Ordered-set and hypothetical-set aggregates.** `percentile_cont`
+//!     (3974, 3976, 3980, 3982, `pg_aggregate.aggkind = 'o'`) is spelled
+//!     `percentile_cont(f) WITHIN GROUP (ORDER BY x)`, and the aggregate
+//!     forms of `cume_dist`/`percent_rank` (3990, 3988, `aggkind = 'h'`) are
+//!     spelled `cume_dist(x) WITHIN GROUP (ORDER BY y)`. [`FuncKind`] has no
+//!     variant for either, and tabulating them as plain
+//!     [`FuncKind::Aggregate`] would assert they are callable as ordinary
+//!     two-argument aggregates — which is exactly the "same name, different
+//!     function" trap DataFusion falls into for `percentile_cont`. Six real
+//!     rows, deliberately omitted rather than misrepresented; representing
+//!     them needs an `aggkind` this struct does not carry.
 //!
 //! `ceiling` — the SQL-standard-named alias of `ceil` — IS covered, as a
 //! genuinely separate `pg_proc` oid per argument type, not folded into
@@ -83,6 +116,28 @@
 //! representative string instantiation; any other concrete type is simply not
 //! covered yet, not covered wrongly. See the module docs on
 //! [`crate::operator::OPERATORS`] for the same rule spelled out for arrays.
+//!
+//! The array family added with the DataFusion-orphan block (`array_append`,
+//! `array_cat`, `array_length`, `array_ndims`, `array_position`,
+//! `array_positions`, `array_prepend`, `array_remove`, `array_replace`,
+//! `array_reverse`, `array_sort`, `array_to_string`, `cardinality`) follows
+//! exactly this rule, and is declared on the *other* polymorphic family:
+//! `anycompatible` (2277's sibling, oid 5077) and `anycompatiblearray` (5078),
+//! not `anyelement`/`anyarray` — a real distinction that governs how Postgres
+//! unifies the argument types, and one this table does not flatten.
+//!
+//! **The monomorphization must never escape this crate.** It is a resolution
+//! aid, not a claim about the catalog:
+//! `crates/basin-pgcatalog/src/pg_proc.rs`'s `SignatureOverride` restores the
+//! real polymorphic `proargtypes`/`prorettype` for every one of these oids, so
+//! `pg_proc` reports `array_cat(anycompatiblearray, anycompatiblearray)`, not
+//! `array_cat(int4[], int4[])`. Commit `c09b783b` found 17 cells where that
+//! had gone wrong for `lag`/`lead`/`nth_value` — a driver reading parameter
+//! types off `pg_proc` would have refused every non-`int4` call — and
+//! `catalog_fidelity` now re-checks all of them against a live server on every
+//! run. Adding a polymorphic row here without its `SignatureOverride` there is
+//! a bug that harness will catch; do not silence it by monomorphizing the
+//! catalog.
 //!
 //! `concat` is different in kind: it is declared `VARIADIC "any"` (oid 3058,
 //! `pg_get_function_identity_arguments` confirms exactly one `"any"`-typed
@@ -1006,6 +1061,1047 @@ pub static FUNCS: &[FuncSig] = &[
         oid::TEXT,
         FuncKind::SetReturning,
     ),
+    // ─────────────────────────────────────────────────────────────────────
+    // The DataFusion orphans
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // Every row below is a `pg_catalog` function Basin answers today ONLY
+    // because DataFusion's builtin registry answers it — see commit
+    // `c9bd3a68` and `crates/basin-exec/tests/orphan_functions.rs`, which is
+    // the acceptance criterion for their removal. Until a row exists here,
+    // [`resolve`] returns `None` and the owned planner cannot even *build*
+    // the call, so no amount of work in `eval.rs` would be reachable: the
+    // catalog row has to land first.
+    //
+    // As with the math sub-block above, a row's presence here does NOT mean
+    // `basin-exec` implements the function. It means the planner can name it.
+    //
+    // Every oid, argument type and result type below was read off a live
+    // PostgreSQL 18.2 `pg_proc` by the query in the module docs and emitted
+    // mechanically — none was recalled.
+    // ─── Math — hyperbolics, cot, log10, pow
+    FuncSig::new(2466, "acosh", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(2465, "asinh", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(2467, "atanh", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(2463, "cosh", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(2462, "sinh", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(2464, "tanh", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(1607, "cot", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(1194, "log10", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(
+        1481,
+        "log10",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1346,
+        "pow",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1738,
+        "pow",
+        &[oid::NUMERIC, oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    // ─── Integer math — factorial, gcd, lcm
+    FuncSig::new(
+        1376,
+        "factorial",
+        &[oid::INT8],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        5044,
+        "gcd",
+        &[oid::INT4, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        5045,
+        "gcd",
+        &[oid::INT8, oid::INT8],
+        oid::INT8,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        5048,
+        "gcd",
+        &[oid::NUMERIC, oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        5046,
+        "lcm",
+        &[oid::INT4, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        5047,
+        "lcm",
+        &[oid::INT8, oid::INT8],
+        oid::INT8,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        5049,
+        "lcm",
+        &[oid::NUMERIC, oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    // ─── String — length family
+    FuncSig::new(
+        1811,
+        "bit_length",
+        &[oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1810,
+        "bit_length",
+        &[oid::BYTEA],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1381,
+        "char_length",
+        &[oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1372,
+        "char_length",
+        &[oid::BPCHAR],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1369,
+        "character_length",
+        &[oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1367,
+        "character_length",
+        &[oid::BPCHAR],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1374,
+        "octet_length",
+        &[oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        720,
+        "octet_length",
+        &[oid::BYTEA],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1375,
+        "octet_length",
+        &[oid::BPCHAR],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    // ─── String — case, padding, repetition
+    FuncSig::new(872, "initcap", &[oid::TEXT], oid::TEXT, FuncKind::Scalar),
+    FuncSig::new(
+        879,
+        "lpad",
+        &[oid::TEXT, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        873,
+        "lpad",
+        &[oid::TEXT, oid::INT4, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        880,
+        "rpad",
+        &[oid::TEXT, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        874,
+        "rpad",
+        &[oid::TEXT, oid::INT4, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1622,
+        "repeat",
+        &[oid::TEXT, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    // ─── String — hashing
+    FuncSig::new(2311, "md5", &[oid::TEXT], oid::TEXT, FuncKind::Scalar),
+    FuncSig::new(2321, "md5", &[oid::BYTEA], oid::TEXT, FuncKind::Scalar),
+    FuncSig::new(3419, "sha224", &[oid::BYTEA], oid::BYTEA, FuncKind::Scalar),
+    FuncSig::new(3420, "sha256", &[oid::BYTEA], oid::BYTEA, FuncKind::Scalar),
+    FuncSig::new(3421, "sha384", &[oid::BYTEA], oid::BYTEA, FuncKind::Scalar),
+    FuncSig::new(3422, "sha512", &[oid::BYTEA], oid::BYTEA, FuncKind::Scalar),
+    // ─── String — overlay, starts_with, to_hex
+    FuncSig::new(
+        1405,
+        "overlay",
+        &[oid::TEXT, oid::TEXT, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1404,
+        "overlay",
+        &[oid::TEXT, oid::TEXT, oid::INT4, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        752,
+        "overlay",
+        &[oid::BYTEA, oid::BYTEA, oid::INT4],
+        oid::BYTEA,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        749,
+        "overlay",
+        &[oid::BYTEA, oid::BYTEA, oid::INT4, oid::INT4],
+        oid::BYTEA,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3696,
+        "starts_with",
+        &[oid::TEXT, oid::TEXT],
+        oid::BOOL,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(2089, "to_hex", &[oid::INT4], oid::TEXT, FuncKind::Scalar),
+    FuncSig::new(2090, "to_hex", &[oid::INT8], oid::TEXT, FuncKind::Scalar),
+    // ─── String — substring/position overloads
+    FuncSig::new(
+        2073,
+        "substring",
+        &[oid::TEXT, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        2074,
+        "substring",
+        &[oid::TEXT, oid::TEXT, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        2013,
+        "substring",
+        &[oid::BYTEA, oid::INT4],
+        oid::BYTEA,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        2012,
+        "substring",
+        &[oid::BYTEA, oid::INT4, oid::INT4],
+        oid::BYTEA,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        2014,
+        "position",
+        &[oid::BYTEA, oid::BYTEA],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    // ─── Regex
+    FuncSig::new(
+        6254,
+        "regexp_count",
+        &[oid::TEXT, oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6255,
+        "regexp_count",
+        &[oid::TEXT, oid::TEXT, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6256,
+        "regexp_count",
+        &[oid::TEXT, oid::TEXT, oid::INT4, oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6257,
+        "regexp_instr",
+        &[oid::TEXT, oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6258,
+        "regexp_instr",
+        &[oid::TEXT, oid::TEXT, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6259,
+        "regexp_instr",
+        &[oid::TEXT, oid::TEXT, oid::INT4, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6260,
+        "regexp_instr",
+        &[oid::TEXT, oid::TEXT, oid::INT4, oid::INT4, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6261,
+        "regexp_instr",
+        &[
+            oid::TEXT,
+            oid::TEXT,
+            oid::INT4,
+            oid::INT4,
+            oid::INT4,
+            oid::TEXT,
+        ],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6262,
+        "regexp_instr",
+        &[
+            oid::TEXT,
+            oid::TEXT,
+            oid::INT4,
+            oid::INT4,
+            oid::INT4,
+            oid::TEXT,
+            oid::INT4,
+        ],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6263,
+        "regexp_like",
+        &[oid::TEXT, oid::TEXT],
+        oid::BOOL,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6264,
+        "regexp_like",
+        &[oid::TEXT, oid::TEXT, oid::TEXT],
+        oid::BOOL,
+        FuncKind::Scalar,
+    ),
+    // ─── Date/time
+    FuncSig::new(
+        3846,
+        "make_date",
+        &[oid::INT4, oid::INT4, oid::INT4],
+        oid::DATE,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1284,
+        "date_trunc",
+        &[oid::TEXT, oid::TIMESTAMPTZ, oid::TEXT],
+        oid::TIMESTAMPTZ,
+        FuncKind::Scalar,
+    ),
+    // ─── Volatile
+    FuncSig::new(1598, "random", &[], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(
+        6339,
+        "random",
+        &[oid::INT4, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6340,
+        "random",
+        &[oid::INT8, oid::INT8],
+        oid::INT8,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6341,
+        "random",
+        &[oid::NUMERIC, oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    // ─── string_to_array
+    FuncSig::new(
+        394,
+        "string_to_array",
+        &[oid::TEXT, oid::TEXT],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        376,
+        "string_to_array",
+        &[oid::TEXT, oid::TEXT, oid::TEXT],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    // ─── Aggregates — bitwise and boolean
+    FuncSig::new(
+        2236,
+        "bit_and",
+        &[oid::INT2],
+        oid::INT2,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2238,
+        "bit_and",
+        &[oid::INT4],
+        oid::INT4,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2240,
+        "bit_and",
+        &[oid::INT8],
+        oid::INT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(2237, "bit_or", &[oid::INT2], oid::INT2, FuncKind::Aggregate),
+    FuncSig::new(2239, "bit_or", &[oid::INT4], oid::INT4, FuncKind::Aggregate),
+    FuncSig::new(2241, "bit_or", &[oid::INT8], oid::INT8, FuncKind::Aggregate),
+    FuncSig::new(
+        6164,
+        "bit_xor",
+        &[oid::INT2],
+        oid::INT2,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        6165,
+        "bit_xor",
+        &[oid::INT4],
+        oid::INT4,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        6166,
+        "bit_xor",
+        &[oid::INT8],
+        oid::INT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2517,
+        "bool_and",
+        &[oid::BOOL],
+        oid::BOOL,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2518,
+        "bool_or",
+        &[oid::BOOL],
+        oid::BOOL,
+        FuncKind::Aggregate,
+    ),
+    // ─── Aggregates — statistical
+    FuncSig::new(
+        2829,
+        "corr",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2827,
+        "covar_pop",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2828,
+        "covar_samp",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2818,
+        "regr_count",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::INT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2819,
+        "regr_sxx",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2820,
+        "regr_syy",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2821,
+        "regr_sxy",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2822,
+        "regr_avgx",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2823,
+        "regr_avgy",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2824,
+        "regr_r2",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2825,
+        "regr_slope",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2826,
+        "regr_intercept",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    // ─── Aggregates — stddev/variance
+    FuncSig::new(
+        2154,
+        "stddev",
+        &[oid::INT8],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2155,
+        "stddev",
+        &[oid::INT4],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2156,
+        "stddev",
+        &[oid::INT2],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2157,
+        "stddev",
+        &[oid::FLOAT4],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2158,
+        "stddev",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2159,
+        "stddev",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2724,
+        "stddev_pop",
+        &[oid::INT8],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2725,
+        "stddev_pop",
+        &[oid::INT4],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2726,
+        "stddev_pop",
+        &[oid::INT2],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2727,
+        "stddev_pop",
+        &[oid::FLOAT4],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2728,
+        "stddev_pop",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2729,
+        "stddev_pop",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2712,
+        "stddev_samp",
+        &[oid::INT8],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2713,
+        "stddev_samp",
+        &[oid::INT4],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2714,
+        "stddev_samp",
+        &[oid::INT2],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2715,
+        "stddev_samp",
+        &[oid::FLOAT4],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2716,
+        "stddev_samp",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2717,
+        "stddev_samp",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2718,
+        "var_pop",
+        &[oid::INT8],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2719,
+        "var_pop",
+        &[oid::INT4],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2720,
+        "var_pop",
+        &[oid::INT2],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2721,
+        "var_pop",
+        &[oid::FLOAT4],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2722,
+        "var_pop",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2723,
+        "var_pop",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2641,
+        "var_samp",
+        &[oid::INT8],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2642,
+        "var_samp",
+        &[oid::INT4],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2643,
+        "var_samp",
+        &[oid::INT2],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2644,
+        "var_samp",
+        &[oid::FLOAT4],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2645,
+        "var_samp",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2646,
+        "var_samp",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    // ─── Window
+    FuncSig::new(3103, "percent_rank", &[], oid::FLOAT8, FuncKind::Window),
+    FuncSig::new(3104, "cume_dist", &[], oid::FLOAT8, FuncKind::Window),
+    FuncSig::new(3105, "ntile", &[oid::INT4], oid::INT4, FuncKind::Window),
+    // ─── Arrays ─────────────────────────────────────────────────────────────
+    //
+    // Every row in this block is a *monomorphization* of a genuinely
+    // polymorphic real `pg_proc` row, at the two representative element types
+    // this module already uses for `array_agg`/`unnest` (`int4` and `text`) —
+    // see the module docs. Postgres mints one physical oid per function, not
+    // one per element type, so both rows of a pair legitimately carry the same
+    // oid. `crates/basin-pgcatalog/src/pg_proc.rs`'s `SignatureOverride`
+    // restores the real `anyarray`/`anycompatible`/`anycompatiblearray`
+    // signature for the catalog view, so nothing outside this table ever sees
+    // the concrete instantiation.
+    FuncSig::new(
+        378,
+        "array_append",
+        &[oid::INT4_ARRAY, oid::INT4],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        378,
+        "array_append",
+        &[oid::TEXT_ARRAY, oid::TEXT],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        379,
+        "array_prepend",
+        &[oid::INT4, oid::INT4_ARRAY],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        379,
+        "array_prepend",
+        &[oid::TEXT, oid::TEXT_ARRAY],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        383,
+        "array_cat",
+        &[oid::INT4_ARRAY, oid::INT4_ARRAY],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        383,
+        "array_cat",
+        &[oid::TEXT_ARRAY, oid::TEXT_ARRAY],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3167,
+        "array_remove",
+        &[oid::INT4_ARRAY, oid::INT4],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3167,
+        "array_remove",
+        &[oid::TEXT_ARRAY, oid::TEXT],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3168,
+        "array_replace",
+        &[oid::INT4_ARRAY, oid::INT4, oid::INT4],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3168,
+        "array_replace",
+        &[oid::TEXT_ARRAY, oid::TEXT, oid::TEXT],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    // `array_position`'s result is a plain `int4`, not the element type — the
+    // polymorphism is entirely in its arguments.
+    FuncSig::new(
+        3277,
+        "array_position",
+        &[oid::INT4_ARRAY, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3277,
+        "array_position",
+        &[oid::TEXT_ARRAY, oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3278,
+        "array_position",
+        &[oid::INT4_ARRAY, oid::INT4, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3278,
+        "array_position",
+        &[oid::TEXT_ARRAY, oid::TEXT, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    // Likewise `array_positions`: `int4[]` whatever the element type is.
+    FuncSig::new(
+        3279,
+        "array_positions",
+        &[oid::INT4_ARRAY, oid::INT4],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3279,
+        "array_positions",
+        &[oid::TEXT_ARRAY, oid::TEXT],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    // `array_length(a, 1)` is NULL for an empty array while `cardinality(a)`
+    // is 0 — confirmed live, and the reason these two are separate rows rather
+    // than one shared helper.
+    FuncSig::new(
+        2176,
+        "array_length",
+        &[oid::INT4_ARRAY, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        2176,
+        "array_length",
+        &[oid::TEXT_ARRAY, oid::INT4],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        748,
+        "array_ndims",
+        &[oid::INT4_ARRAY],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        748,
+        "array_ndims",
+        &[oid::TEXT_ARRAY],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3179,
+        "cardinality",
+        &[oid::INT4_ARRAY],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3179,
+        "cardinality",
+        &[oid::TEXT_ARRAY],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6381,
+        "array_reverse",
+        &[oid::INT4_ARRAY],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6381,
+        "array_reverse",
+        &[oid::TEXT_ARRAY],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6388,
+        "array_sort",
+        &[oid::INT4_ARRAY],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6388,
+        "array_sort",
+        &[oid::TEXT_ARRAY],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6389,
+        "array_sort",
+        &[oid::INT4_ARRAY, oid::BOOL],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6389,
+        "array_sort",
+        &[oid::TEXT_ARRAY, oid::BOOL],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6390,
+        "array_sort",
+        &[oid::INT4_ARRAY, oid::BOOL, oid::BOOL],
+        oid::INT4_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6390,
+        "array_sort",
+        &[oid::TEXT_ARRAY, oid::BOOL, oid::BOOL],
+        oid::TEXT_ARRAY,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        395,
+        "array_to_string",
+        &[oid::INT4_ARRAY, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        395,
+        "array_to_string",
+        &[oid::TEXT_ARRAY, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        384,
+        "array_to_string",
+        &[oid::INT4_ARRAY, oid::TEXT, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        384,
+        "array_to_string",
+        &[oid::TEXT_ARRAY, oid::TEXT, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
 ];
 
 /// Whether `declared` (one entry from a [`FuncSig::args`]) accepts `given`
@@ -1417,7 +2513,10 @@ mod tests {
 
         let substr3 = resolve("substr", &[oid::TEXT, oid::INT4, oid::INT4]).unwrap();
         let substr2 = resolve("substr", &[oid::TEXT, oid::INT4]).unwrap();
-        assert_ne!(sub3.oid, substr3.oid, "substring and substr must not share an oid");
+        assert_ne!(
+            sub3.oid, substr3.oid,
+            "substring and substr must not share an oid"
+        );
         assert_ne!(sub2.oid, substr2.oid);
     }
 
@@ -1571,5 +2670,319 @@ mod tests {
         assert_eq!(exp_numeric.oid, Oid(1732));
         let ln_numeric = resolve("ln", &[oid::NUMERIC]).expect("ln(numeric) must resolve");
         assert_eq!(ln_numeric.oid, Oid(1734));
+    }
+
+    // ─── The DataFusion orphans ─────────────────────────────────────────
+
+    /// The whole point of the orphan block: every one of these was
+    /// `UNRESOLVABLE` before it landed, meaning the owned planner could not
+    /// build the call at all. Each OID here was read off a live PostgreSQL
+    /// 18.2 `pg_proc`. A wrong OID is worse than a missing row — it resolves
+    /// to the wrong function — so they are pinned individually rather than
+    /// merely asserted non-`None`.
+    #[test]
+    fn orphan_scalar_overloads_resolve_to_their_real_oids() {
+        let cases: &[(&str, &[Oid], u32)] = &[
+            ("acosh", &[oid::FLOAT8], 2466),
+            ("asinh", &[oid::FLOAT8], 2465),
+            ("atanh", &[oid::FLOAT8], 2467),
+            ("cosh", &[oid::FLOAT8], 2463),
+            ("sinh", &[oid::FLOAT8], 2462),
+            ("tanh", &[oid::FLOAT8], 2464),
+            ("cot", &[oid::FLOAT8], 1607),
+            ("log10", &[oid::FLOAT8], 1194),
+            ("log10", &[oid::NUMERIC], 1481),
+            ("pow", &[oid::FLOAT8, oid::FLOAT8], 1346),
+            ("pow", &[oid::NUMERIC, oid::NUMERIC], 1738),
+            ("factorial", &[oid::INT8], 1376),
+            ("gcd", &[oid::INT4, oid::INT4], 5044),
+            ("gcd", &[oid::INT8, oid::INT8], 5045),
+            ("lcm", &[oid::INT4, oid::INT4], 5046),
+            ("lcm", &[oid::INT8, oid::INT8], 5047),
+            ("initcap", &[oid::TEXT], 872),
+            ("md5", &[oid::TEXT], 2311),
+            ("md5", &[oid::BYTEA], 2321),
+            ("octet_length", &[oid::TEXT], 1374),
+            ("octet_length", &[oid::BYTEA], 720),
+            ("bit_length", &[oid::TEXT], 1811),
+            ("char_length", &[oid::TEXT], 1381),
+            ("character_length", &[oid::TEXT], 1369),
+            ("repeat", &[oid::TEXT, oid::INT4], 1622),
+            ("lpad", &[oid::TEXT, oid::INT4], 879),
+            ("lpad", &[oid::TEXT, oid::INT4, oid::TEXT], 873),
+            ("rpad", &[oid::TEXT, oid::INT4], 880),
+            ("rpad", &[oid::TEXT, oid::INT4, oid::TEXT], 874),
+            ("starts_with", &[oid::TEXT, oid::TEXT], 3696),
+            ("string_to_array", &[oid::TEXT, oid::TEXT], 394),
+            ("string_to_array", &[oid::TEXT, oid::TEXT, oid::TEXT], 376),
+            ("to_hex", &[oid::INT4], 2089),
+            ("to_hex", &[oid::INT8], 2090),
+            ("regexp_count", &[oid::TEXT, oid::TEXT], 6254),
+            ("regexp_instr", &[oid::TEXT, oid::TEXT], 6257),
+            ("regexp_like", &[oid::TEXT, oid::TEXT], 6263),
+            ("sha224", &[oid::BYTEA], 3419),
+            ("sha256", &[oid::BYTEA], 3420),
+            ("sha384", &[oid::BYTEA], 3421),
+            ("sha512", &[oid::BYTEA], 3422),
+            ("overlay", &[oid::TEXT, oid::TEXT, oid::INT4], 1405),
+            (
+                "overlay",
+                &[oid::TEXT, oid::TEXT, oid::INT4, oid::INT4],
+                1404,
+            ),
+            ("make_date", &[oid::INT4, oid::INT4, oid::INT4], 3846),
+            ("random", &[], 1598),
+        ];
+        for (name, args, want) in cases {
+            let f = resolve(name, args)
+                .unwrap_or_else(|| panic!("{name}({args:?}) must resolve — it is an orphan row"));
+            assert_eq!(
+                f.oid,
+                Oid(*want),
+                "{name}({args:?}) resolved to the wrong oid"
+            );
+        }
+    }
+
+    /// `pow`/`log10` are separate real `pg_proc` oids from `power`/`log`, not
+    /// aliases pointing at the same row — confirmed live. Collapsing them
+    /// would make `pg_proc` report a function Postgres does not have there.
+    #[test]
+    fn pow_and_log10_are_distinct_oids_from_power_and_log() {
+        let pow = resolve("pow", &[oid::FLOAT8, oid::FLOAT8]).unwrap();
+        let power = resolve("power", &[oid::FLOAT8, oid::FLOAT8]).unwrap();
+        assert_eq!(pow.oid, Oid(1346));
+        assert_ne!(pow.oid, power.oid, "pow and power are different oids");
+
+        let log10 = resolve("log10", &[oid::FLOAT8]).unwrap();
+        let log = resolve("log", &[oid::FLOAT8]).unwrap();
+        assert_eq!(log10.oid, Oid(1194));
+        assert_ne!(log10.oid, log.oid, "log10 and log are different oids");
+    }
+
+    /// The polymorphic array family shares one oid across element types, the
+    /// same invariant `array_agg`/`unnest` already have — and every one of
+    /// them monomorphizes to a *different* concrete result type while keeping
+    /// the single real oid.
+    #[test]
+    fn polymorphic_array_functions_share_one_oid_across_element_types() {
+        let int_cat = resolve("array_cat", &[oid::INT4_ARRAY, oid::INT4_ARRAY])
+            .expect("array_cat(int4[], int4[]) must resolve");
+        let text_cat = resolve("array_cat", &[oid::TEXT_ARRAY, oid::TEXT_ARRAY]).unwrap();
+        assert_eq!(int_cat.oid, Oid(383));
+        assert_eq!(
+            int_cat.oid, text_cat.oid,
+            "one real oid, two instantiations"
+        );
+        assert_eq!(int_cat.ret, oid::INT4_ARRAY);
+        assert_eq!(text_cat.ret, oid::TEXT_ARRAY);
+
+        let append = resolve("array_append", &[oid::TEXT_ARRAY, oid::TEXT]).unwrap();
+        assert_eq!(append.oid, Oid(378));
+        assert_eq!(append.ret, oid::TEXT_ARRAY);
+
+        // `array_prepend` takes (element, array) — the reverse of
+        // `array_append`. Getting the order wrong is a silent wrong answer,
+        // not a resolution failure, so it is pinned.
+        let prepend = resolve("array_prepend", &[oid::INT4, oid::INT4_ARRAY]).unwrap();
+        assert_eq!(prepend.oid, Oid(379));
+        assert_eq!(
+            resolve("array_prepend", &[oid::INT4_ARRAY, oid::INT4]),
+            None,
+            "array_prepend(array, element) is not a real signature"
+        );
+    }
+
+    /// `array_length`, `cardinality` and `array_ndims` return a plain
+    /// `integer` whatever the element type, and `array_positions` a plain
+    /// `integer[]` — their polymorphism is entirely in the arguments. A row
+    /// that made the result follow the element type would be wrong, and is
+    /// exactly the mistake `pg_proc`'s `SignatureOverride` exists to prevent
+    /// in the other direction.
+    #[test]
+    fn array_measurement_functions_return_integers_not_the_element_type() {
+        for (name, args, oid_want) in [
+            ("array_length", vec![oid::TEXT_ARRAY, oid::INT4], 2176u32),
+            ("cardinality", vec![oid::TEXT_ARRAY], 3179),
+            ("array_ndims", vec![oid::TEXT_ARRAY], 748),
+        ] {
+            let f = resolve(name, &args).unwrap_or_else(|| panic!("{name} must resolve"));
+            assert_eq!(f.oid, Oid(oid_want));
+            assert_eq!(f.ret, oid::INT4, "{name} returns integer, not the element");
+        }
+
+        let positions = resolve("array_positions", &[oid::TEXT_ARRAY, oid::TEXT]).unwrap();
+        assert_eq!(positions.oid, Oid(3279));
+        assert_eq!(positions.ret, oid::INT4_ARRAY, "positions, not elements");
+    }
+
+    /// The statistical aggregates are `Aggregate`, not `Scalar`, and their
+    /// return types are the surprising part: `stddev(int4)` widens to
+    /// `numeric` while `stddev(float8)` stays `float8`, and `regr_count`
+    /// returns `bigint` while every other `regr_*` returns `float8`.
+    /// Confirmed live.
+    #[test]
+    fn statistical_aggregates_carry_their_real_return_types() {
+        let s_int = resolve("stddev", &[oid::INT4]).expect("stddev(int4) must resolve");
+        assert_eq!(s_int.oid, Oid(2155));
+        assert_eq!(s_int.ret, oid::NUMERIC);
+        assert_eq!(s_int.kind, FuncKind::Aggregate);
+
+        let s_float = resolve("stddev", &[oid::FLOAT8]).unwrap();
+        assert_eq!(s_float.oid, Oid(2158));
+        assert_eq!(s_float.ret, oid::FLOAT8);
+
+        let count = resolve("regr_count", &[oid::FLOAT8, oid::FLOAT8]).unwrap();
+        assert_eq!(count.oid, Oid(2818));
+        assert_eq!(count.ret, oid::INT8, "regr_count is bigint, not float8");
+        for name in ["regr_slope", "regr_r2", "regr_sxx", "corr", "covar_pop"] {
+            let f = resolve(name, &[oid::FLOAT8, oid::FLOAT8])
+                .unwrap_or_else(|| panic!("{name} must resolve"));
+            assert_eq!(f.ret, oid::FLOAT8, "{name} returns float8");
+            assert!(is_aggregate(f.oid), "{name} must be an aggregate");
+        }
+    }
+
+    /// `bit_and`/`bit_or`/`bit_xor` have one oid per integer width, each
+    /// returning that same width — not one polymorphic row and not a single
+    /// `int4` row that everything widens into.
+    #[test]
+    fn bitwise_aggregates_have_one_oid_per_integer_width() {
+        for (arg, want) in [(oid::INT2, 2236u32), (oid::INT4, 2238), (oid::INT8, 2240)] {
+            let f = resolve("bit_and", &[arg]).expect("bit_and must resolve");
+            assert_eq!(f.oid, Oid(want));
+            assert_eq!(f.ret, arg, "bit_and preserves its argument's width");
+            assert!(is_aggregate(f.oid));
+        }
+        assert_eq!(resolve("bit_or", &[oid::INT4]).unwrap().oid, Oid(2239));
+        assert_eq!(resolve("bit_xor", &[oid::INT4]).unwrap().oid, Oid(6165));
+    }
+
+    /// `percent_rank`/`cume_dist` are niladic *window* functions here (oids
+    /// 3103/3104). Their same-named `pg_proc` rows 3988/3990 are
+    /// hypothetical-set *aggregates* — a different function that this table
+    /// deliberately does not carry (see the module docs), so a one-argument
+    /// call must not resolve to something that would run as a plain
+    /// aggregate.
+    #[test]
+    fn percent_rank_and_cume_dist_are_the_window_rows_not_the_aggregate_ones() {
+        for (name, want) in [("percent_rank", 3103u32), ("cume_dist", 3104)] {
+            let f = resolve(name, &[]).unwrap_or_else(|| panic!("{name}() must resolve"));
+            assert_eq!(f.oid, Oid(want));
+            assert_eq!(f.kind, FuncKind::Window);
+            assert!(is_window(f.oid));
+            assert!(!is_aggregate(f.oid));
+            assert_eq!(
+                resolve(name, &[oid::INT4]),
+                None,
+                "{name}(x) is the hypothetical-set aggregate, which is not tabulated"
+            );
+        }
+
+        let ntile = resolve("ntile", &[oid::INT4]).expect("ntile(int) must resolve");
+        assert_eq!(ntile.oid, Oid(3105));
+        assert_eq!(ntile.kind, FuncKind::Window);
+    }
+
+    /// `percentile_cont` is an ordered-set aggregate
+    /// (`percentile_cont(f) WITHIN GROUP (ORDER BY x)`); [`FuncKind`] cannot
+    /// express that, so it is absent rather than misrepresented as a plain
+    /// two-argument aggregate. This pins the *absence*, because the failure
+    /// mode of getting it wrong is silent: a call would resolve and then run
+    /// a different function than Postgres would.
+    #[test]
+    fn percentile_cont_is_absent_rather_than_a_plain_two_arg_aggregate() {
+        assert_eq!(
+            resolve("percentile_cont", &[oid::FLOAT8, oid::FLOAT8]),
+            None
+        );
+        assert!(
+            !FUNCS.iter().any(|f| f.name == "percentile_cont"),
+            "no percentile_cont row may exist until FuncKind can carry aggkind"
+        );
+    }
+
+    /// Adding the orphan rows must not have moved an existing resolution.
+    /// `substring` gains a `(text, text)` regex overload and two `bytea`
+    /// ones; `position` gains a `bytea` one; `date_trunc` gains its
+    /// three-argument timezone-name form. None of them may shadow the row
+    /// that was already there.
+    #[test]
+    fn new_overloads_do_not_shadow_the_existing_rows_of_the_same_name() {
+        assert_eq!(
+            resolve("substring", &[oid::TEXT, oid::INT4]).unwrap().oid,
+            Oid(937)
+        );
+        assert_eq!(
+            resolve("substring", &[oid::TEXT, oid::INT4, oid::INT4])
+                .unwrap()
+                .oid,
+            Oid(936)
+        );
+        assert_eq!(
+            resolve("substring", &[oid::TEXT, oid::TEXT]).unwrap().oid,
+            Oid(2073),
+            "the regex overload is a different row, not a replacement"
+        );
+        assert_eq!(
+            resolve("substring", &[oid::BYTEA, oid::INT4]).unwrap().oid,
+            Oid(2013)
+        );
+
+        assert_eq!(
+            resolve("position", &[oid::TEXT, oid::TEXT]).unwrap().oid,
+            Oid(849)
+        );
+        assert_eq!(
+            resolve("position", &[oid::BYTEA, oid::BYTEA]).unwrap().oid,
+            Oid(2014)
+        );
+
+        assert_eq!(
+            resolve("date_trunc", &[oid::TEXT, oid::TIMESTAMPTZ])
+                .unwrap()
+                .oid,
+            Oid(1217)
+        );
+        assert_eq!(
+            resolve("date_trunc", &[oid::TEXT, oid::TIMESTAMPTZ, oid::TEXT])
+                .unwrap()
+                .oid,
+            Oid(1284),
+            "the three-argument timezone-name form is now covered"
+        );
+    }
+
+    /// No row may name a type this crate cannot represent — the guard that
+    /// keeps the `bit`-typed overloads named in the module docs from being
+    /// added by reflex. [`every_function_has_a_named_or_array_result_type`]
+    /// covers results; this covers arguments, which nothing checked before.
+    #[test]
+    fn every_function_argument_is_a_named_or_array_type() {
+        for f in FUNCS {
+            for (i, arg) in f.args.iter().enumerate() {
+                assert!(
+                    oid::type_name(*arg).is_some() || oid::is_array(*arg) || *arg == PSEUDO_ANY,
+                    "function {} ({}) argument {i} has an unrecognized oid {}",
+                    f.name,
+                    f.oid,
+                    arg
+                );
+            }
+        }
+    }
+
+    /// A single oid must never carry two different `FuncKind`s or two
+    /// different names across its monomorphized rows — `pg_proc` reports one
+    /// row per oid (the first), so a disagreement here would make the catalog
+    /// row depend on table order.
+    #[test]
+    fn rows_sharing_an_oid_agree_on_name_and_kind() {
+        for f in FUNCS {
+            for g in FUNCS.iter().filter(|g| g.oid == f.oid) {
+                assert_eq!(f.name, g.name, "oid {} has two names", f.oid);
+                assert_eq!(f.kind, g.kind, "oid {} has two kinds", f.oid);
+            }
+        }
     }
 }
