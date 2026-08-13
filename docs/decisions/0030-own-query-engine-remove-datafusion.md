@@ -124,6 +124,14 @@ passes tests at every commit; the final commit in the sequence is the
 `Cargo.toml` line removal. Migration analysis lives in
 `docs/migration/df-removal/`.
 
+The distance to that final commit is measured, not asserted, in
+[`18-removal-surface.md`](../migration/df-removal/18-removal-surface.md).
+DataFusion is confined to exactly one crate — `basin-engine` — but 63 files
+holding 117,614 lines, 60% of that crate's source, import it. A third of the
+`use datafusion::…` lines are arrow re-exports that could be rewritten
+mechanically; doing so would decouple **one** file of the sixty-three. The
+remaining 380 lines are each a design decision.
+
 ## Consequences
 
 ### Positive
