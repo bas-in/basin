@@ -280,15 +280,9 @@ mod tests {
     #[test]
     fn interval_typmod_matches_postgres_encoding() {
         // `interval(3)`: no field restriction, precision 3.
-        assert_eq!(
-            encode_interval(INTERVAL_RANGE_FULL, Some(3)),
-            2_147_418_115
-        );
+        assert_eq!(encode_interval(INTERVAL_RANGE_FULL, Some(3)), 2_147_418_115);
         // `interval year to month`: no precision.
-        assert_eq!(
-            encode_interval(INTERVAL_RANGE_YEAR_TO_MONTH, None),
-            458_751
-        );
+        assert_eq!(encode_interval(INTERVAL_RANGE_YEAR_TO_MONTH, None), 458_751);
         // `interval day to second(3)`.
         assert_eq!(
             encode_interval(INTERVAL_RANGE_DAY_TO_SECOND, Some(3)),

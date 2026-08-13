@@ -1045,10 +1045,7 @@ mod tests {
             "INSERT INTO t(charcol) VALUES (namecol) is an error in Postgres"
         );
 
-        assert_eq!(
-            cast_kind(oid::CHAR, oid::NAME),
-            Some(CastKind::Assignment)
-        );
+        assert_eq!(cast_kind(oid::CHAR, oid::NAME), Some(CastKind::Assignment));
         assert!(
             can_coerce(
                 PgType::new(oid::CHAR),
