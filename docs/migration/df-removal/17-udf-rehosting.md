@@ -14,8 +14,8 @@ migration map. [04](./04-function-gap.md) measured the *size* of this block —
 untouched piece of the migration. This document asks the different question:
 **what kind of work is it?**
 
-**Status: partial.** Four families are inventoried below. String, math, JSONB,
-geo and range are not yet surveyed.
+**Status: partial.** Six families are inventoried below. JSONB and range are
+not yet surveyed.
 
 ## The headline: it is not mostly a porting problem
 
@@ -45,9 +45,55 @@ individual function's logic**, and it is shared by every ENTANGLED entry below.
 | Date / time / interval | 26 | ~3,116 | 10 | 14 | 2 |
 | Regex / FTS / trigram | 25 | ~4,454 | 8 | 17 | **0** |
 | Geo / PostGIS | 43 live | ~3,820 | 12 | 45 | 3 |
-| **Surveyed total** | **~129** | **~23,137** | **43** | **87** | **21** |
+| String | 19 | ~2,502 | 12 | 7 | 0 |
+| Math | **see below** | — | — | — | — |
+| **Surveyed total** | **~148** | **~25,639** | **55** | **94** | **21** |
 
-Not yet surveyed: string, math, JSONB, range.
+Not yet surveyed: JSONB, range.
+
+### Math: the taxonomy has no slot for it, and that is the finding
+
+The string family behaves as expected — 19 structs across `string_dt_udf.rs`
+(14, 1,285 lines) and `string_more_udf.rs` (5, 1,217 lines), zero entangled,
+mostly pure text manipulation that ports as plain Rust.
+
+Math does not, because **Basin does not implement it**. Searching the whole of
+`basin-engine` for `sqrt`, `cbrt`, `ln`, `log`, `exp`, `power`, `trunc`,
+`degrees`, `radians`, `atan2` and the trigonometric family returns **nothing**.
+The only math-ish names Basin registers of its own are `div`, `width_bucket`,
+`to_number` and `sign`, in `pg_scalar_aliases.rs`.
+
+`SELECT sqrt(2)` works today entirely because DataFusion's built-in
+`datafusion-functions` math module is registered on the `SessionContext`.
+
+That makes the math family a **fourth category** this document did not have:
+
+> **ABSENT** — no Basin code exists to re-host. Deleting DataFusion deletes the
+> function outright, and it must be *written*, not moved.
+
+The other three categories all describe code that exists and needs a new home.
+This one describes a capability that silently belongs to the dependency being
+removed. It is invisible to any inventory that counts `ScalarUDFImpl`
+definitions, because there is nothing to count — which is exactly why it went
+unrecorded through four earlier surveys.
+
+The current state across the owned crates:
+
+| | Math names known |
+|---|---|
+| `basin-pgtype`'s `pg_proc` table | 7 — `abs`, `ceil`, `floor`, `mod`, `power`, `round`, `sqrt` |
+| `basin-exec`'s evaluator | 4 — `abs`, `ceil`, `floor`, `round` |
+
+So even the names Basin has OIDs for are only half executable, and `sqrt` is
+already a table entry with no implementation behind it.
+
+**This is not a large amount of work** — the functions are individually trivial
+and mostly one `f64` method call each, with the real care going into Postgres's
+rounding and error semantics (`round` on `double precision` is half-to-even, on
+`numeric` half-away-from-zero; `ln(0)` and `sqrt(-1)` must error rather than
+return infinity or NaN). It is, however, work that no one had counted, and it is
+a hard blocker on step 5: the `Cargo.toml` line cannot be deleted while `sqrt`
+has no implementation.
 
 The regex/FTS/trigram family is worth singling out: **zero entangled**, across
 4,454 lines including the whole full-text search stack. `tsvector` and `tsquery`
