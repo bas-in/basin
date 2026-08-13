@@ -43,6 +43,37 @@
 //! async caller — it never touches whatever runtime context the calling
 //! thread may or may not have.
 //!
+//! # Existence is not liveness: where a scan's file set comes from
+//!
+//! This module has two constructors and the difference between them is a
+//! correctness property, not a convenience.
+//!
+//! [`StorageBatchSource::new`] reads through `Storage::read`, which LISTs the
+//! table's object-store prefix. That answers "which files physically exist".
+//! It does NOT answer "which files are still part of this table", and nothing
+//! at the storage layer can: a superseded file is deliberately retained after
+//! it stops being live — `basin-shard` holds superseded compaction inputs for
+//! `BASIN_SUPERSEDED_DELETE_GRACE_SECS` (**300 s** by default) so in-flight
+//! scans do not 404, and the engine's UPDATE/DELETE deletes its rewritten
+//! inputs from a detached task. A LIST-sourced scan inside that window
+//! returns each affected row once per physically present copy, at the
+//! PRE- and POST-update values both.
+//!
+//! [`StorageBatchSource::new_live_paths`] reads exactly the paths the caller
+//! took from `basin_catalog::TableMetadata::live_data_files()`, via
+//! `Storage::read_paths_with_schema`. That is the file set the DataFusion
+//! read path has always used (bug #41), and it is what
+//! [`StorageTableResolver`] — hence every SQL scan built through
+//! [`crate::build::build`] — now uses.
+//!
+//! The pull in the other direction is a trap that has already been sprung
+//! once (bc57fa48): do not push the catalog down into `Storage::read` itself.
+//! A file exists from the moment `Storage::write_batch` puts it, which is
+//! before its commit lands (`note_uncommitted_file` exists for precisely that
+//! window), so a catalog-authoritative `Storage::read` LOSES freshly written
+//! rows. The engine may source from the catalog only because it commits its
+//! own writes before making them visible.
+//!
 //! The channel has capacity 1 (a rendezvous with one slot of read-ahead), so
 //! `next_batch` does bounded work per call — one `recv()` — honouring the
 //! same "return control between batches" cancellation contract
@@ -103,7 +134,8 @@ use futures::StreamExt;
 
 use basin_common::{ProjectId, TableName};
 use basin_plan::TableId;
-use basin_storage::{ReadOptions, Storage};
+use basin_storage::{DataFile, ReadOptions, Storage};
+use object_store::path::Path as ObjectPath;
 
 use crate::build::TableResolver;
 use crate::operator::ExecError;
@@ -135,8 +167,42 @@ impl std::fmt::Debug for StorageBatchSource {
     }
 }
 
+/// Where a [`StorageBatchSource`] gets its file set from — the distinction
+/// that decides whether a scan sees the LIVE rows or merely the rows that
+/// happen to be on disk. See [`StorageBatchSource::new_live_paths`].
+enum FileSet {
+    /// LIST the table's prefix, i.e. `Storage::read`. Answers "what
+    /// physically exists", which is NOT "what is live".
+    ListTablePrefix(TableName),
+    /// Exactly these paths, sourced by the caller from
+    /// `basin_catalog::TableMetadata::live_data_files()`.
+    LivePaths(Vec<ObjectPath>),
+}
+
 impl StorageBatchSource {
-    /// Open a storage-backed source for one table.
+    /// Open a storage-backed source that LISTs `table`'s prefix for its file
+    /// set — i.e. [`basin_storage::Storage::read`].
+    ///
+    /// # This is not the constructor a SQL scan wants
+    ///
+    /// The LIST is authoritative for a file's EXISTENCE and says nothing
+    /// about its LIVENESS. A file the catalog has superseded (copy-on-write
+    /// UPDATE/DELETE, compaction, stripe merge) stays physically present long
+    /// after it stops being part of the table — `basin-shard` retains
+    /// superseded compaction inputs for `BASIN_SUPERSEDED_DELETE_GRACE_SECS`,
+    /// **300 seconds by default**, so that in-flight scans do not 404, and
+    /// the engine's UPDATE/DELETE deletes its rewritten inputs from a
+    /// detached task. Inside that window a LIST-sourced scan enumerates both
+    /// the superseded file and its replacement, and returns every affected
+    /// row once per physically present copy — not clean duplication, but the
+    /// PRE- and POST-update images of the same row side by side, which no
+    /// amount of deduplication downstream can tell apart.
+    ///
+    /// Use [`new_live_paths`](Self::new_live_paths) for anything that must
+    /// return a table's current rows. This constructor remains for callers
+    /// that genuinely want "every file on disk" and hold no catalog — the
+    /// raw-`Storage` tests below, which write with `Storage::write_batch` and
+    /// never register a catalog row at all.
     ///
     /// `table_schema` is the table's full Arrow schema, in the column order
     /// a caller's downstream `Scan` expects (see the module docs' pushdown
@@ -160,6 +226,69 @@ impl StorageBatchSource {
         table_schema: SchemaRef,
         opts: ReadOptions,
     ) -> Result<Self, ExecError> {
+        Self::open(
+            storage,
+            project,
+            FileSet::ListTablePrefix(table),
+            table_schema,
+            opts,
+        )
+    }
+
+    /// Open a storage-backed source over exactly `live_paths` — the file set
+    /// the caller took from `basin_catalog::TableMetadata::live_data_files()`.
+    ///
+    /// This is the constructor every SQL scan must use, and the reason is the
+    /// whole of [`new`](Self::new)'s doc comment: the catalog is the only
+    /// component that knows which of the physically present files are still
+    /// part of the table. The DataFusion read path has always done exactly
+    /// this (`basin_engine::session::refresh_table_inner` builds its
+    /// `ListingTable` over `meta.live_data_files()` — bug #41); the owned
+    /// engine re-introduced #41 by reading through `Storage::read`, and this
+    /// is how it stops.
+    ///
+    /// Note the direction of the danger, because the opposite mistake is also
+    /// a real one and has been shipped before (bc57fa48): the catalog must
+    /// NOT be made authoritative down inside `basin-storage`, where a
+    /// flushed-but-not-yet-committed file (`Storage::write_batch` puts the
+    /// object before the commit lands — see `note_uncommitted_file`) would
+    /// become invisible and reads would LOSE rows. The engine can source from
+    /// the catalog safely only because it commits every one of its own writes
+    /// before making them visible; storage cannot assume that on its callers'
+    /// behalf. `Storage::read` is therefore left exactly as it was.
+    ///
+    /// An empty `live_paths` is a table with no live data at this snapshot
+    /// (genesis, TRUNCATE, a rollback): the source yields zero batches, which
+    /// is what DataFusion's path does too (it registers an empty `MemTable`).
+    ///
+    /// `table_schema` and `opts` behave exactly as in [`new`](Self::new). The
+    /// full (pre-projection) `table_schema` is also handed to storage as the
+    /// catalog schema, so schema-evolution NULL synthesis for columns added
+    /// after a file was written works here exactly as it does under
+    /// `Storage::read`.
+    pub fn new_live_paths(
+        storage: Storage,
+        project: ProjectId,
+        live_paths: Vec<ObjectPath>,
+        table_schema: SchemaRef,
+        opts: ReadOptions,
+    ) -> Result<Self, ExecError> {
+        Self::open(
+            storage,
+            project,
+            FileSet::LivePaths(live_paths),
+            table_schema,
+            opts,
+        )
+    }
+
+    fn open(
+        storage: Storage,
+        project: ProjectId,
+        files: FileSet,
+        table_schema: SchemaRef,
+        opts: ReadOptions,
+    ) -> Result<Self, ExecError> {
         let schema = match &opts.projection {
             Some(names) => {
                 let mut fields = Vec::with_capacity(names.len());
@@ -174,7 +303,7 @@ impl StorageBatchSource {
                 }
                 Arc::new(Schema::new(fields))
             }
-            None => table_schema,
+            None => table_schema.clone(),
         };
 
         // Rendezvous-plus-one channel: bounds the background thread to at
@@ -197,7 +326,35 @@ impl StorageBatchSource {
                     }
                 };
                 rt.block_on(async move {
-                    let mut stream = match storage.read(&project, &table, opts).await {
+                    let opened = match files {
+                        FileSet::ListTablePrefix(table) => {
+                            storage.read(&project, &table, opts).await
+                        }
+                        FileSet::LivePaths(paths) => {
+                            // `Storage::read` warms the project's bucket
+                            // assignment before reading (#36 stripe pool);
+                            // `read_paths_with_schema` does not, so do it here
+                            // to keep the two paths byte-identical in where
+                            // they route their GETs. A no-op when no bucket
+                            // pool is configured, which is the common case.
+                            match storage.ensure_bucket_assignment(&project).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    let _ = tx.send(Err(ExecError::Internal(e.to_string())));
+                                    return;
+                                }
+                            }
+                            storage
+                                .read_paths_with_schema(
+                                    &project,
+                                    paths,
+                                    opts,
+                                    Some(table_schema.clone()),
+                                )
+                                .await
+                        }
+                    };
+                    let mut stream = match opened {
                         Ok(s) => s,
                         Err(e) => {
                             let _ = tx.send(Err(ExecError::Internal(e.to_string())));
@@ -252,8 +409,70 @@ impl BatchSource for StorageBatchSource {
 /// One table [`StorageTableResolver`] knows how to open.
 struct TableEntry {
     project: ProjectId,
-    table: TableName,
     schema: SchemaRef,
+    /// The file set this table's scans read, pinned at registration time.
+    /// See [`StorageTableResolver::register`] for why this is a file list and
+    /// not a table name, and [`prune_live_files`] for why it carries each
+    /// file's stats rather than just its path.
+    live_files: Vec<DataFile>,
+}
+
+/// File-level statistics prune over a pinned live set: drop every file whose
+/// per-column min/max PROVE the predicate cannot match, before any of them is
+/// opened.
+///
+/// This is the prune `Storage::read` performs inside
+/// `reader::resolve_table_read_paths`, reproduced here because the liveness
+/// fix takes the file set from the catalog instead and so no longer goes
+/// through that function. It is the same `evaluate_compound_for_pruning` over
+/// the same `ColumnStats` shape — the catalog persists per-file stats at
+/// write-commit time (Phase 5.7 A4) precisely so a caller can prune without a
+/// footer fetch, which makes this strictly cheaper than the path it replaces:
+/// `Storage::read`'s prune has to LIST and read footers first.
+///
+/// A file with no recorded stats (written before A4, envelope-encrypted, or
+/// an unsupported Vortex type) yields no per-column entry, so
+/// `evaluate_compound_for_pruning` returns `Mixed` and the file is KEPT. The
+/// prune can therefore only ever drop a file it can prove is empty of matches
+/// — never guess one away.
+///
+/// Losing this costs no correctness at all (the surviving scan re-applies
+/// every predicate), only I/O, which is exactly why
+/// `pushdown_reaches_storage_through_build` asserts on the open counter and
+/// not on the row count.
+fn prune_live_files(
+    files: &[DataFile],
+    filters: &[basin_storage::Predicate],
+    schema: &Schema,
+) -> Vec<ObjectPath> {
+    if filters.is_empty() {
+        return files.iter().map(|f| f.path.clone()).collect();
+    }
+    let mut atoms: Vec<basin_storage::CompoundPredicate> = filters
+        .iter()
+        .cloned()
+        .map(basin_storage::CompoundPredicate::Atom)
+        .collect();
+    let compound = if atoms.len() == 1 {
+        atoms.pop().expect("len == 1")
+    } else {
+        basin_storage::CompoundPredicate::And(atoms)
+    };
+    files
+        .iter()
+        .filter(|f| {
+            !matches!(
+                basin_storage::evaluate_compound_for_pruning(
+                    &compound,
+                    &f.column_stats,
+                    schema,
+                    f.row_count,
+                ),
+                basin_storage::PruneOutcome::NoMatch
+            )
+        })
+        .map(|f| f.path.clone())
+        .collect()
 }
 
 /// A [`TableResolver`] backed by [`basin_storage::Storage`].
@@ -277,23 +496,38 @@ impl StorageTableResolver {
         }
     }
 
-    /// Register `table` as backed by `(project, name)` with Arrow schema
-    /// `schema`. `schema`'s field order must match the `ColId` numbering the
-    /// planner used when it built `table`'s `LogicalPlan::Scan` nodes —
-    /// mirrors [`crate::build::MemTableResolver::insert`]'s contract.
+    /// Register `table` as backed by `project` with Arrow schema `schema`,
+    /// reading exactly `live_files`. `schema`'s field order must match the
+    /// `ColId` numbering the planner used when it built `table`'s
+    /// `LogicalPlan::Scan` nodes — mirrors
+    /// [`crate::build::MemTableResolver::insert`]'s contract.
+    ///
+    /// `live_files` is a FILE SET, deliberately, rather than the table name it
+    /// used to be. A resolver is what a SQL scan opens its table through, and
+    /// a SQL scan must see the table's LIVE rows; only the caller holds the
+    /// catalog that can say which files those are. Source it from
+    /// `basin_catalog::TableMetadata::live_data_files()` — see
+    /// [`StorageBatchSource::new_live_paths`] for what goes wrong when the
+    /// file set is re-derived from an object-store LIST instead, and for why
+    /// the catalog cannot be consulted one layer down in `basin-storage`.
+    ///
+    /// Each entry carries its per-file `column_stats` as well as its path, so
+    /// [`TableResolver::open`] can still prune files by predicate before
+    /// opening any of them ([`prune_live_files`]) — the prune that used to
+    /// happen inside `Storage::read`.
     pub fn register(
         &mut self,
         table: TableId,
         project: ProjectId,
-        name: TableName,
         schema: SchemaRef,
+        live_files: Vec<DataFile>,
     ) {
         self.tables.insert(
             table.0,
             TableEntry {
                 project,
-                table: name,
                 schema,
+                live_files,
             },
         );
     }
@@ -345,10 +579,15 @@ impl TableResolver for StorageTableResolver {
             pushed.filters_applied = true;
         }
 
-        StorageBatchSource::new(
+        // File-level prune first, over the LIVE set only. `Storage::read` did
+        // this inside `resolve_table_read_paths`; the live-paths read cannot,
+        // because it is handed the file set rather than resolving one.
+        let paths = prune_live_files(&entry.live_files, &opts.filters, &entry.schema);
+
+        StorageBatchSource::new_live_paths(
             self.storage.clone(),
             entry.project,
-            entry.table.clone(),
+            paths,
             entry.schema.clone(),
             opts,
         )
@@ -514,6 +753,28 @@ mod tests {
                 .unwrap();
         });
         (project, table)
+    }
+
+    /// The live file set for a `StorageTableResolver::register` in these
+    /// tests. There is no catalog attached to `storage_in`'s `Storage`, so
+    /// there is no `live_data_files()` to ask; every file these tests write is
+    /// still live (nothing here supersedes anything), which makes the LIST and
+    /// the live set the same set. `_with_stats` because the resolver prunes on
+    /// those stats — without a catalog they come from the file footers, which
+    /// is where `Storage::read` used to get them too. Production callers must
+    /// NOT source a scan's file set this way — see
+    /// `StorageBatchSource::new_live_paths`.
+    fn all_files_as_live(
+        storage: &Storage,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Vec<DataFile> {
+        rt().block_on(async {
+            storage
+                .list_data_files_with_stats(project, table)
+                .await
+                .unwrap()
+        })
     }
 
     fn drain(mut source: StorageBatchSource) -> Vec<RecordBatch> {
@@ -808,8 +1069,9 @@ mod tests {
             }
         });
 
+        let live = all_files_as_live(&storage, &project, &table);
         let mut resolver = StorageTableResolver::new(storage.clone());
-        resolver.register(TableId(7), project, table, schema_id_name());
+        resolver.register(TableId(7), project, schema_id_name(), live);
 
         let before = storage.read_counters().snapshot();
         let plan = LogicalPlan::Scan {
@@ -889,8 +1151,9 @@ mod tests {
                 .unwrap();
         });
 
+        let live = all_files_as_live(&storage, &project, &table);
         let mut resolver = StorageTableResolver::new(storage);
-        resolver.register(TableId(3), project, table, schema_uid_k_n());
+        resolver.register(TableId(3), project, schema_uid_k_n(), live);
 
         let plan = LogicalPlan::Scan {
             table: TableId(3),
@@ -971,9 +1234,10 @@ mod tests {
         let batch = batch_id_name(&[1, 2, 3, 4], &["a", "b", "c", "d"]);
         let (project, table_name) = write_one(&storage, FileFormat::Vortex, &batch);
 
+        let live = all_files_as_live(&storage, &project, &table_name);
         let mut resolver = StorageTableResolver::new(storage);
         let table_id = basin_plan::TableId(7);
-        resolver.register(table_id, project, table_name, schema_id_name());
+        resolver.register(table_id, project, schema_id_name(), live);
 
         let plan = basin_plan::LogicalPlan::Scan {
             table: table_id,

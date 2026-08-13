@@ -40,6 +40,18 @@
 //! error, just as unactionable to the caller) when one applies. See that
 //! function's body for the precise list.
 //!
+//! The same class of silent-wrong-rows failure applies to WHICH FILES the
+//! scan reads, and that one is not a check but a choice made in
+//! [`build_resolver`]: the file set comes from the catalog's
+//! `live_data_files()`, never from an object-store LIST. A LIST answers "what
+//! physically exists", and superseded files are deliberately retained for
+//! `BASIN_SUPERSEDED_DELETE_GRACE_SECS` (300 s) after every compaction, so a
+//! LIST-sourced scan returns the pre- and post-UPDATE image of the same row
+//! side by side and inflates every aggregate over it. The DataFusion path has
+//! sourced its `ListingTable` from `live_data_files()` since bug #41; this
+//! path now matches it exactly. See `build_resolver`'s comment at the
+//! `live_files` binding, and `tests/owned_scan_liveness.rs`.
+//!
 //! What is intentionally *not* checked, because it costs performance and not
 //! correctness — the owned path returns right answers, just without the
 //! index-assisted pruning the DataFusion path has accumulated (secondary
@@ -1080,17 +1092,23 @@ impl CatalogTableResolver {
         }
     }
 
+    /// `live_files` is the catalog's `live_data_files()` for this table, taken
+    /// at resolution time and pinned for the whole statement. See
+    /// [`basin_exec::storage_source::StorageTableResolver::register`] for why
+    /// a file SET rather than a table name, and `build_resolver` below for
+    /// where it comes from.
     fn register(
         &mut self,
         key: String,
         table_id: TableId,
         plan_schema: PlanSchema,
         project: ProjectId,
-        table: TableName,
         arrow_schema: arrow_schema::SchemaRef,
+        live_files: Vec<basin_storage::DataFile>,
     ) {
         self.plan_tables.insert(key, (table_id, plan_schema));
-        self.exec.register(table_id, project, table, arrow_schema);
+        self.exec
+            .register(table_id, project, arrow_schema, live_files);
     }
 }
 
@@ -1187,13 +1205,58 @@ async fn build_resolver(
             .iter()
             .map(|f| (f.name().clone(), pgtype_of(f)))
             .collect();
+        // THE file set this statement's scans read, taken from the catalog —
+        // not re-derived by LIST'ing the table prefix down in storage.
+        //
+        // A LIST answers "what physically exists", and existence is not
+        // liveness: a file superseded by a copy-on-write UPDATE/DELETE, a
+        // compaction or a stripe merge stays on the object store long after it
+        // leaves the table. `basin-shard` retains superseded compaction inputs
+        // for `BASIN_SUPERSEDED_DELETE_GRACE_SECS` — 300 seconds by default —
+        // so that in-flight scans do not 404, and `dml_mutate`'s own cleanup
+        // runs from a detached task. Scanning the LIST inside that window
+        // returns each affected row once per physically present copy, at its
+        // pre- AND post-update values both: measured 6, then 9, then 12 rows
+        // where the truth was 3, and `count(*)` = 6 where the truth was 3.
+        //
+        // `live_data_files()` is what the DataFusion path has always used
+        // (`session::refresh_table_inner`, bug #41). It is safe HERE, and only
+        // here, because the engine commits every write before making it
+        // visible; pushing the same catalog lookup down into `Storage::read`
+        // is the bc57fa48 regression, where a flushed-but-uncommitted file
+        // (`note_uncommitted_file`'s window) goes invisible and reads LOSE
+        // rows.
+        //
+        // Pinning the set here also gives the statement a stable file set for
+        // its whole execution — every scan of the same table in one statement
+        // (self-join, repeated reference) reads exactly the same files.
+        //
+        // The per-file `column_stats` ride along because the resolver still
+        // has to prune files by predicate before opening them, and that prune
+        // used to live inside `Storage::read` (which LISTed and read footers
+        // to get the same numbers). The catalog has carried them since Phase
+        // 5.7 A4 for exactly this purpose, so the prune is now free.
+        let live_files: Vec<basin_storage::DataFile> = meta
+            .live_data_files()
+            .into_iter()
+            .map(|f| basin_storage::DataFile {
+                path: object_store::path::Path::from(f.path.as_str()),
+                tier: basin_storage::Tier::from_path(&f.path),
+                size_bytes: f.size_bytes,
+                row_count: f.row_count,
+                column_stats: f.column_stats,
+                bloom_filters: f.bloom_filters,
+                hll_sketches: f.hll_sketches,
+                tdigest_sketches: f.tdigest_sketches,
+            })
+            .collect();
         resolver.register(
             key,
             table_id,
             plan_schema,
             sess.project,
-            table_name,
             meta.schema.clone(),
+            live_files,
         );
     }
 
