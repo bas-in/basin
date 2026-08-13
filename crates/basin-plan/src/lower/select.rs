@@ -22,16 +22,19 @@
 //! list (including `*` expansion and set-returning functions such as
 //! `generate_series`/`unnest`, see [`apply_project_set`]), `WHERE`, `GROUP
 //! BY` / `HAVING`, `ORDER BY`, `LIMIT` / `OFFSET`, `VALUES`, a `FROM`-less
-//! `SELECT`, `UNION` / `INTERSECT` / `EXCEPT`, plain `DISTINCT`, `WITH` /
-//! `WITH RECURSIVE` (see [`lower_with_clause`]), and window functions
-//! (`OVER (...)`, see [`apply_windows`]). Everything else — a named
-//! `WINDOW` clause referenced via `OVER <name>`, `DISTINCT ON`, `LATERAL`,
-//! a subquery or set-returning function in `FROM`, `NATURAL`/`USING`
-//! joins, a CTE's own column-alias list, a data-modifying CTE, a
-//! set-returning function combined with `GROUP BY`/an aggregate, or one
-//! nested inside another set-returning function's own arguments — returns
-//! [`LowerError::Unsupported`] naming the construct. That is a correct
-//! outcome for this increment, not a bug.
+//! `SELECT`, `UNION` / `INTERSECT` / `EXCEPT`, `DISTINCT` and `DISTINCT ON`
+//! (see [`materialize_distinct_on`]), `WITH` / `WITH RECURSIVE` — including a
+//! CTE's own column-alias list, `WITH x(a, b) AS ...` (see
+//! [`apply_column_alias_list`]) — a bare `VALUES` list in `FROM` (also
+//! subject to [`apply_column_alias_list`]), and window functions (`OVER
+//! (...)`, see [`apply_windows`]). Everything else — a named `WINDOW` clause
+//! referenced via `OVER <name>`, `LATERAL`, a genuine subquery (anything but
+//! a bare `VALUES` list) or set-returning function in `FROM`,
+//! `NATURAL`/`USING` joins, a data-modifying CTE, `DISTINCT ON` combined with
+//! `GROUP BY`/an aggregate, a set-returning function combined with `GROUP
+//! BY`/an aggregate, or one nested inside another set-returning function's
+//! own arguments — returns [`LowerError::Unsupported`] naming the construct.
+//! That is a correct outcome for this increment, not a bug.
 //!
 //! # Equijoin extraction
 //!
@@ -470,11 +473,6 @@ fn lower_with_clause(
                 "WITH list entry is not a CommonTableExpr",
             ));
         };
-        if !cte.aliascolnames.is_empty() {
-            return Err(LowerError::Unsupported(
-                "a CTE's own column-alias list (WITH x(a, b) AS ...) is not yet lowered".into(),
-            ));
-        }
         let ctequery = cte
             .ctequery
             .as_deref()
@@ -492,9 +490,11 @@ fn lower_with_clause(
         // from there.
         let id = CteId(ctes.len() as u16);
         let (body, schema, recursive) = if with.recursive {
-            lower_recursive_cte(cte_stmt, res, &ctes, id, &cte.ctename)?
+            lower_recursive_cte(cte_stmt, res, &ctes, id, &cte.ctename, &cte.aliascolnames)?
         } else {
             let (body, schema) = lower_select_stmt_ctx(cte_stmt, res, &ctes)?;
+            let schema =
+                apply_column_alias_list(schema, &cte.aliascolnames, "WITH query", &cte.ctename)?;
             (body, schema, false)
         };
 
@@ -542,10 +542,12 @@ fn lower_recursive_cte(
     ctes: &[CteBinding],
     id: CteId,
     name: &str,
+    aliascolnames: &[Node],
 ) -> Result<(LogicalPlan, Schema, bool), LowerError> {
     let op_kind = SetOperation::try_from(stmt.op).unwrap_or(SetOperation::Undefined);
     if op_kind != SetOperation::SetopUnion {
         let (body, schema) = lower_select_stmt_ctx(stmt, res, ctes)?;
+        let schema = apply_column_alias_list(schema, aliascolnames, "WITH query", name)?;
         return Ok((body, schema, false));
     }
     if !stmt.sort_clause.is_empty() || stmt.limit_count.is_some() || stmt.limit_offset.is_some() {
@@ -560,6 +562,16 @@ fn lower_recursive_cte(
         "WITH RECURSIVE member with no recursive term",
     ))?;
     let (anchor, anchor_schema) = lower_select_stmt_ctx(larg, res, ctes)?;
+    // The alias list is applied to the ANCHOR's schema before the recursive
+    // term is lowered, not after the whole CTE is built: the recursive term's
+    // own `FROM <name>` (its self-reference) resolves columns against
+    // whatever `CteBinding::schema` says right now, so `r.n` only resolves at
+    // all because this renames the anchor's raw `?column?` to `n` first.
+    // Verified live: `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1
+    // FROM r WHERE n < 5) SELECT n FROM r` — the recursive term references
+    // `n`, which does not exist on the anchor (`SELECT 1`) under any other
+    // name.
+    let anchor_schema = apply_column_alias_list(anchor_schema, aliascolnames, "WITH query", name)?;
     let mut inner = ctes.to_vec();
     inner.push(CteBinding {
         name: name.to_string(),
@@ -574,6 +586,55 @@ fn lower_recursive_cte(
         all: stmt.all,
     };
     Ok((body, anchor_schema, true))
+}
+
+/// Apply a `WITH x(a, b) AS (...)` / `FROM (...) AS v(a, b)` column-alias
+/// list to a body's own output schema, renaming positionally. `what`/`label`
+/// only affect the error message's wording (`"WITH query"`/CTE name vs.
+/// `"table"`/relation alias — Postgres phrases the two differently, checked
+/// live below), not the rule itself, which is identical for both.
+///
+/// Verified on a live PostgreSQL 18.2 server, because the obvious guess here
+/// is wrong: `WITH x(a) AS (SELECT 1 AS one, 2 AS two) SELECT * FROM x`
+/// returns columns `a, two` — FEWER aliases than the body has columns is
+/// *not* an error, it renames only the leading columns positionally and
+/// leaves the rest under their own names. Only MORE aliases than columns is
+/// rejected:
+/// ```text
+/// WITH x(a,b,c) AS (SELECT 1, 'hi') SELECT * FROM x;
+/// ERROR:  WITH query "x" has 2 columns available but 3 columns specified
+/// SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v(i,s,extra);
+/// ERROR:  table "v" has 2 columns available but 3 columns specified
+/// ```
+/// and once a name is aliased, the body's own original name for that column
+/// is hidden (`WITH x(a) AS (SELECT 1 AS orig) SELECT orig FROM x` fails with
+/// `column "orig" does not exist`) — which falls out for free here since this
+/// overwrites the name rather than adding an alternate one.
+fn apply_column_alias_list(
+    mut schema: Schema,
+    aliascolnames: &[Node],
+    what: &str,
+    label: &str,
+) -> Result<Schema, LowerError> {
+    if aliascolnames.is_empty() {
+        return Ok(schema);
+    }
+    if aliascolnames.len() > schema.len() {
+        return Err(LowerError::Unsupported(format!(
+            "{what} \"{label}\" has {} columns available but {} columns specified",
+            schema.len(),
+            aliascolnames.len()
+        )));
+    }
+    for (slot, node) in schema.iter_mut().zip(aliascolnames) {
+        let Some(NodeEnum::String(s)) = node.node.as_ref() else {
+            return Err(LowerError::Malformed(
+                "column-alias list entry is not a name",
+            ));
+        };
+        slot.0 = s.sval.clone();
+    }
+    Ok(schema)
 }
 
 fn lower_select_stmt_body(
@@ -606,18 +667,10 @@ fn lower_select_stmt_body(
     // EMPTY placeholder node in this list, while `DISTINCT ON (...)` puts the
     // real expressions. Distinguishing them by node emptiness rather than by
     // list length is what Postgres's own gram.y does.
-    //
-    // `DISTINCT ON` stays unsupported: it keeps the FIRST row per key group in
-    // the input's current order, which is only deterministic when an ORDER BY
-    // agrees with the ON list. Lowering it without checking that agreement
-    // would produce a plan whose answer depends on scan order — a wrong answer
-    // that changes between runs, which is worse than an honest refusal.
     let is_distinct = !stmt.distinct_clause.is_empty();
-    if is_distinct && stmt.distinct_clause.iter().any(|n| n.node.is_some()) {
-        return Err(LowerError::Unsupported(
-            "DISTINCT ON is not yet lowered".into(),
-        ));
-    }
+    let distinct_on_raw: Option<&[Node]> =
+        (is_distinct && stmt.distinct_clause.iter().any(|n| n.node.is_some()))
+            .then_some(stmt.distinct_clause.as_slice());
 
     if !stmt.values_lists.is_empty() {
         return lower_values(stmt, res);
@@ -672,6 +725,20 @@ fn lower_select_stmt_body(
     if has_agg && raw_target.iter().any(|(e, _)| e.contains_srf()) {
         return Err(LowerError::Unsupported(
             "a set-returning function combined with GROUP BY / an aggregate function is not yet lowered".into(),
+        ));
+    }
+
+    // A live server DOES allow `DISTINCT ON` alongside `GROUP BY`/an
+    // aggregate (`SELECT DISTINCT ON (k) k, sum(v) FROM t GROUP BY k ORDER BY
+    // k` runs fine). Supporting it needs the ON list validated against the
+    // ORDER BY keys *after* `rewrite_post_agg` renumbers them (an aggregate
+    // query's `ORDER BY` isn't lowered until then — see the module docs on
+    // aggregation), which is extra wiring this increment does not add.
+    // Refusing outright keeps the refusal honest rather than reaching
+    // `materialize_distinct_on` with column indices from the wrong scope.
+    if distinct_on_raw.is_some() && has_agg {
+        return Err(LowerError::Unsupported(
+            "DISTINCT ON combined with GROUP BY / an aggregate function is not yet lowered".into(),
         ));
     }
 
@@ -737,7 +804,7 @@ fn lower_select_stmt_body(
         };
         apply_limit(apply_distinct(projected, is_distinct), stmt, res)?
     } else {
-        let order_keys = stmt
+        let mut order_keys = stmt
             .sort_clause
             .iter()
             .map(|n| lower_sort_by(n, &ctx))
@@ -748,12 +815,59 @@ fn lower_select_stmt_body(
             ));
         }
 
+        // `DISTINCT ON` is lowered against exactly the same (pre-`Project`)
+        // scope `ORDER BY` itself uses — the two are required to agree, so
+        // sharing a scope is what makes the structural-equality check below
+        // meaningful rather than comparing apples to oranges.
+        let mut distinct_on_exprs = distinct_on_raw
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .map(|n| lower_expr(n, &ctx))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+
+        // Verified live: `SELECT DISTINCT ON (k) k, v FROM t ORDER BY v` is
+        // rejected — `ERROR: SELECT DISTINCT ON expressions must match
+        // initial ORDER BY expressions` — and so is `ORDER BY v, k` (an extra
+        // LEADING key also counts as a mismatch). But an ABSENT `ORDER BY`
+        // is fine: `SELECT DISTINCT ON (k) k, v FROM t` runs with no error,
+        // "first" then being whatever order the input happens to arrive in
+        // (documented on `basin_exec::setop::Distinct` itself, and matches
+        // what a live server does once its own input actually is ordered).
+        if let Some(on) = &distinct_on_exprs {
+            let leading_matches = on.len() <= order_keys.len()
+                && on.iter().zip(order_keys.iter()).all(|(o, k)| *o == k.expr);
+            if !order_keys.is_empty() && !leading_matches {
+                return Err(LowerError::Unsupported(
+                    "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+                        .into(),
+                ));
+            }
+        }
+
         let base_width = scope.total_len();
         let (windowed, target, window_width) = apply_windows(base_plan, base_width, raw_target);
         // Strictly after `apply_windows` — see `apply_project_set`'s own
         // docs for why the order is fixed, not a choice, and why its width
         // is `base_width + window_width`, not `base_width`.
-        let (srf_applied, target) = apply_project_set(windowed, base_width + window_width, target)?;
+        let (srf_applied, target, srf_width) =
+            apply_project_set(windowed, base_width + window_width, target)?;
+
+        // `DISTINCT ON`'s own expressions must be plain columns by the time
+        // they reach `LogicalPlan::Distinct::on` — `basin-exec`'s
+        // `Distinct::new_on` keys physically, on already-resolved column
+        // positions, the same requirement `Sort`'s own keys have (see
+        // `materialize_distinct_on`'s own docs).
+        let materialized_width = base_width + window_width + srf_width;
+        let srf_applied = match &mut distinct_on_exprs {
+            Some(on) => {
+                materialize_distinct_on(srf_applied, materialized_width, on, &mut order_keys)
+            }
+            None => srf_applied,
+        };
+
         let sorted = if order_keys.is_empty() {
             srf_applied
         } else {
@@ -762,11 +876,30 @@ fn lower_select_stmt_body(
                 keys: order_keys,
             }
         };
+        // `DISTINCT ON` sits BELOW the final `Project`, unlike plain
+        // `DISTINCT` (see `apply_distinct`'s own docs) — its expressions may
+        // reference columns that never make it into the SELECT list at all
+        // (verified live: `SELECT DISTINCT ON (v) k FROM t ORDER BY v, k`
+        // is legal), so it must still see the pre-`Project` scope.
+        let distinct_applied = match distinct_on_exprs {
+            Some(on) => LogicalPlan::Distinct {
+                input: Box::new(sorted),
+                on: Some(on),
+            },
+            None => sorted,
+        };
         let projected = LogicalPlan::Project {
-            input: Box::new(sorted),
+            input: Box::new(distinct_applied),
             exprs: target,
         };
-        apply_limit(apply_distinct(projected, is_distinct), stmt, res)?
+        // Plain `DISTINCT` (no ON) is applied here, above the projection, by
+        // `apply_distinct`; `DISTINCT ON` was already applied above, below
+        // it, so it must not be applied a second time here.
+        apply_limit(
+            apply_distinct(projected, is_distinct && distinct_on_raw.is_none()),
+            stmt,
+            res,
+        )?
     };
     Ok((plan, out_schema))
 }
@@ -973,9 +1106,7 @@ fn build_from_item(
     match item.node.as_ref() {
         Some(NodeEnum::RangeVar(rv)) => build_range_var(rv, res, ctes),
         Some(NodeEnum::JoinExpr(je)) => build_join_expr(je, res, ctes),
-        Some(NodeEnum::RangeSubselect(_)) => Err(LowerError::Unsupported(
-            "a subquery in FROM is not yet lowered".into(),
-        )),
+        Some(NodeEnum::RangeSubselect(rs)) => build_range_subselect(rs, res),
         Some(NodeEnum::RangeFunction(_)) => Err(LowerError::Unsupported(
             "a set-returning function in FROM is not yet lowered".into(),
         )),
@@ -984,6 +1115,73 @@ fn build_from_item(
         )),
         None => Err(LowerError::Malformed("empty FROM item")),
     }
+}
+
+/// `FROM (subquery) [AS alias [(colnames)]]`. A genuine subquery (anything
+/// with its own `SELECT` list, `WHERE`, etc.) stays unsupported — see the
+/// module docs — but a bare `VALUES` list is a relation too, and `VALUES` is
+/// already fully lowered ([`lower_values`]); the only new work here is
+/// exposing it under the right name(s). Verified live: `SELECT * FROM
+/// (VALUES (1,'a'),(2,'b')) AS v` (and the unaliased `FROM (VALUES ...)`)
+/// both name the columns `column1`, `column2`, … — exactly
+/// [`lower_values`]'s own default — and `AS v(i, s)` overrides those
+/// positionally through the exact same [`apply_column_alias_list`] a CTE's
+/// own column-alias list uses (confirmed live: the arity rule and even the
+/// error wording differ only in saying `table "v"` instead of `WITH query
+/// "x"`).
+fn build_range_subselect(
+    rs: &pg_query::protobuf::RangeSubselect,
+    res: &Resolvers,
+) -> Result<FromBuilt, LowerError> {
+    if rs.lateral {
+        return Err(LowerError::Unsupported(
+            "LATERAL is not yet lowered".into(),
+        ));
+    }
+    let stmt = match rs.subquery.as_deref().and_then(|n| n.node.as_ref()) {
+        Some(NodeEnum::SelectStmt(s)) => s,
+        _ => {
+            return Err(LowerError::Unsupported(
+                "a subquery in FROM is not yet lowered".into(),
+            ))
+        }
+    };
+    let op_kind = SetOperation::try_from(stmt.op).unwrap_or(SetOperation::Undefined);
+    // The exact shape `lower_values` itself lowers: a bare VALUES list, with
+    // no other clause layered on top. `ORDER BY` in particular is excluded
+    // rather than silently dropped — `lower_values` has no wiring for it (it
+    // only ever runs as a top-level statement's own body today, where an
+    // absent `stmt.sort_clause` handler was never exercised), and reaching
+    // it here would silently produce a plan that ignores an `ORDER BY` the
+    // user actually wrote.
+    let is_plain_values = op_kind == SetOperation::SetopNone
+        && !stmt.values_lists.is_empty()
+        && stmt.sort_clause.is_empty()
+        && stmt.with_clause.is_none();
+    if !is_plain_values {
+        return Err(LowerError::Unsupported(
+            "a subquery in FROM is not yet lowered (a bare VALUES list is)".into(),
+        ));
+    }
+    let (plan, schema) = lower_values(stmt, res)?;
+    let (qualifier, schema) = match &rs.alias {
+        Some(a) if !a.colnames.is_empty() => (
+            a.aliasname.clone(),
+            apply_column_alias_list(schema, &a.colnames, "table", &a.aliasname)?,
+        ),
+        Some(a) => (a.aliasname.clone(), schema),
+        // A relation with no alias at all has no name to qualify by — an
+        // empty qualifier can never match a real (non-empty) one a user
+        // writes, so `v.col`-style access correctly stays unresolvable while
+        // bare `col` still works. Verified live: `SELECT * FROM (VALUES
+        // (1,'a'))` (no alias anywhere) runs fine.
+        None => (String::new(), schema),
+    };
+    Ok(FromBuilt {
+        plan,
+        scope: Scope::single(qualifier, schema),
+        top_join_left_len: None,
+    })
 }
 
 fn build_range_var(
@@ -1733,18 +1931,24 @@ fn rewrite_post_srf(expr: &Expr, input_width: usize, flat: &[Expr]) -> Expr {
 /// three independently-ranked rows. `input_width` is `input`'s width AFTER
 /// any window columns `apply_windows` already appended, which is exactly
 /// what that function's own `usize` return value is for.
+///
+/// The returned `usize` mirrors [`apply_windows`]'s own (`0` when `target`
+/// had no SRF calls at all) — [`materialize_distinct_on`] needs it for the
+/// same reason `apply_project_set` itself needed `apply_windows`'s: to know
+/// where ITS OWN appended columns must start.
 fn apply_project_set(
     input: LogicalPlan,
     input_width: usize,
     target: Vec<(Expr, String)>,
-) -> Result<(LogicalPlan, Vec<(Expr, String)>), LowerError> {
+) -> Result<(LogicalPlan, Vec<(Expr, String)>, usize), LowerError> {
     let mut collected = Vec::new();
     for (e, _) in &target {
         collect_srfs(e, &mut collected)?;
     }
     if collected.is_empty() {
-        return Ok((input, target));
+        return Ok((input, target, 0));
     }
+    let added = collected.len();
     let plan = LogicalPlan::ProjectSet {
         input: Box::new(input),
         srfs: collected.clone(),
@@ -1753,7 +1957,70 @@ fn apply_project_set(
         .into_iter()
         .map(|(e, alias)| (rewrite_post_srf(&e, input_width, &collected), alias))
         .collect();
-    Ok((plan, target))
+    Ok((plan, target, added))
+}
+
+/// Materialize any `DISTINCT ON` expression that isn't already a bare column
+/// into a `Project` inserted directly below where `Sort`/[`LogicalPlan::Distinct`]
+/// will read from — mirroring [`materialize_agg_inputs`]'s pattern for a
+/// `GROUP BY` key: `basin-exec`'s `Distinct::new_on` (like `Sort`'s own keys,
+/// via `column_index`) requires a physical column position, never a general
+/// expression, so `DISTINCT ON (k % 2)` needs `k % 2` computed once, here,
+/// and referenced by position everywhere after.
+///
+/// When a materialized slot's expression is *also* one of `order_keys`'s own
+/// leading expressions — already checked structurally equal by the caller,
+/// per Postgres's "DISTINCT ON expressions must match initial ORDER BY
+/// expressions" rule — that key is rewritten to point at the exact same slot
+/// rather than recomputing the identical expression a second time under a
+/// second column.
+fn materialize_distinct_on(
+    input: LogicalPlan,
+    base_width: usize,
+    on_exprs: &mut [Expr],
+    order_keys: &mut [SortKey],
+) -> LogicalPlan {
+    let mut extra: Vec<(Expr, String)> = Vec::new();
+    let mut next_index = base_width as u16;
+    for (i, e) in on_exprs.iter_mut().enumerate() {
+        if matches!(e, Expr::Column(_)) {
+            continue;
+        }
+        let alias = default_alias(e);
+        extra.push((e.clone(), alias.clone()));
+        let materialized = Expr::Column(ColumnRef {
+            relation: 0,
+            index: next_index,
+            name: alias,
+        });
+        next_index += 1;
+        if let Some(k) = order_keys.get_mut(i) {
+            k.expr = materialized.clone();
+        }
+        *e = materialized;
+    }
+    if extra.is_empty() {
+        return input;
+    }
+    // A plain positional identity pass-through of every existing column —
+    // names are irrelevant here (this `Project` is never what exposes a
+    // query's or CTE's final output schema; the real, outer `Project` built
+    // from `target` is), unlike `materialize_agg_inputs`'s identity list,
+    // which does need real names for that reason.
+    let identity = (0..base_width as u16).map(|i| {
+        (
+            Expr::Column(ColumnRef {
+                relation: 0,
+                index: i,
+                name: String::new(),
+            }),
+            String::new(),
+        )
+    });
+    LogicalPlan::Project {
+        input: Box::new(input),
+        exprs: identity.chain(extra).collect(),
+    }
 }
 
 fn sort_keys_contain_window(keys: &[SortKey]) -> bool {
@@ -3266,16 +3533,96 @@ mod tests {
         );
     }
 
+    /// A CTE's own column-alias list renames its exposed output positionally
+    /// — `WITH x(n) AS (SELECT 1) SELECT n FROM x` only type-checks because
+    /// `n` is what `x` exposes, not the anchor's own `?column?`. Verified
+    /// live: `WITH x(a, b) AS (SELECT 1, 'hi') SELECT a, b FROM x` returns
+    /// `a=1, b='hi'`.
     #[test]
-    fn a_ctes_own_column_alias_list_is_unsupported() {
-        let err = lower("WITH x(n) AS (SELECT 1) SELECT n FROM x").unwrap_err();
+    fn a_ctes_own_column_alias_list_renames_its_output() {
+        let plan = lower("WITH x(n) AS (SELECT 1) SELECT n FROM x").expect("lowers");
+        let LogicalPlan::Cte { input, .. } = plan else {
+            panic!("expected a Cte node, got {plan:?}");
+        };
+        let LogicalPlan::Project { input, exprs } = *input else {
+            panic!("expected the main query's own Project, got {input:?}");
+        };
+        assert_eq!(exprs, vec![(col(0, "n"), "n".to_string())]);
+        let LogicalPlan::CteRef { schema, .. } = *input else {
+            panic!("expected a CteRef, got {input:?}");
+        };
+        assert_eq!(schema, vec![("n".to_string(), PgType::INT4)]);
+    }
+
+    /// Fewer aliases than the body has columns is NOT an error — only the
+    /// leading columns are renamed, the rest keep their own name. Verified
+    /// live: `WITH x(a) AS (SELECT 1 AS one, 2 AS two) SELECT * FROM x`
+    /// returns columns `a, two`.
+    #[test]
+    fn a_ctes_column_alias_list_may_be_shorter_than_the_body() {
+        let plan = lower("WITH x(a) AS (SELECT id, b FROM t) SELECT * FROM x").expect("lowers");
+        let LogicalPlan::Cte { input, .. } = plan else {
+            panic!("expected a Cte node, got {plan:?}");
+        };
+        let LogicalPlan::Project { exprs, .. } = *input else {
+            panic!("expected the main query's own Project, got {input:?}");
+        };
+        assert_eq!(
+            exprs,
+            vec![
+                (col(0, "a"), "a".to_string()),
+                (col(1, "b"), "b".to_string()),
+            ]
+        );
+    }
+
+    /// MORE aliases than the body has columns IS an error. Verified live:
+    /// `WITH x(a,b,c) AS (SELECT 1, 'hi') SELECT * FROM x` fails with `WITH
+    /// query "x" has 2 columns available but 3 columns specified`.
+    #[test]
+    fn a_ctes_column_alias_list_longer_than_the_body_is_an_error() {
+        let err = lower("WITH x(a,b,c) AS (SELECT id, b FROM t) SELECT * FROM x").unwrap_err();
         let LowerError::Unsupported(msg) = err else {
             panic!("expected Unsupported, got {err:?}");
         };
         assert!(
-            msg.to_lowercase().contains("column"),
+            msg.contains("2 columns available") && msg.contains("3 columns specified"),
             "message should be precise: {msg}"
         );
+    }
+
+    /// Once a CTE has its own column-alias list, the body's original column
+    /// name is hidden — `n` is the only name in scope for `x`'s first column,
+    /// not whatever the body itself called it. Verified live: `WITH x(a) AS
+    /// (SELECT 1 AS orig) SELECT orig FROM x` fails with `column "orig" does
+    /// not exist`.
+    #[test]
+    fn a_ctes_column_alias_list_hides_the_bodys_own_name() {
+        let err = lower("WITH x(a) AS (SELECT id AS orig FROM t) SELECT orig FROM x").unwrap_err();
+        assert!(matches!(err, LowerError::UnknownName(_)));
+    }
+
+    /// `WITH RECURSIVE`'s alias list must apply to the anchor's schema before
+    /// the recursive term is lowered, not after: the recursive term's own
+    /// `FROM r` self-reference is what resolves `n`. Verified live: `WITH
+    /// RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5)
+    /// SELECT n FROM r` returns 1..5 — this was the confirmed blocker this
+    /// increment exists to fix.
+    #[test]
+    fn a_recursive_ctes_column_alias_list_is_visible_to_its_own_recursive_term() {
+        let plan = lower(
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5) \
+             SELECT n FROM r",
+        )
+        .expect("lowers");
+        let LogicalPlan::Cte {
+            recursive, body, ..
+        } = plan
+        else {
+            panic!("expected a Cte node, got {plan:?}");
+        };
+        assert!(recursive);
+        assert!(matches!(*body, LogicalPlan::SetOp { .. }));
     }
 
     #[test]
@@ -3287,14 +3634,116 @@ mod tests {
 
     // --- Unsupported constructs ------------------------------------------------
 
+    /// No `ORDER BY` at all is legal for `DISTINCT ON` — verified live:
+    /// `SELECT DISTINCT ON (k) k, v FROM t` runs with no error, "first"
+    /// being whatever order the input arrives in (documented on
+    /// `basin_exec::setop::Distinct` itself). `Distinct` must sit BELOW the
+    /// final `Project`, not above it like plain `DISTINCT` — its own
+    /// expression may not even be in the SELECT list.
     #[test]
-    fn distinct_on_is_unsupported_with_a_precise_message() {
-        let err = lower("SELECT DISTINCT ON (a) a, b FROM t").unwrap_err();
+    fn distinct_on_with_no_order_by_lowers_below_the_projection() {
+        let plan = lower("SELECT DISTINCT ON (a) a, b FROM t").expect("lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project at the top, got {plan:?}");
+        };
+        let LogicalPlan::Distinct { input, on } = *input else {
+            panic!("expected Distinct under the Project, got {input:?}");
+        };
+        assert_eq!(on, Some(vec![col(1, "a")]));
+        assert!(
+            matches!(*input, LogicalPlan::Scan { .. }),
+            "with no ORDER BY, Distinct sits directly on the FROM scan: {input:?}"
+        );
+    }
+
+    /// A matching leading `ORDER BY` sorts before `Distinct` picks the first
+    /// row of each group — verified live: `SELECT DISTINCT ON (k) k, v FROM t
+    /// ORDER BY k, v DESC` keeps the row with the largest `v` per `k`.
+    #[test]
+    fn distinct_on_with_a_matching_order_by_sorts_before_deduping() {
+        let plan = lower("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC").expect("lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project at the top, got {plan:?}");
+        };
+        let LogicalPlan::Distinct { input, on } = *input else {
+            panic!("expected Distinct under the Project, got {input:?}");
+        };
+        assert_eq!(on, Some(vec![col(1, "a")]));
+        let LogicalPlan::Sort { keys, input } = *input else {
+            panic!("expected Sort under Distinct, got {input:?}");
+        };
+        assert_eq!(keys.len(), 2);
+        assert!(matches!(*input, LogicalPlan::Scan { .. }));
+    }
+
+    /// Verified live: `SELECT DISTINCT ON (k) k, v FROM t ORDER BY v` fails
+    /// with `SELECT DISTINCT ON expressions must match initial ORDER BY
+    /// expressions`.
+    #[test]
+    fn distinct_on_with_a_non_matching_order_by_is_an_error() {
+        let err = lower("SELECT DISTINCT ON (a) a, b FROM t ORDER BY b").unwrap_err();
         let LowerError::Unsupported(msg) = err else {
             panic!("expected Unsupported, got {err:?}");
         };
         assert!(
-            msg.contains("DISTINCT ON"),
+            msg.contains("DISTINCT ON expressions must match"),
+            "message should be precise: {msg}"
+        );
+    }
+
+    /// An extra LEADING `ORDER BY` key ahead of the `DISTINCT ON` expression
+    /// is also a mismatch — verified live: `... ORDER BY v, k` (with
+    /// `DISTINCT ON (k)`) is rejected the same as `ORDER BY v` alone.
+    #[test]
+    fn distinct_on_with_an_extra_leading_order_by_key_is_an_error() {
+        let err = lower("SELECT DISTINCT ON (a) a, b FROM t ORDER BY b, a").unwrap_err();
+        assert!(matches!(err, LowerError::Unsupported(_)));
+    }
+
+    /// A `DISTINCT ON` expression that isn't a bare column (`a + 1`, say) is
+    /// computed once and referenced by position — `basin-exec`'s
+    /// `Distinct::new_on` requires a physical column, the same requirement
+    /// `Sort`'s own keys already have.
+    #[test]
+    fn distinct_on_materializes_a_non_column_expression() {
+        let plan =
+            lower("SELECT DISTINCT ON (a + 1) a, b FROM t ORDER BY a + 1, b").expect("lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project at the top, got {plan:?}");
+        };
+        let LogicalPlan::Distinct { input, on } = *input else {
+            panic!("expected Distinct under the Project, got {input:?}");
+        };
+        // The materialized slot sits right after `t`'s own 3 columns.
+        assert_eq!(on, Some(vec![col(3, "?column?")]));
+        let LogicalPlan::Sort { keys, input } = *input else {
+            panic!("expected Sort under Distinct, got {input:?}");
+        };
+        // Both the DISTINCT ON slot and the matching ORDER BY key point at
+        // the SAME materialized column, not two separate computations of
+        // `a + 1`.
+        assert_eq!(keys[0].expr, col(3, "?column?"));
+        let LogicalPlan::Project { exprs, input } = *input else {
+            panic!("expected a materializing Project under Sort, got {input:?}");
+        };
+        assert_eq!(exprs.len(), 4, "t's 3 columns plus the materialized a + 1");
+        assert!(matches!(*input, LogicalPlan::Scan { .. }));
+    }
+
+    /// Combining `DISTINCT ON` with `GROUP BY`/an aggregate is a live-server
+    /// legal combination (`SELECT DISTINCT ON (k) k, sum(v) FROM t GROUP BY k
+    /// ORDER BY k` runs), but is out of scope for this increment — see the
+    /// guard's own comment for why. It must be refused, not silently
+    /// mishandled.
+    #[test]
+    fn distinct_on_combined_with_group_by_is_unsupported() {
+        let err = lower("SELECT DISTINCT ON (a) a, sum(id) FROM t GROUP BY a ORDER BY a")
+            .unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("DISTINCT ON") && msg.contains("GROUP BY"),
             "message should be precise: {msg}"
         );
     }
@@ -3344,5 +3793,112 @@ mod tests {
             panic!("expected Unsupported, got {err:?}");
         };
         assert!(msg.contains("subquery"), "message should be precise: {msg}");
+    }
+
+    // --- VALUES in FROM ------------------------------------------------------
+
+    /// Verified live: `SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v` names the
+    /// columns `column1`, `column2` — the exact same default `lower_values`
+    /// itself already uses for a top-level `VALUES` statement.
+    #[test]
+    fn a_values_list_in_from_uses_the_default_column_names() {
+        let plan = lower("SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v").expect("lowers");
+        let LogicalPlan::Project { exprs, input } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(
+            exprs,
+            vec![
+                (col(0, "column1"), "column1".to_string()),
+                (col(1, "column2"), "column2".to_string()),
+            ]
+        );
+        let LogicalPlan::Values { rows, .. } = *input else {
+            panic!("expected Values under Project, got {input:?}");
+        };
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// Verified live: an alias with no column list still works, and even a
+    /// bare `FROM (VALUES ...)` with no alias at all does too — the relation
+    /// simply has no name to qualify by.
+    #[test]
+    fn a_values_list_in_from_needs_no_alias() {
+        let plan = lower("SELECT * FROM (VALUES (1,'a'))").expect("lowers");
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(exprs[0].1, "column1");
+    }
+
+    /// Verified live: `SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v(i, s)`
+    /// renames both columns positionally, same rule a CTE's own column-alias
+    /// list uses.
+    #[test]
+    fn a_values_list_in_from_may_be_column_aliased() {
+        let plan = lower("SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v(i, s)").expect("lowers");
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(
+            exprs,
+            vec![
+                (col(0, "i"), "i".to_string()),
+                (col(1, "s"), "s".to_string()),
+            ]
+        );
+    }
+
+    /// Fewer aliases than columns renames only the leading ones, same as a
+    /// CTE's own column-alias list — verified live.
+    #[test]
+    fn a_values_list_in_from_column_alias_list_may_be_shorter() {
+        let plan = lower("SELECT * FROM (VALUES (1,'a')) AS v(i)").expect("lowers");
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(
+            exprs,
+            vec![
+                (col(0, "i"), "i".to_string()),
+                (col(1, "column2"), "column2".to_string()),
+            ]
+        );
+    }
+
+    /// More aliases than columns is an error. Verified live: `SELECT * FROM
+    /// (VALUES (1,'a'),(2,'b')) AS v(i,s,extra)` fails with `table "v" has 2
+    /// columns available but 3 columns specified`.
+    #[test]
+    fn a_values_list_in_from_column_alias_list_longer_than_the_body_is_an_error() {
+        let err = lower("SELECT * FROM (VALUES (1,'a')) AS v(i, s, extra)").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("table \"v\"")
+                && msg.contains("2 columns available")
+                && msg.contains("3 columns specified"),
+            "message should be precise: {msg}"
+        );
+    }
+
+    /// A `VALUES` relation in `FROM` joins like any other — exercising it
+    /// alongside a real table catches an off-by-one in the scope's flat
+    /// column offsets that a `VALUES`-only query never would.
+    #[test]
+    fn a_values_list_in_from_joins_against_a_real_table() {
+        let plan = lower(
+            "SELECT t.id, s.x FROM t JOIN (VALUES (1), (2)) AS s(x) ON t.id = s.x",
+        )
+        .expect("lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        let LogicalPlan::Join { on, right, .. } = *input else {
+            panic!("expected Join under Project, got {input:?}");
+        };
+        assert_eq!(on.len(), 1);
+        assert!(matches!(*right, LogicalPlan::Values { .. }));
     }
 }
