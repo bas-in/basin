@@ -75,7 +75,7 @@
 
 use pg_query::protobuf::{
     node::Node as NodeEnum, AExprKind, BoolExprType, JoinType, LimitOption, Node, SelectStmt,
-    SetOperation,
+    SetOperation, SortByDir, SortByNulls,
 };
 
 use basin_pgtype::PgType;
@@ -744,18 +744,40 @@ fn lower_select_stmt_body(
 
     let plan = if has_agg {
         let mut aggs = Vec::new();
+
+        // `order_keys` is resolved — ordinal substitution
+        // ([`lower_order_by_key`]) and the plain-`DISTINCT` membership check
+        // ([`check_distinct_order_by`]) — against `raw_target` itself, the
+        // SELECT list exactly as written, so both must run BEFORE
+        // `raw_target` is consumed into `target` below and before either is
+        // touched by `rewrite_post_agg`: Postgres checks both against the
+        // pre-rewrite target list, and (for plain `DISTINCT`) reports that
+        // mismatch even when the same key would independently also fail the
+        // `GROUP BY` rewrite below — verified live (see
+        // `check_distinct_order_by`'s own docs) that the DISTINCT error wins,
+        // which only happens if this runs first.
+        let raw_order_keys = stmt
+            .sort_clause
+            .iter()
+            .map(|n| lower_order_by_key(n, &raw_target, &ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        if is_distinct {
+            // `distinct_on_raw.is_some() && has_agg` was already refused
+            // above, so a plain `is_distinct` here always means plain
+            // (no-`ON`) `DISTINCT`.
+            check_distinct_order_by(&raw_order_keys, &raw_target)?;
+        }
+
         let target = raw_target
-            .into_iter()
-            .map(|(e, alias)| Ok((rewrite_post_agg(&e, &group_exprs, &mut aggs)?, alias)))
+            .iter()
+            .map(|(e, alias)| {
+                Ok((rewrite_post_agg(e, &group_exprs, &mut aggs)?, alias.clone()))
+            })
             .collect::<Result<Vec<_>, LowerError>>()?;
         let having = having_expr
             .map(|e| rewrite_post_agg(&e, &group_exprs, &mut aggs))
             .transpose()?;
-        let order_keys = stmt
-            .sort_clause
-            .iter()
-            .map(|n| lower_sort_by(n, &ctx))
-            .collect::<Result<Vec<_>, _>>()?
+        let mut order_keys = raw_order_keys
             .into_iter()
             .map(|k| {
                 Ok(SortKey {
@@ -789,7 +811,14 @@ fn lower_select_stmt_body(
         // Window functions are computed over the post-WHERE, post-GROUP BY
         // (and post-HAVING) row set — `windows` sees exactly the rows/columns
         // `having_applied` produces, per the module docs.
-        let (windowed, target, _window_width) = apply_windows(having_applied, agg_width, target);
+        let (windowed, target, window_width) = apply_windows(having_applied, agg_width, target);
+        // The same materialization the non-aggregate branch below needs, for
+        // the same reason: an ORDER BY key that survived `rewrite_post_agg`
+        // as something other than a bare column (`ORDER BY count(*) + 1`,
+        // say) still is not a physical position `basin-exec`'s `sort_keys`
+        // can use. `agg_width + window_width` is exactly `windowed`'s own
+        // width, matching what [`apply_project_set`] uses `input_width` for.
+        let windowed = materialize_order_by(windowed, agg_width + window_width, &mut order_keys);
         let sorted = if order_keys.is_empty() {
             windowed
         } else {
@@ -804,15 +833,30 @@ fn lower_select_stmt_body(
         };
         apply_limit(apply_distinct(projected, is_distinct), stmt, res)?
     } else {
+        // Resolved against `raw_target` — the SELECT list exactly as
+        // written — which is why this runs before `raw_target` is moved into
+        // `apply_windows` below. See `lower_order_by_key`'s own docs for the
+        // ordinal case (`ORDER BY 2`) this also handles.
         let mut order_keys = stmt
             .sort_clause
             .iter()
-            .map(|n| lower_sort_by(n, &ctx))
+            .map(|n| lower_order_by_key(n, &raw_target, &ctx))
             .collect::<Result<Vec<_>, _>>()?;
         if sort_keys_contain_window(&order_keys) {
             return Err(LowerError::Unsupported(
                 "window functions in ORDER BY are not yet lowered".into(),
             ));
+        }
+
+        // Plain (no `ON`) `DISTINCT` restricts `ORDER BY` to the SELECT
+        // list's own expressions — a stricter rule than `DISTINCT ON`'s (see
+        // `check_distinct_order_by`'s own docs, including why it must run
+        // before this branch's own aggregate-free plan is anything but
+        // `raw_target` itself). `DISTINCT ON` has no such restriction — its
+        // own, different, leading-match rule is checked separately just
+        // below — so this only applies when `distinct_on_raw` is absent.
+        if is_distinct && distinct_on_raw.is_none() {
+            check_distinct_order_by(&order_keys, &raw_target)?;
         }
 
         // `DISTINCT ON` is lowered against exactly the same (pre-`Project`)
@@ -861,12 +905,25 @@ fn lower_select_stmt_body(
         // positions, the same requirement `Sort`'s own keys have (see
         // `materialize_distinct_on`'s own docs).
         let materialized_width = base_width + window_width + srf_width;
-        let srf_applied = match &mut distinct_on_exprs {
+        let (srf_applied, distinct_on_width) = match &mut distinct_on_exprs {
             Some(on) => {
                 materialize_distinct_on(srf_applied, materialized_width, on, &mut order_keys)
             }
-            None => srf_applied,
+            None => (srf_applied, 0),
         };
+
+        // Same materialization `basin-exec`'s `sort_keys` needs — see
+        // `materialize_order_by`'s own docs. Runs last (after `DISTINCT ON`'s
+        // own materialization above) and against the width THAT step left
+        // behind, so an `ORDER BY` key already rewritten to point at a
+        // `DISTINCT ON` slot (the leading-match case) is correctly seen as
+        // already a bare column and left alone, and any remaining
+        // non-column key is appended past it rather than colliding with it.
+        let srf_applied = materialize_order_by(
+            srf_applied,
+            materialized_width + distinct_on_width,
+            &mut order_keys,
+        );
 
         let sorted = if order_keys.is_empty() {
             srf_applied
@@ -1974,12 +2031,18 @@ fn apply_project_set(
 /// expressions" rule — that key is rewritten to point at the exact same slot
 /// rather than recomputing the identical expression a second time under a
 /// second column.
+///
+/// The returned `usize` mirrors [`apply_windows`]/[`apply_project_set`]'s own
+/// (`0` when every `on_exprs` entry was already a bare column) —
+/// [`materialize_order_by`] needs it for the same reason `apply_project_set`
+/// itself needed `apply_windows`'s: an `ORDER BY` key materialized *after*
+/// this runs must append past whatever this already added, not overwrite it.
 fn materialize_distinct_on(
     input: LogicalPlan,
     base_width: usize,
     on_exprs: &mut [Expr],
     order_keys: &mut [SortKey],
-) -> LogicalPlan {
+) -> (LogicalPlan, usize) {
     let mut extra: Vec<(Expr, String)> = Vec::new();
     let mut next_index = base_width as u16;
     for (i, e) in on_exprs.iter_mut().enumerate() {
@@ -2000,7 +2063,7 @@ fn materialize_distinct_on(
         *e = materialized;
     }
     if extra.is_empty() {
-        return input;
+        return (input, 0);
     }
     // A plain positional identity pass-through of every existing column —
     // names are irrelevant here (this `Project` is never what exposes a
@@ -2017,14 +2080,213 @@ fn materialize_distinct_on(
             String::new(),
         )
     });
-    LogicalPlan::Project {
-        input: Box::new(input),
-        exprs: identity.chain(extra).collect(),
-    }
+    let added = extra.len();
+    (
+        LogicalPlan::Project {
+            input: Box::new(input),
+            exprs: identity.chain(extra).collect(),
+        },
+        added,
+    )
 }
 
 fn sort_keys_contain_window(keys: &[SortKey]) -> bool {
     keys.iter().any(|k| contains_window(&k.expr))
+}
+
+/// Lower one `ORDER BY` entry, the same job [`lower_sort_by`] does, plus one
+/// case that function cannot handle on its own: a bare integer literal
+/// (`ORDER BY 2`) is a 1-based ORDINAL into the SELECT list, not a constant
+/// expression to lower and sort by — Postgres's `transformSortClause` /
+/// `transformNumericSortGroupClause` resolve it against the target list
+/// before anything else runs, which needs `raw_target` (this statement's own
+/// SELECT list, as written), something `lower::expr::lower_sort_by` has no
+/// way to see. Verified live on a PostgreSQL 18.2 server:
+///
+/// - `SELECT id, name FROM t ORDER BY 1` sorts by `id` (position 1).
+/// - `SELECT id FROM t ORDER BY 1 + 0` does NOT — `EXPLAIN` shows no `Sort`
+///   node at all, because `1 + 0` is a constant expression, not an ordinal,
+///   and Postgres's own grammar only folds a PLAIN integer constant into the
+///   ordinal path (an `A_Expr`, which `1 + 0` is, never does, however
+///   trivially it happens to evaluate to an integer).
+/// - `SELECT id FROM t ORDER BY -1` IS treated as an ordinal (and rejected,
+///   `ERROR: ORDER BY position -1 is not in select list`) — Postgres's own
+///   grammar folds a leading `-` directly onto an adjacent numeric literal
+///   into a single negative constant (`doNegate`, the same
+///   `SignedIconst`-folding that makes `SELECT -1` a `Const`, never
+///   `Unary(-, Const(1))`), so this is still the plain-`A_Const` case, not a
+///   unary expression wrapping one — matched here for the same reason:
+///   `pg_query`'s parse tree already reflects that fold before this ever
+///   runs.
+/// - `SELECT id FROM t ORDER BY 2` (only one SELECT-list column) and `ORDER
+///   BY 0` are both rejected with `ERROR: ORDER BY position N is not in
+///   select list`, exact wording matched below.
+///
+/// The substituted expression is `raw_target`'s own (already lowered, but
+/// not yet aggregate/window/SRF-rewritten) entry — from here on an ordinal
+/// ORDER BY key is indistinguishable from the caller having written that
+/// exact expression out by hand, which is also why a position naming a
+/// window-function entry still hits the ordinary "window functions in ORDER
+/// BY are not yet lowered" refusal downstream rather than a special case
+/// here (verified live that a live server DOES allow that one case; out of
+/// scope for the same reason `Expr::Window` in `ORDER BY` generally is).
+fn lower_order_by_key(
+    node: &Node,
+    raw_target: &[(Expr, String)],
+    ctx: &LowerCtx,
+) -> Result<SortKey, LowerError> {
+    use pg_query::protobuf::a_const::Val;
+
+    let Some(NodeEnum::SortBy(sb)) = node.node.as_ref() else {
+        return Err(LowerError::Malformed("expected a SortBy node"));
+    };
+    let expr_node = sb
+        .node
+        .as_deref()
+        .ok_or(LowerError::Malformed("SortBy with no expression"))?;
+
+    if let Some(NodeEnum::AConst(ac)) = expr_node.node.as_ref() {
+        if let Some(Val::Ival(i)) = ac.val.as_ref() {
+            let pos = i.ival;
+            if pos < 1 || pos as usize > raw_target.len() {
+                return Err(LowerError::Unsupported(format!(
+                    "ORDER BY position {pos} is not in select list"
+                )));
+            }
+            let expr = raw_target[(pos - 1) as usize].0.clone();
+            let (descending, nulls_first) = sort_by_direction(sb)?;
+            return Ok(SortKey {
+                expr,
+                descending,
+                nulls_first,
+            });
+        }
+    }
+
+    lower_sort_by(node, ctx)
+}
+
+/// A `SortBy` node's own direction/null-placement, independent of its
+/// expression — duplicated from `lower::expr::lower_sort_by`'s own logic
+/// (rather than calling it) because [`lower_order_by_key`]'s ordinal branch
+/// needs exactly this half WITHOUT also lowering `sb.node` as a scalar
+/// expression: a bare `2` naming a select-list position is not itself a
+/// value to evaluate once it is known to be an ordinal.
+fn sort_by_direction(sb: &pg_query::protobuf::SortBy) -> Result<(bool, bool), LowerError> {
+    let descending = match SortByDir::try_from(sb.sortby_dir).unwrap_or(SortByDir::Undefined) {
+        SortByDir::Undefined | SortByDir::SortbyDefault | SortByDir::SortbyAsc => false,
+        SortByDir::SortbyDesc => true,
+        SortByDir::SortbyUsing => {
+            return Err(LowerError::Unsupported(
+                "ORDER BY ... USING <custom operator> is not yet lowered".into(),
+            ))
+        }
+    };
+    let nulls_first = match SortByNulls::try_from(sb.sortby_nulls).unwrap_or(SortByNulls::Undefined)
+    {
+        SortByNulls::Undefined | SortByNulls::SortbyNullsDefault => descending,
+        SortByNulls::SortbyNullsFirst => true,
+        SortByNulls::SortbyNullsLast => false,
+    };
+    Ok((descending, nulls_first))
+}
+
+/// Reject an `ORDER BY` key that is not one of `raw_target`'s own
+/// expressions, for a plain (no `ON`) `DISTINCT`. Postgres's rule is
+/// stricter than "every column the key reads is projected" — it requires the
+/// key to structurally match a SELECT-list entry, checked (like
+/// [`materialize_distinct_on`]'s own leading-match check) by `Expr`'s own
+/// (derived) structural equality, against `raw_target` — the SELECT list
+/// exactly as written, before any aggregate/window/SRF rewrite — the same
+/// list Postgres's own `transformSortClause` matches against, and it runs
+/// before that function ever looks at `GROUP BY` validity.
+///
+/// Verified live on a PostgreSQL 18.2 server:
+/// - `SELECT DISTINCT id, amt FROM t ORDER BY amt / 2` is rejected even
+///   though `amt` alone (not `amt / 2`) is in the select list —
+///   `ERROR:  for SELECT DISTINCT, ORDER BY expressions must appear in
+///   select list`, matched verbatim below.
+/// - `SELECT DISTINCT id FROM t ORDER BY t.id` (same column, differently
+///   qualified) is fine — it resolves to the identical underlying column,
+///   which is exactly what makes the two `Expr::Column`s compare equal here.
+/// - `SELECT DISTINCT name, count(*) FROM t GROUP BY name ORDER BY amt / 2`
+///   reports THIS error, not "amt must appear in the GROUP BY clause" (both
+///   are independently true of that query) — confirming the ordering this
+///   function's docs describe, which is why callers run this check before
+///   `rewrite_post_agg`, against `raw_target`, not after.
+fn check_distinct_order_by(
+    order_keys: &[SortKey],
+    raw_target: &[(Expr, String)],
+) -> Result<(), LowerError> {
+    for key in order_keys {
+        if !raw_target.iter().any(|(e, _)| *e == key.expr) {
+            return Err(LowerError::Unsupported(
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Materialize any `ORDER BY` key expression that isn't already a bare
+/// column into a `Project` inserted directly below `Sort` — the same pattern
+/// [`materialize_distinct_on`] uses for `DISTINCT ON`'s own expressions, for
+/// the identical underlying reason: `basin-exec/src/build.rs`'s `sort_keys`
+/// requires every key to already be a plain `Expr::Column` position
+/// (`column_index(...).ok_or(BuildError::NonColumnKey("ORDER BY"))`), never
+/// a general expression, so `ORDER BY amt / 2` needs `amt / 2` computed
+/// once, here, and referenced by position everywhere after.
+///
+/// This is what makes `SELECT id FROM t ORDER BY amt / 2` legal at all:
+/// verified live, an `ORDER BY` expression that is not itself in the SELECT
+/// list is allowed for a plain `SELECT` (`amt` need not be projected — see
+/// [`check_distinct_order_by`]'s docs for why plain `DISTINCT` is the one
+/// case that forbids it, checked and refused separately, upstream of this
+/// function ever running), and the extra column must never reach the
+/// query's own output. That drop falls out for free here rather than
+/// needing its own step: both call sites build their final `Project` from
+/// `target`, a list fixed before this function ever runs, so it simply never
+/// references the positions appended below.
+fn materialize_order_by(
+    input: LogicalPlan,
+    base_width: usize,
+    order_keys: &mut [SortKey],
+) -> LogicalPlan {
+    let mut extra: Vec<(Expr, String)> = Vec::new();
+    let mut next_index = base_width as u16;
+    for key in order_keys.iter_mut() {
+        if matches!(key.expr, Expr::Column(_)) {
+            continue;
+        }
+        let alias = default_alias(&key.expr);
+        extra.push((key.expr.clone(), alias.clone()));
+        key.expr = Expr::Column(ColumnRef {
+            relation: 0,
+            index: next_index,
+            name: alias,
+        });
+        next_index += 1;
+    }
+    if extra.is_empty() {
+        return input;
+    }
+    // A plain positional identity pass-through, same as
+    // `materialize_distinct_on`'s own (names are irrelevant: this `Project`
+    // is never what exposes the query's final output schema).
+    let identity = (0..base_width as u16).map(|i| {
+        (
+            Expr::Column(ColumnRef {
+                relation: 0,
+                index: i,
+                name: String::new(),
+            }),
+            String::new(),
+        )
+    });
+    LogicalPlan::Project {
+        input: Box::new(input),
+        exprs: identity.chain(extra).collect(),
+    }
 }
 
 // ─── Aggregate input materialization ───────────────────────────────────────
@@ -2914,6 +3176,166 @@ mod tests {
         };
         assert_eq!(keys[0].expr, col(1, "?column?")); // same agg slot as the SELECT list
         assert!(matches!(*input, LogicalPlan::Aggregate { .. }));
+    }
+
+    /// The regression this increment fixes: `ORDER BY a / 2` is neither a
+    /// bare column nor in the SELECT list at all (only `id` is projected).
+    /// Verified live: this is legal for a plain `SELECT` — Postgres
+    /// materializes the sort key and never exposes it — and `basin-exec`'s
+    /// `sort_keys` (`build.rs`) requires a physical `Expr::Column` position
+    /// for ANY `Sort` key, so `a / 2` must be computed once, below `Sort`,
+    /// and referenced by position; the query's own final `Project` (built
+    /// from `id` alone) must not reference that appended slot.
+    #[test]
+    fn order_by_expression_not_in_select_list_materializes_and_is_dropped() {
+        let plan = lower("SELECT id FROM t ORDER BY a / 2").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project at the top, got {plan:?}");
+        };
+        // The final projection is exactly what was written — the
+        // materialized sort key must never reach the query's own output.
+        assert_eq!(exprs, vec![(col(0, "id"), "id".to_string())]);
+        let LogicalPlan::Sort { keys, input } = *input else {
+            panic!("expected Sort under Project, got {input:?}");
+        };
+        // The materialized slot sits right after t's own 3 columns.
+        assert_eq!(keys[0].expr, col(3, "?column?"));
+        let LogicalPlan::Project { exprs, input } = *input else {
+            panic!("expected a materializing Project under Sort, got {input:?}");
+        };
+        assert_eq!(exprs.len(), 4, "t's 3 columns plus the materialized a / 2");
+        assert!(matches!(*input, LogicalPlan::Scan { .. }));
+    }
+
+    /// The same materialization, on the aggregate side: `count(id) + 1`
+    /// survives `rewrite_post_agg` as `Binary(Column, Literal)`, still not a
+    /// bare column — `sort_keys` needs a physical position regardless of
+    /// whether the query has a `GROUP BY`.
+    #[test]
+    fn order_by_after_aggregation_materializes_a_non_column_expression() {
+        let plan = lower("SELECT a, count(id) FROM t GROUP BY a ORDER BY count(id) + 1")
+            .expect("lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Sort { keys, input } = *input else {
+            panic!("expected Sort under Project, got {input:?}");
+        };
+        // The materialized slot sits right after the group key (0) and the
+        // aggregate's own output (1).
+        assert_eq!(keys[0].expr, col(2, "?column?"));
+        let LogicalPlan::Project { exprs, input } = *input else {
+            panic!("expected a materializing Project under Sort, got {input:?}");
+        };
+        assert_eq!(
+            exprs.len(),
+            3,
+            "the group key and agg output, plus the materialized count(id) + 1"
+        );
+        assert!(matches!(*input, LogicalPlan::Aggregate { .. }));
+    }
+
+    /// A bare integer literal in `ORDER BY` is a 1-based ORDINAL into the
+    /// SELECT list, not a constant to sort by — verified live. Here it names
+    /// an already-projected bare column, so no materialization is needed:
+    /// `Sort` sits directly on the `Scan`.
+    #[test]
+    fn order_by_ordinal_resolves_to_the_select_list_position() {
+        let plan = lower("SELECT id, a FROM t ORDER BY 2").expect("lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Sort { keys, input } = *input else {
+            panic!("expected Sort under Project, got {input:?}");
+        };
+        assert_eq!(
+            keys[0].expr,
+            col(1, "a"),
+            "ORDER BY 2 must mean the 2nd select-list entry (a), not the literal 2"
+        );
+        assert!(
+            matches!(*input, LogicalPlan::Scan { .. }),
+            "an ordinal naming an already-bare-column entry needs no materializing Project"
+        );
+    }
+
+    /// Verified live: `SELECT id FROM t ORDER BY 2` (only one select-list
+    /// column) is rejected with `ERROR: ORDER BY position 2 is not in
+    /// select list`, matched verbatim here.
+    #[test]
+    fn order_by_ordinal_out_of_range_is_an_error() {
+        let err = lower("SELECT id FROM t ORDER BY 2").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert_eq!(msg, "ORDER BY position 2 is not in select list");
+    }
+
+    /// `1 + 0` is a general expression that merely evaluates to a constant —
+    /// NOT a plain integer literal — so it must NOT be treated as an
+    /// ordinal. Verified live: `SELECT id FROM t ORDER BY 1 + 0` runs with
+    /// no error (in particular it is not rejected as an out-of-range
+    /// ordinal the way `ORDER BY 2` above is) and produces no defined order
+    /// (a live `EXPLAIN` shows no `Sort` node at all, since the key
+    /// references no column) — this only requires that it lowers and
+    /// materializes like any other non-column key, not that Basin also
+    /// perform that no-op-sort optimization.
+    #[test]
+    fn order_by_a_constant_expression_is_not_an_ordinal() {
+        let plan = lower("SELECT id FROM t ORDER BY 1 + 0").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(exprs, vec![(col(0, "id"), "id".to_string())]);
+        let LogicalPlan::Sort { keys, input } = *input else {
+            panic!("expected Sort under Project, got {input:?}");
+        };
+        // Materialized past t's 3 columns — NOT resolved to `col(0, "id")`,
+        // which is what treating `1` as an ordinal position would produce.
+        assert_eq!(keys[0].expr, col(3, "?column?"));
+        assert!(matches!(*input, LogicalPlan::Project { .. }));
+    }
+
+    /// Postgres's plain (no `ON`) `DISTINCT` is stricter than an ordinary
+    /// `SELECT`: an `ORDER BY` expression must appear in the select list,
+    /// not merely reference columns that are projected. Verified live:
+    /// `ERROR:  for SELECT DISTINCT, ORDER BY expressions must appear in
+    /// select list`, matched verbatim here.
+    #[test]
+    fn plain_distinct_rejects_an_order_by_expression_not_in_the_select_list() {
+        let err = lower("SELECT DISTINCT id FROM t ORDER BY a / 2").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+        );
+    }
+
+    /// The rule is stricter than "every column it reads is projected" —
+    /// verified live: `SELECT DISTINCT id, amt FROM t ORDER BY amt / 2` is
+    /// STILL rejected even though `amt` alone is in the select list; only
+    /// `amt` itself (not `amt / 2`) would be a legal `ORDER BY` key here.
+    #[test]
+    fn plain_distinct_rejects_even_when_every_column_it_reads_is_projected() {
+        let err = lower("SELECT DISTINCT id, a FROM t ORDER BY a / 2").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("for SELECT DISTINCT"),
+            "message should be precise: {msg}"
+        );
+    }
+
+    /// The positive case: an `ORDER BY` expression that DOES structurally
+    /// match a select-list entry is fine under plain `DISTINCT` — verified
+    /// live (`SELECT DISTINCT a FROM t ORDER BY a` runs with no error).
+    #[test]
+    fn plain_distinct_allows_an_order_by_expression_that_matches_the_select_list() {
+        let plan = lower("SELECT DISTINCT a FROM t ORDER BY a").expect("lowers");
+        assert!(matches!(plan, LogicalPlan::Distinct { .. }));
     }
 
     // --- 6: LIMIT / OFFSET -> Limit ------------------------------------------
