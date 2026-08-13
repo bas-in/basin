@@ -132,6 +132,67 @@ holding 117,614 lines, 60% of that crate's source, import it. A third of the
 mechanically; doing so would decouple **one** file of the sixty-three. The
 remaining 380 lines are each a design decision.
 
+> **Amended 2026-08-13 — the surface re-counted by category, and the removal
+> re-planned as two moves.** From
+> [`17-udf-rehosting.md`](../migration/df-removal/17-udf-rehosting.md) §1 and §8
+> and [`20-oracles.md`](../migration/df-removal/20-oracles.md).
+>
+> **The dependency, exactly.** `datafusion = "53"` at `Cargo.toml:149`, consumed
+> by **`basin-engine` alone**. `basin-plan/Cargo.toml:19` mentions DataFusion in
+> a comment — it is the crate that *replaces* `pg_operators.rs`, so it names the
+> thing it replaces — and has no dependency on it. `grep -rln datafusion
+> --include=Cargo.toml` matches three files (workspace root, `basin-engine`,
+> `basin-plan`) and this has been misread as three consumers, including in
+> commit `d0e14e87`'s message. There is one consumer. That materially simplifies
+> the endgame: the two-move removal below touches exactly one crate's manifest.
+>
+> **Three file counts are in circulation and all three are correct at different
+> scopes.** They must not be quoted interchangeably:
+>
+> | Count | Scope | Source |
+> |---:|---|---|
+> | **69** | files mentioning `datafusion` **workspace-wide** — 67 engine, one `basin-storage`, one `basin-bench-harness` | the Context bullet above |
+> | **67** | of `basin-engine/src`'s 133 files mention `datafusion` | [17](../migration/df-removal/17-udf-rehosting.md) §1, `grep -rl` |
+> | **63** | of those actually carry a `use datafusion::…` import | [18](../migration/df-removal/18-removal-surface.md) |
+>
+> **69 is not the engine figure**, and quoting it as one overstates the engine's
+> coupling by two files.
+>
+> **1,017 references** across those 67 files (`grep -rc`, summed). They are five
+> removal problems with different owners, not one:
+>
+> | Category | Refs | Files |
+> |---|---:|---:|
+> | Function hosting (`ScalarUDFImpl`/`AggregateUDFImpl` bodies + registration) | **521** | 29 |
+> | Physical plan nodes + physical optimizer | 164 | 8 |
+> | Session / context / driver | 118 | 6 |
+> | Table providers / scan | 74 | 7 |
+> | Logical optimizer / analyzer rules | 59 | 5 |
+> | Type conversion | 44 | 2 |
+> | Remainder | 37 | 10 |
+>
+> Function hosting is **51%** of the reference count and shares no owner with the
+> other four. A plan quoting "1,017 references" should not imply that finishing
+> the functions finishes the migration; one quoting "372 UDF sites" should not
+> imply the functions are the whole 1,017 — 372 was a grep line count, not a
+> function count.
+>
+> **The delete is two moves, not one.** The paragraph above makes the final
+> commit the `Cargo.toml` line removal.
+> [20](../migration/df-removal/20-oracles.md) supersedes that:
+>
+> 1. **DataFusion moves to `[dev-dependencies]`.** Shipped `basin-engine` code
+>    stops naming it; it survives for the shadow comparison alone. **This is the
+>    point at which the removal becomes real for anyone downstream** — users get
+>    a build with no DataFusion in it while the project keeps its oracle.
+> 2. **The dev-dependency is dropped**, once golden answers are recorded and the
+>    shadow mode has nothing left to say.
+>
+> What must leave production code in move 1 is the ~380 genuine API import lines
+> of the 566 total; the 186 `datafusion::arrow::*` re-export lines are a
+> mechanical rename that decouples exactly one file (`convert.rs`) and can happen
+> at any time.
+
 ## Consequences
 
 ### Positive
@@ -146,6 +207,81 @@ remaining 380 lines are each a design decision.
   ADR 0015 and the root `Cargo.toml` loses one of its three legs.
 - Cost modelling can use Basin's real unit — an S3 GET — instead of
   DataFusion's local-page assumption.
+
+### The function surface, and the 49 nobody was counting
+
+> **Added 2026-08-13.** Recorded here because it is the consequence that was
+> discovered rather than predicted, and the only one where deleting the
+> dependency removes a *working* feature with no code to port. Source:
+> [`17-udf-rehosting.md`](../migration/df-removal/17-udf-rehosting.md), measured
+> against `6f0d9630`.
+
+`basin-engine` registers **308 distinct SQL function names** on DataFusion
+(~362 registration calls; 23 names registered twice under a `pg_catalog.`-
+qualified alias, 18 more from two modules). **`basin-exec` implements 12 of
+them.** 296 remain.
+
+Separately, and not previously counted: **49 `pg_catalog` function names are
+served today only by DataFusion's own builtin registry.** No Basin code
+registers them and none exists to port. They include `date_trunc`, `date_part`,
+`now`, `md5`, `lpad`, `rpad`, `initcap`, `repeat`, `concat_ws`, `overlay`,
+`starts_with`, `stddev`, `bool_and`, `bool_or`, `array_length`, `cardinality`,
+`string_to_array`, `random`, `ntile`, `cume_dist` and `percent_rank`. These are
+ordinary SQL that Basin answers correctly today and stops answering the moment
+`Cargo.toml:149` is deleted. They are invisible to every inventory that greps
+for what Basin registers, **because Basin registers nothing**.
+
+**The real remaining function surface is 296 + 49 = 345 names.** The 49 are
+strictly harder to notice and strictly easier to write.
+
+> **Ambiguity, recorded rather than resolved: 49 is a floor, not a count.** It
+> is 48 names found by applying a `fn name()`/`aliases()` heuristic to the
+> `datafusion-functions{,-aggregate,-nested,-window}-53.1.0` crates, plus
+> `percent_rank`, which that heuristic missed. `percent_rank` was missed because
+> `datafusion-functions-window` generates it by macro rather than declaring a
+> literal name — **and `rank` and `dense_rank` are generated the same way**, so
+> the heuristic is known to under-count and the true figure is higher than 49 by
+> an unmeasured amount. Document 17's YAML frontmatter summary still says 48
+> while its body §3 says 49; **the body is the one to trust**, and the
+> discrepancy is left visible here rather than smoothed into false precision.
+
+### Oracles, and the one with an expiry date
+
+> **Added 2026-08-13**, from
+> [`20-oracles.md`](../migration/df-removal/20-oracles.md). This supersedes
+> nothing above; it sequences the Phase 0 work the 2026-08-12 amendment under
+> *Mitigations* made a prerequisite.
+
+PostgreSQL is the authority on what is **correct**. The incumbent DataFusion
+path is the authority on what Basin currently **does**. Those differ — Basin has
+20 known deliberate divergences from Postgres, plus behaviour Postgres has no
+opinion about (Vortex file pruning, the hot-tier and tombstone overlay, RLS
+predicate injection, promoted-JSONB shadow columns) — so a disagreement between
+the owned engine and the incumbent is one of three things (owned engine wrong;
+incumbent wrong; behaviour deliberately changing), and a Postgres oracle alone
+cannot tell them apart.
+
+Three oracles, ordered by availability rather than by preference:
+
+| | Oracle | Available | Build it |
+|---|---|---|---|
+| 1 | Incumbent, in-process shadow compare | **only until removal** | **now** |
+| 2 | PostgreSQL differential | always | continuously |
+| 3 | Recorded golden answers | forever, once recorded | **before the delete** |
+
+Oracle 1 is nearly free — `owned_engine.rs` already runs both engines in one
+process, over the same data, from the same call site — and it is the only
+instrument that gets *harder* later rather than easier. Oracle 2 catches the
+failure mode oracle 1 structurally cannot: where Basin and DataFusion agree with
+each other and both differ from Postgres. Oracle 3 keeps the answers, not the
+engine: run the corpus through the incumbent once while it exists and record the
+results, rather than preserving a DataFusion-linked binary as a test fixture.
+
+The trap is the intuitive order — expand the Postgres suite first, because it is
+obviously the one that matters — and arriving at the delete having never run the
+in-process comparison. At that point "did the owned engine change any answer
+Basin used to give?" becomes permanently unanswerable, and it is the question a
+user of the existing product actually cares about.
 
 ### Negative — stated plainly
 
@@ -179,6 +315,74 @@ remaining 380 lines are each a design decision.
   > call sites, Basin implements `PruningStatistics` nowhere, and the crate
   > reaches `Cargo.lock` only via DataFusion-side dependents. See
   > [`06-scan-and-storage.md`](../migration/df-removal/06-scan-and-storage.md).
+
+- **The instruments work, and that is the bad news as well as the good.**
+  *Added 2026-08-13.* The differential harnesses built for this migration have
+  already found, every item traceable to a commit:
+
+  - **A panic reachable from ordinary SQL.** `round(n::numeric, -2147483648)`
+    computed `scale - ndigits` on `i32` with caller-supplied `ndigits`;
+    24 call sites reported `attempt to subtract with overflow`. It killed the
+    query. (`6f0d9630`)
+  - **Silent wrong answers.** `lower('{"l":1,"u":5,…}')` returned `1` instead of
+    the string — `range_udf.rs:520` registers the range bound accessors under
+    the bare names `lower`/`upper`, shadowing the string builtins, and
+    disambiguates on a *content* heuristic where PostgreSQL dispatches on
+    argument **type** (`d0e14e87`). `replace(s, '', to)` returned
+    `"0h0e0l0l0o0 0w0o0r0l0d0"` for `"hello world"`, because Rust's
+    `str::replace` matches an empty pattern at every character boundary
+    (`6f0d9630`). `OVER w` lowered as an **empty window** — the code checked
+    `WindowDef.refname`, which gram.y sets only for the copy-and-extend form
+    `OVER (w …)`, so it refused the right construct and mis-lowered the wrong
+    one (`7285398d`).
+  - **127 real bugs across five `pg_catalog` relations that had passed every
+    shape check** (`c09b783b`), found when the oracle stopped checking shape and
+    started diffing all 10,443 cells against the live server. The load-bearing
+    class is **polymorphic functions monomorphized**: `pg_proc` oid 3106 read
+    `lag(integer) -> integer` where the real row is
+    `lag(anyelement) -> anyelement`, and the same for `lead`, `first_value`,
+    `last_value`, `nth_value`, `unnest` and `array_agg`; in `pg_operator`,
+    `@>`, `<@` and `&&` claimed `integer[]` where the real rows are `anyarray`.
+    A driver resolving parameter types from `pg_proc` would have refused every
+    non-`int4` `lag()` in existence.
+
+  **This is evidence for the approach and against the premise.** Every one of
+  those defects predates the owned engine and was live in shipped behaviour.
+  They were found because someone pointed a real oracle at a surface previously
+  checked only for shape. **The pre-existing surface was less correct than
+  believed** — which raises the cost of this migration in one direction, since
+  there is more to fix than the port itself, and lowers the risk in another,
+  since "matching the incumbent" was never the bar it was assumed to be.
+
+- **The oracle work is itself a source of hazards, not only a detector of them.**
+  *Added 2026-08-13.* The shadow-compare design doc specified its double-write
+  guard as a `match` on `NodeEnum::SelectStmt`. That is unsafe:
+  `WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x` roots at a
+  `SelectStmt` whose `with_clause` holds the `InsertStmt`, **so the documented
+  guard would have double-written on every execution.** It was replaced with
+  `is_side_effect_free()`, which walks the WITH list and each set-op arm's own
+  WITH and refuses anything unrecognised rather than assuming it is safe
+  (`02f8008f`). A differential harness runs every statement twice by
+  construction; that is harmless only for as long as the side-effect analysis is
+  exactly right, and this ADR should not treat oracle-building as risk-free
+  overhead.
+
+  The same first run is direct evidence for this ADR's own claim that the
+  incumbent records what Basin *does* and never what is *correct*: of 13
+  divergences over 146 comparisons, the owned engine was wrong in 4 — and
+  **DataFusion was wrong or unable in 5**. `0.0 = -0.0` is false on DataFusion
+  and true on both the owned engine and PostgreSQL; `count(DISTINCT) FILTER`, a
+  correlated scalar subquery and `FETCH FIRST` all error on DataFusion and are
+  served correctly by the owned engine. The remaining 4 were oracle false
+  positives (unordered `array_agg`/`string_agg` element order, one genuine
+  3-way `ORDER BY` tie).
+
+- **Fallback rate cannot be the sole governing metric.** *Added 2026-08-13.* A
+  query that falls back is invisible to a correctness harness *and* correct for
+  the user; both of those stop being true at the delete. What "falls back" is
+  currently doing, "correct" will have to do afterwards, and the running list of
+  those places is
+  [`19-expires-at-removal.md`](../migration/df-removal/19-expires-at-removal.md).
 
 ### Estimates as measured
 
