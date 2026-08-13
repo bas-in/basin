@@ -1714,16 +1714,41 @@ fn window_func_of(oid: u32) -> Option<WindowFunc> {
         3100 => WindowFunc::RowNumber,
         3101 => WindowFunc::Rank,
         3102 => WindowFunc::DenseRank,
-        3106 => WindowFunc::Lag,
-        3108 => WindowFunc::Lead,
-        3110 => WindowFunc::FirstValue,
-        3111 => WindowFunc::LastValue,
-        3112 => WindowFunc::NthValue,
+        // The oids below are the real ones, dumped from PostgreSQL 18.2:
+        //
+        //   3106 lag(anyelement)                    3109 lead(anyelement)
+        //   3107 lag(anyelement, integer)           3110 lead(anyelement, integer)
+        //   3108 lag(anycompatible, int, anycompat) 3111 lead(anycompatible, ...)
+        //   3112 first_value   3113 last_value      3114 nth_value
+        //
+        // This table previously read 3108 as lead, 3110 as first_value, 3111 as
+        // last_value and 3112 as nth_value — every one of them off by the size
+        // of lag's and lead's overload blocks. `basin-pgtype`'s func.rs had the
+        // right oids all along, so the two tables disagreed, and the visible
+        // symptom was only that `first_value(x)` fell back: it resolved to 3112,
+        // arrived here as NthValue, and failed the arity check.
+        //
+        // The invisible symptom was the dangerous one. `lead(x, n)` resolves to
+        // 3110, which this table called FirstValue — an arity the builder
+        // accepts. That is a wrong answer, not a fallback.
+        3106 | 3107 => WindowFunc::Lag,
+        3109 | 3110 => WindowFunc::Lead,
+        3112 => WindowFunc::FirstValue,
+        3113 => WindowFunc::LastValue,
+        3114 => WindowFunc::NthValue,
+        // 3108 and 3111 — lag/lead's THREE-argument form, which supplies a
+        // default for rows with no peer at the offset — are deliberately absent.
+        // `window_spec` reads args[0] and args[1] and has nowhere to put a
+        // default, so mapping them here would silently drop it and return NULL
+        // where Postgres returns the default. Falling back is the correct
+        // answer until the operator can carry one.
         2803 => WindowFunc::CountStar,
         2107 | 2108 | 2111 | 2114 => WindowFunc::Sum,
         2115 | 2116 | 2120 | 2130 => WindowFunc::Max,
         2131 | 2132 | 2136 | 2146 => WindowFunc::Min,
-        2100 | 2101 | 2103 | 2105 => WindowFunc::Avg,
+        // 2102 is avg(smallint), which was missing — the others are
+        // avg(bigint)/avg(integer)/avg(numeric)/avg(float8).
+        2100 | 2101 | 2102 | 2103 | 2105 => WindowFunc::Avg,
         _ => return None,
     })
 }
@@ -1901,6 +1926,52 @@ mod tests {
     use basin_pgtype::PgType;
     use basin_plan::{ColId, ColumnRef, Datum, SnapshotId};
     use std::sync::Arc;
+
+    /// Pins every window oid against the real `pg_proc` block, because this
+    /// table was wrong by exactly the width of lag's and lead's overload runs
+    /// and nothing caught it. Two agents investigated "why does `first_value`
+    /// fall back" without finding it, because the fallback was a symptom of a
+    /// mapping error three oids away.
+    ///
+    /// Dumped from PostgreSQL 18.2:
+    ///   3100 row_number  3101 rank       3102 dense_rank
+    ///   3106 lag(any)    3107 lag(any,int)   3108 lag(any,int,any)
+    ///   3109 lead(any)   3110 lead(any,int)  3111 lead(any,int,any)
+    ///   3112 first_value 3113 last_value 3114 nth_value
+    #[test]
+    fn window_oids_match_the_real_pg_proc_block() {
+        assert_eq!(window_func_of(3100), Some(WindowFunc::RowNumber));
+        assert_eq!(window_func_of(3101), Some(WindowFunc::Rank));
+        assert_eq!(window_func_of(3102), Some(WindowFunc::DenseRank));
+        assert_eq!(window_func_of(3106), Some(WindowFunc::Lag));
+        assert_eq!(window_func_of(3107), Some(WindowFunc::Lag));
+        assert_eq!(window_func_of(3109), Some(WindowFunc::Lead));
+        assert_eq!(window_func_of(3110), Some(WindowFunc::Lead));
+        assert_eq!(window_func_of(3112), Some(WindowFunc::FirstValue));
+        assert_eq!(window_func_of(3113), Some(WindowFunc::LastValue));
+        assert_eq!(window_func_of(3114), Some(WindowFunc::NthValue));
+    }
+
+    /// `lead(x, n)` is oid 3110. This table used to call that `FirstValue` —
+    /// an arity the builder ACCEPTS, so the query ran and returned the wrong
+    /// column. Every other error in the block produced a fallback; this one
+    /// produced an answer. Pinned separately so its significance is not lost
+    /// among the rest.
+    #[test]
+    fn lead_with_an_offset_is_lead_and_not_first_value() {
+        assert_eq!(window_func_of(3110), Some(WindowFunc::Lead));
+        assert_ne!(window_func_of(3110), Some(WindowFunc::FirstValue));
+    }
+
+    /// lag/lead's three-argument form carries a DEFAULT for rows with no peer
+    /// at the offset. `window_spec` reads only args[0] and args[1], so mapping
+    /// these would silently drop the default and return NULL where Postgres
+    /// returns it. Absent on purpose; falling back is the right answer.
+    #[test]
+    fn the_three_argument_lag_and_lead_forms_are_refused_not_silently_truncated() {
+        assert_eq!(window_func_of(3108), None);
+        assert_eq!(window_func_of(3111), None);
+    }
 
     fn table() -> (Arc<Schema>, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
