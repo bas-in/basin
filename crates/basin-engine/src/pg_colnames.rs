@@ -104,7 +104,8 @@ pub(crate) fn pg_style_column_names(schema: &Arc<Schema>, plan: &LogicalPlan) ->
 fn top_projection_exprs(plan: &LogicalPlan) -> Option<Vec<Expr>> {
     match plan {
         LogicalPlan::Projection(p) => {
-            Some(resolve_pass_through_aggregate_columns(&p.expr, &p.input))
+            let exprs = resolve_pass_through_aggregate_columns(&p.expr, &p.input);
+            Some(resolve_pass_through_projection_columns(&exprs, &p.input))
         }
         LogicalPlan::Sort(s) => top_projection_exprs(&s.input),
         LogicalPlan::Limit(l) => top_projection_exprs(&l.input),
@@ -163,6 +164,65 @@ fn top_projection_exprs(plan: &LogicalPlan) -> Option<Vec<Expr>> {
 /// output field -- fixes all of them at once, because it never re-derives a
 /// name from text; it hands the original expression to the
 /// `Expr::AggregateFunction` arm that already only looks at `func.name()`.
+/// The same problem as [`resolve_pass_through_aggregate_columns`], one node
+/// type over: an outer `Projection` whose expressions are bare `Column`
+/// references into an INNER `Projection` that holds the real call.
+///
+/// `SELECT data -> 'a' FROM t ORDER BY id` plans as
+/// `Projection([Column("json_get(t.data,Utf8(\"a\"))")])` over `Sort` over
+/// `Projection([ScalarFunction(json_get)])`. The outer expression is a bare
+/// column whose NAME is DataFusion's display text, so it reaches
+/// `Expr::Column`'s "use the name verbatim" rule and the internal rewrite
+/// target goes straight to the wire. Neither the `ScalarFunction` arm nor the
+/// `Alias` arm of the naming rule ever sees it.
+///
+/// Doc 16 inferred this double-`Projection` shape from the code and from which
+/// tests had `ORDER BY`, and flagged explicitly that it had never been dumped
+/// and confirmed. It was dumped; the inference was right. That is why the
+/// override table alone closed only `list_has_all` (which plans without the
+/// extra projection) and left the three jsonb operators diverging.
+///
+/// Resolved structurally — swap the pass-through column for the inner
+/// projection's own expression at the same position — rather than by
+/// text-matching the name, for the reason the aggregate version gives: a name
+/// heuristic works for `json_get(a,b)` and breaks on anything whose rendered
+/// text does not end at the first balanced `)`.
+fn resolve_pass_through_projection_columns(exprs: &[Expr], input: &LogicalPlan) -> Vec<Expr> {
+    // Look through the nodes that do not change column semantics. `ORDER BY`
+    // is the reason this shape exists at all, so `Sort` is the one that
+    // matters, but the others are equally transparent.
+    let mut inner = input;
+    while let Some(next) = match inner {
+        LogicalPlan::Sort(s) => Some(&*s.input),
+        LogicalPlan::Limit(l) => Some(&*l.input),
+        LogicalPlan::Distinct(d) => Some(d.input().as_ref()),
+        LogicalPlan::SubqueryAlias(s) => Some(&*s.input),
+        _ => None,
+    } {
+        inner = next;
+    }
+    let LogicalPlan::Projection(inner_proj) = inner else {
+        return exprs.to_vec();
+    };
+    if inner_proj.expr.len() != inner_proj.schema.fields().len() {
+        return exprs.to_vec();
+    }
+    exprs
+        .iter()
+        .map(|e| match e {
+            Expr::Column(c) => inner_proj
+                .schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == &c.name)
+                .and_then(|i| inner_proj.expr.get(i))
+                .cloned()
+                .unwrap_or_else(|| e.clone()),
+            other => other.clone(),
+        })
+        .collect()
+}
+
 fn resolve_pass_through_aggregate_columns(exprs: &[Expr], input: &LogicalPlan) -> Vec<Expr> {
     let LogicalPlan::Aggregate(a) = input else {
         return exprs.to_vec();
