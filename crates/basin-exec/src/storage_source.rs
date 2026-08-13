@@ -62,30 +62,35 @@
 //! fires, not just that the row count comes out right.
 //!
 //! [`StorageTableResolver`] — the [`TableResolver`] implementation this
-//! module also provides, for plugging into [`crate::build::build`] — does
-//! **not** thread that pushdown through, and this is a real gap worth
-//! stating precisely rather than papering over: [`TableResolver::open`]
-//! takes only a `TableId`. `build.rs`'s `LogicalPlan::Scan` arm resolves the
-//! source with `tables.open(*table)` and only *afterwards* hands `Scan` the
-//! plan's `projection`/`filters`, which `Scan` then applies itself, in
-//! Arrow, against whatever the source handed back — the trait has no
-//! parameter for a scan's pushdown to travel through. So `StorageTableResolver`
-//! opens every table with `ReadOptions::default()` (no projection, no
-//! filters): correct and safe — `Scan` still filters and projects exactly as
-//! it does over `MemTableResolver` — but it reads every column of every row
-//! group of every file, same as an in-memory source would. Column-projection
-//! pushdown specifically has a second obstacle even if the trait grew a
-//! pushdown parameter: `Scan::new`'s `projection: Vec<usize>` and its
-//! filters' `ColumnRef { index, .. }` are both positions into the *full*
-//! table schema (see `scan.rs`), so a source that narrows its own schema to
-//! only the selected columns would silently break that index alignment
-//! unless `build.rs` also remapped those indices — a plan-rewriting change,
-//! out of scope here. Wiring real pushdown through `build::build` therefore
-//! needs one of: (a) widening `TableResolver::open` to accept
-//! projection/filters and only push filters (not projection, for the reason
-//! above) down to `ReadOptions`, or (b) a planner-side rewrite that resolves
-//! column indices against the reduced post-projection schema. Neither is
-//! done here; [`StorageBatchSource`] is ready for either once one lands.
+//! module also provides, for plugging into [`crate::build::build`] — threads
+//! that pushdown through: [`TableResolver::open`] receives the scan's
+//! `projection` and `filters` and reports back, via
+//! [`crate::build::ScanPushdown`], which of them it honoured.
+//!
+//! # The two index spaces, and which one a filter is written in
+//!
+//! This is the seam where a wrong answer is cheapest to produce, so it is
+//! stated once, here, and both sides refer back to it.
+//!
+//! - `projection: &[usize]` — positions in the **table's** schema. That is
+//!   what [`StorageTableResolver::register`] pins, and what turns into column
+//!   names for `ReadOptions::projection`.
+//! - a filter's `ColumnRef { index, .. }` — a position within **that same
+//!   `projection` list**, i.e. within the scan's own output. The logical layer
+//!   numbers them that way: filter pushdown moves a `Filter` predicate whose
+//!   indices address its input's output into the scan, and projection pruning
+//!   renumbers them in step with the projection it shrinks
+//!   (`basin_plan::opt::projection`).
+//!
+//! The two coincide exactly when the projection is the identity `0..n`, which
+//! it is for every plan that has not been through projection pruning — which
+//! is why resolving a filter's index straight into the table schema looked
+//! right in every hand-built plan and was wrong for real queries. `SELECT n
+//! FROM u WHERE n > 7` prunes to `projection=[n]` and renumbers the predicate
+//! to position 0; read against the table that is the FIRST table column, and
+//! storage then filtered on that column instead. `expr_to_predicate` resolves
+//! through `projection` for this reason, and `build.rs` performs the matching
+//! translation on whatever filters the source declines.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -316,18 +321,24 @@ impl TableResolver for StorageTableResolver {
         // pushing some.
         let mut opts = ReadOptions::default();
         let mut pushed = crate::build::ScanPushdown::default();
-        if !projection.is_empty() {
-            opts.projection = Some(
-                projection
-                    .iter()
-                    .filter_map(|i| entry.schema.fields().get(*i).map(|f| f.name().clone()))
-                    .collect(),
-            );
+        // Every requested position must name a real column. A `filter_map`
+        // here would quietly hand back a NARROWER column list than the scan
+        // asked for while still reporting `projection_applied`, and the scan's
+        // identity remap would then read every column one slot off. A
+        // registration whose schema disagrees with the plan is a bug either
+        // way; declining the pushdown surfaces it as an out-of-range error
+        // from `Scan::new` instead of as shifted data.
+        let names: Option<Vec<String>> = projection
+            .iter()
+            .map(|i| entry.schema.fields().get(*i).map(|f| f.name().clone()))
+            .collect();
+        if let Some(names) = names.filter(|n| !n.is_empty()) {
+            opts.projection = Some(names);
             pushed.projection_applied = true;
         }
         let translated: Vec<_> = filters
             .iter()
-            .filter_map(|f| expr_to_predicate(f, &entry.schema))
+            .filter_map(|f| expr_to_predicate(f, &entry.schema, projection))
             .collect();
         if !filters.is_empty() && translated.len() == filters.len() {
             opts.filters = translated;
@@ -355,8 +366,24 @@ impl TableResolver for StorageTableResolver {
 /// `None` and the scan evaluates it Arrow-side, which is always correct and
 /// only costs I/O.
 ///
-/// Column names come from `schema`, because a `ColumnRef` carries an index into
-/// the table and storage predicates are keyed by name.
+/// Storage predicates are keyed by column NAME, so the `ColumnRef` has to be
+/// resolved to one. That resolution goes through `projection`, not straight
+/// into `schema`: a scan filter's column index is a position within the scan's
+/// own projection (see `build.rs`'s `LogicalPlan::Scan` arm for why the
+/// logical layer numbers them that way), while `schema` is the whole table.
+/// The two coincide only for an unpruned, identity projection.
+///
+/// Reading `schema` directly instead was a silent wrong answer, not a missed
+/// prune: `SELECT n FROM u WHERE n > 7` prunes the scan to `projection=[n]`
+/// and renumbers the predicate to position 0, which resolved against the table
+/// to the name of the FIRST table column and pushed *that* column's
+/// comparison into storage. Which wrong column you got — and so whether the
+/// query came back unfiltered, empty, or right by luck — depended on the
+/// SELECT list, since that is what decides the projection.
+///
+/// A position with no entry in `projection` yields `None`, so the predicate is
+/// simply not pushed and the scan evaluates it Arrow-side. Correct, and never
+/// a guess.
 ///
 /// The operator OIDs are Postgres's own, read from `pg_operator` on a live
 /// server rather than remembered: 96/410/416 are `=` for int4/int8/int8-int4,
@@ -366,6 +393,7 @@ impl TableResolver for StorageTableResolver {
 fn expr_to_predicate(
     e: &basin_plan::Expr,
     schema: &arrow_schema::Schema,
+    projection: &[usize],
 ) -> Option<basin_storage::Predicate> {
     use basin_plan::{Datum, Expr};
     use basin_storage::{Predicate, ScalarValue};
@@ -381,7 +409,8 @@ fn expr_to_predicate(
     let Expr::Literal(d, _) = rhs.as_ref() else {
         return None;
     };
-    let name = schema.fields().get(c.index as usize)?.name().clone();
+    let table_col = *projection.get(c.index as usize)?;
+    let name = schema.fields().get(table_col)?.name().clone();
 
     let scalar = match d {
         Datum::Int16(v) => ScalarValue::Int64(*v as i64),
@@ -812,6 +841,120 @@ mod tests {
             "the predicate must prune two of three files AT STORAGE, not after decode — \
              a build() that opens everything and filters Arrow-side gives the same rows \
              and throws away the scan advantage silently"
+        );
+    }
+
+    /// Three columns, chosen so that the same `> 7` predicate gives a
+    /// DIFFERENT answer on each: `uid` passes for every row, `k` for none, `n`
+    /// for exactly the last two. A predicate pushed against the wrong column
+    /// therefore cannot come out right by coincidence.
+    fn schema_uid_k_n() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("uid", DataType::Int64, false),
+            Field::new("k", DataType::Int32, false),
+            Field::new("n", DataType::Int32, false),
+        ]))
+    }
+
+    fn batch_uid_k_n() -> RecordBatch {
+        RecordBatch::try_new(
+            schema_uid_k_n(),
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 11, 12])),
+                Arc::new(arrow_array::Int32Array::from(vec![0, 0, 0])),
+                Arc::new(arrow_array::Int32Array::from(vec![7, 8, 9])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Run `plan` against a freshly written `uid/k/n` table and return the
+    /// first output column as text, so a caller can assert on VALUES.
+    fn run_uid_k_n(projection: Vec<basin_plan::ColId>, filter_index: u16) -> Vec<String> {
+        use basin_plan::{ColumnRef, Datum, Expr, LogicalPlan, OpId, SnapshotId, TableId};
+
+        let dir = TempDir::new().unwrap();
+        let storage = storage_in(&dir);
+        let project = ProjectId::new();
+        let table = TableName::new("ukn").unwrap();
+        rt().block_on(async {
+            storage
+                .write_batch(
+                    &project,
+                    &table,
+                    &basin_common::PartitionKey::default_key(),
+                    &batch_uid_k_n(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut resolver = StorageTableResolver::new(storage);
+        resolver.register(TableId(3), project, table, schema_uid_k_n());
+
+        let plan = LogicalPlan::Scan {
+            table: TableId(3),
+            projection,
+            // OID 521 is int4 `>`, from pg_operator on a live server. This is
+            // exactly the operator class `expr_to_predicate` pushes, which is
+            // why it is the one that produced wrong answers.
+            filters: vec![Expr::Binary {
+                op: OpId(basin_pgtype::Oid(521)),
+                lhs: Box::new(Expr::Column(ColumnRef {
+                    relation: 0,
+                    index: filter_index,
+                    name: "n".into(),
+                })),
+                rhs: Box::new(Expr::Literal(Datum::Int32(7), basin_pgtype::PgType::INT4)),
+            }],
+            snapshot: SnapshotId(0),
+        };
+
+        let mut op = crate::build::build(&plan, &resolver).unwrap();
+        let opts = arrow::util::display::FormatOptions::default();
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().unwrap() {
+            let f =
+                arrow::util::display::ArrayFormatter::try_new(b.column(0).as_ref(), &opts).unwrap();
+            for r in 0..b.num_rows() {
+                out.push(f.value(r).to_string());
+            }
+        }
+        out
+    }
+
+    /// The scan filter's column index is a position within the scan's own
+    /// `projection`, not within the table (see this module's docs). Resolving
+    /// it against the table schema pushed a predicate on the wrong COLUMN NAME
+    /// into storage, and storage then filtered on that column — silently, with
+    /// the right row count shape and the wrong rows.
+    ///
+    /// This is the plan `SELECT n FROM u WHERE n > 7` optimizes to. Position 0
+    /// of `[ColId(2)]` is `n`; read against the table it was `uid`, every
+    /// value of which passes `> 7`, so the answer came back UNFILTERED.
+    #[test]
+    fn a_pushed_predicate_names_the_projected_column_not_the_tables_first() {
+        assert_eq!(
+            run_uid_k_n(vec![basin_plan::ColId(2)], 0),
+            vec!["8".to_string(), "9".to_string()],
+            "`n > 7` keeps 8 and 9; `uid > 7` would keep all three and `k > 7` none — \
+             only the values tell those apart, which is why a row-count assertion \
+             would have passed on the wrong answer"
+        );
+    }
+
+    /// Same defect, opposite symptom — the half that makes row counts useless
+    /// as a check. `SELECT uid FROM u WHERE n > 7` prunes to
+    /// `projection=[uid, n]` and renumbers the predicate to position 1; read
+    /// against the table that is `k`, whose every value FAILS `> 7`, so this
+    /// direction returned zero rows. Same root cause as the test above: which
+    /// wrong column you land on depends on the SELECT list.
+    #[test]
+    fn a_pushed_predicate_is_right_when_the_projection_keeps_two_columns() {
+        assert_eq!(
+            run_uid_k_n(vec![basin_plan::ColId(0), basin_plan::ColId(2)], 1),
+            vec!["11".to_string(), "12".to_string()],
+            "uid of the rows where n > 7"
         );
     }
 

@@ -362,12 +362,29 @@ fn build_inner(
             let scan_cols: Vec<usize> = if pushed.projection_applied {
                 (0..cols.len()).collect()
             } else {
-                cols
+                cols.clone()
             };
+            // `Scan.filters`' column indices are positions within
+            // `Scan.projection` — the scan's own OUTPUT — not positions in the
+            // table. That is what the logical layer produces: filter pushdown
+            // moves a `Filter`'s predicate, whose indices address its input's
+            // output, into the scan, and projection pruning renumbers those
+            // indices in step with the projection it shrinks (see
+            // `basin_plan::opt::projection`'s `Scan` arm).
+            //
+            // The physical `Scan`, by contrast, evaluates filters against the
+            // source's UNPROJECTED batch (`scan.rs`), so the two index spaces
+            // only coincide when the source narrowed itself to the projection.
+            // When it did not, every filter index has to be translated back
+            // through `cols` first. Skipping that translation is not a slow
+            // query, it is a wrong answer: the predicate silently reads
+            // whatever column happens to sit at that position in the table.
             let scan_filters = if pushed.filters_applied {
                 Vec::new()
-            } else {
+            } else if pushed.projection_applied {
                 filters
+            } else {
+                filters_to_source_positions(filters, &cols)
             };
             Ok(Box::new(Scan::new(source, scan_cols, scan_filters)?))
         }
@@ -1601,6 +1618,41 @@ fn pg_type_for_arrow(dt: &arrow_schema::DataType) -> Result<PgType, BuildError> 
     })
 }
 
+/// Translate a scan's filters from projection-relative column positions — the
+/// logical convention, see the `LogicalPlan::Scan` arm of [`build_inner`] —
+/// into positions in the source's own schema, for a source that declined the
+/// projection and so hands back full-table batches.
+///
+/// An identity projection needs no translation at all, which covers every plan
+/// that has not been through projection pruning: lowering always emits
+/// `0..n`, and the two index spaces coincide exactly then.
+///
+/// A filter index with no entry in `cols` cannot be translated. That is a
+/// malformed plan rather than a shape to support, and it is left untouched
+/// rather than guessed at — `Scan` will then either read whatever that index
+/// names in the source schema (unchanged from before this translation
+/// existed) or reject it as out of range, both of which are better than
+/// inventing a mapping.
+fn filters_to_source_positions(filters: Vec<Expr>, cols: &[usize]) -> Vec<Expr> {
+    if cols.iter().enumerate().all(|(pos, &c)| pos == c) {
+        return filters;
+    }
+    let remap: Vec<Option<u16>> = cols.iter().map(|&c| Some(c as u16)).collect();
+    filters
+        .into_iter()
+        .map(|f| {
+            let untranslatable = f.any(&mut |e| {
+                matches!(e, Expr::Column(c) if c.relation == 0 && c.index as usize >= remap.len())
+            });
+            if untranslatable {
+                f
+            } else {
+                basin_plan::opt::projection::remap_expr(&f, 0, &remap)
+            }
+        })
+        .collect()
+}
+
 /// The column position an expression refers to, if it is a plain column.
 fn column_index(e: &Expr) -> Option<usize> {
     match e {
@@ -2024,6 +2076,105 @@ mod tests {
         let mut r = MemTableResolver::new();
         r.insert(TableId(1), schema, vec![batch]);
         r
+    }
+
+    /// Three columns whose values are pairwise distinguishable under the same
+    /// predicate, so a filter that reads the WRONG one cannot come out right
+    /// by coincidence: `uid` passes `> 7` for every row, `k` passes for none,
+    /// and `n` passes for exactly the last two.
+    fn three_col_table() -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("uid", DataType::Int64, true),
+            Field::new("k", DataType::Int32, true),
+            Field::new("n", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 11, 12])),
+                Arc::new(Int32Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![7, 8, 9])),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    /// A scan filter's column index is a position within the scan's OWN
+    /// projection, not within the table — see the `LogicalPlan::Scan` arm.
+    /// `MemTableResolver` declines the projection, so its batches carry the
+    /// whole table and the builder has to translate those indices before
+    /// handing them to `Scan`, which filters the unprojected batch.
+    ///
+    /// This is the plan `SELECT n FROM u WHERE n > 7` optimizes to: pruning
+    /// drops `uid` and `k`, leaving `projection=[ColId(2)]` and renumbering
+    /// the predicate's column to position 0. Untranslated, position 0 of the
+    /// full batch is `uid` — every value of which passes `> 7`, so the query
+    /// came back completely unfiltered rather than erroring.
+    #[test]
+    fn a_pruned_scans_filter_reads_the_projected_column_not_the_tables_first() {
+        let (schema, batch) = three_col_table();
+        let mut r = MemTableResolver::new();
+        r.insert(TableId(1), schema, vec![batch]);
+
+        let plan = scan_plan(
+            vec![ColId(2)],
+            // position 0 of `projection` == table column 2 == `n`.
+            // OID 521 is int4 `>`, from pg_operator on a live server.
+            vec![Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(521)),
+                lhs: Box::new(col(0, "n")),
+                rhs: Box::new(Expr::Literal(Datum::Int32(7), PgType::INT4)),
+            }],
+        );
+
+        let batches = drain(build(&plan, &r).unwrap());
+        let got: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..b.num_rows()).map(|i| a.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![8, 9],
+            "the predicate must be `n > 7`; `uid > 7` would keep all three rows \
+             and `k > 7` none, so the VALUES here are what tells the three apart"
+        );
+    }
+
+    /// The same translation, with the projected column no longer at position
+    /// 0 of the table: `SELECT uid FROM u WHERE n > 7` prunes to
+    /// `projection=[uid, n]` and renumbers the predicate to position 1.
+    /// Untranslated, position 1 of the full batch is `k`, whose every value
+    /// fails `> 7` — so this direction returned NOTHING. Same bug, opposite
+    /// symptom, which is why row COUNTS alone cannot pin it: only the values
+    /// distinguish "filtered correctly" from "filtered on a different column".
+    #[test]
+    fn a_pruned_scans_filter_survives_the_projection_keeping_two_columns() {
+        let (schema, batch) = three_col_table();
+        let mut r = MemTableResolver::new();
+        r.insert(TableId(1), schema, vec![batch]);
+
+        let plan = scan_plan(
+            vec![ColId(0), ColId(2)],
+            vec![Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(521)),
+                lhs: Box::new(col(1, "n")),
+                rhs: Box::new(Expr::Literal(Datum::Int32(7), PgType::INT4)),
+            }],
+        );
+
+        let batches = drain(build(&plan, &r).unwrap());
+        let got: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..b.num_rows()).map(|i| a.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(got, vec![11i64, 12], "uid of the rows where n > 7");
     }
 
     fn col(i: u16, name: &str) -> Expr {

@@ -207,7 +207,16 @@ fn collect_columns(e: &Expr, relation: u16, out: &mut BTreeSet<u16>) {
 /// upholding. A stale index here is not a case to degrade gracefully from: it
 /// is silent data corruption (a query returning the wrong column) dressed up
 /// as a query returning *a* column, so this fails loudly instead.
-fn remap_expr(e: &Expr, relation: u16, remap: &[Option<u16>]) -> Expr {
+///
+/// Public because the *physical* layer needs the inverse of the renumbering
+/// this rule performs. This rule leaves `Scan.filters`' column indices as
+/// positions within `Scan.projection` (see the `Scan` arm of [`prune`]);
+/// `basin_exec::build` has to translate them back into positions in whatever
+/// schema the batch source actually hands it, and duplicating a full
+/// expression rewriter there to do it would be a second copy of this exact
+/// walk — one that could silently drift out of step with this one as `Expr`
+/// grows variants.
+pub fn remap_expr(e: &Expr, relation: u16, remap: &[Option<u16>]) -> Expr {
     match e {
         Expr::Column(cr) => {
             if cr.relation == relation {

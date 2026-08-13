@@ -23,6 +23,14 @@
 //! result via `RecordBatch::project`. Filtering before projecting is required
 //! for this reason, not an arbitrary ordering choice.
 //!
+//! Consequently `filters`' column indices here are positions in the SOURCE's
+//! schema, the same space as `projection`'s entries. That is deliberately NOT
+//! the space `basin_plan::LogicalPlan::Scan`'s filters are written in — those
+//! are positions within the scan's own projection — so `build.rs` translates
+//! between the two. Getting that translation wrong is a wrong answer rather
+//! than an error, because both spaces are valid indices into *something*: see
+//! `build::filters_to_source_positions`.
+//!
 //! # The empty-projection rule
 //!
 //! `projection = []` means zero columns, not all columns — `COUNT(*)` and

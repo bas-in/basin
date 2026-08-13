@@ -119,6 +119,18 @@ pub enum LogicalPlan {
         projection: Vec<ColId>,
         /// Predicates the scan may evaluate itself. Pushing these down is what
         /// feeds row-group and bloom pruning.
+        ///
+        /// **Their `Expr::Column` indices are positions within `projection`,
+        /// not within the table.** `projection`'s entries are `ColId`s (table
+        /// columns); a filter's `ColumnRef { index }` is an offset into that
+        /// list. The two coincide only while `projection` is the identity
+        /// `0..n`, which is what lowering emits and therefore what every
+        /// hand-built plan and every `SELECT *` looks like — so code that reads
+        /// a filter's index as a table column passes its tests and is wrong on
+        /// real queries. `opt::projection` renumbers these in step with the
+        /// projection it shrinks; `opt::pushdown` lands predicates here already
+        /// written against the scan's output. A consumer that needs a table
+        /// column must go through `projection` to get it.
         filters: Vec<Expr>,
         snapshot: SnapshotId,
     },
