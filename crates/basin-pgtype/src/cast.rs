@@ -274,15 +274,24 @@ pub fn can_coerce(from: PgType, to: PgType, context: CastContext) -> bool {
 ///
 /// The membership is what drives the I/O fallback in [`cast_kind`], so it
 /// follows `pg_type.typcategory = 'S'` exactly: `text`, `varchar`, `bpchar`,
-/// `name`, and the internal single-byte `"char"`. Notably `xml` and `json` are
-/// category `'U'` and are *not* string types, despite being textual — adding
-/// them here would silently make `int4 -> xml` an assignment cast.
+/// `name`. Notably `xml` and `json` are category `'U'` and are *not* string
+/// types, despite being textual — adding them here would silently make
+/// `int4 -> xml` an assignment cast.
+///
+/// The internal single-byte `"char"` (oid 18) does **not** belong here either,
+/// despite looking like a fourth string type: `SELECT typname, typcategory
+/// FROM pg_type WHERE typname = 'char'` reports category `'Z'`, verified
+/// against a live PostgreSQL 18. Including it here was a bug this crate
+/// shipped with: it made the I/O fallback silently invent casts pg_cast does
+/// not have — `bool -> "char"`, `int8 -> "char"`, `jsonb -> "char"`, etc. all
+/// error in real Postgres (`cannot cast type ... to "char"`), and would
+/// wrongly succeed as an assignment cast if `"char"` were treated as string
+/// category here. `"char"`'s handful of genuine casts (to/from
+/// text/varchar/bpchar/int4) are real `pg_cast` rows and are tabulated
+/// explicitly in [`builtin_pg_cast`] instead.
 #[inline]
 pub fn is_string_category(oid: Oid) -> bool {
-    matches!(
-        oid,
-        oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CHAR
-    )
+    matches!(oid, oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME)
 }
 
 /// Pseudo-types with no values, which therefore have no casts.
@@ -410,11 +419,24 @@ fn builtin_pg_cast(from: Oid, to: Oid) -> Option<CastKind> {
         (oid::BPCHAR, oid::NAME) => Implicit,
 
         // `"char"` — the internal single-byte type (oid 18), NOT char(n).
-        // Widening it to text is implicit; int4 -> "char" has a real pg_cast
-        // row of 'e', which must be tabulated because the string I/O fallback
-        // would otherwise call it Assignment and let an int reach a "char"
-        // column silently.
+        // Its typcategory is 'Z', not 'S' (verified live), so it gets NO help
+        // from the string I/O fallback in `cast_kind` — every one of its casts
+        // must be a real, tabulated `pg_cast` row, or the pair has no cast at
+        // all. `int8 -> "char"`, `bool -> "char"`, `jsonb -> "char"`, etc. are
+        // not typos of omission: Postgres genuinely has no cast for them
+        // (`ERROR: cannot cast type bigint to "char"`), confirmed live.
+        //
+        // Widening it to text is implicit; the rest of its six real casts
+        // (to/from bpchar, varchar, and the int4 pair) are 'a'/'e' and must be
+        // tabulated explicitly, since — unlike text/varchar/bpchar/name — this
+        // type gets no free ride from `is_string_category`.
         (oid::CHAR, oid::TEXT) => Implicit,
+        (oid::CHAR, oid::BPCHAR) => Assignment,
+        (oid::CHAR, oid::VARCHAR) => Assignment,
+        (oid::CHAR, oid::INT4) => Explicit,
+        (oid::TEXT, oid::CHAR) => Assignment,
+        (oid::BPCHAR, oid::CHAR) => Assignment,
+        (oid::VARCHAR, oid::CHAR) => Assignment,
         (oid::INT4, oid::CHAR) => Explicit,
 
         // ─── date / time ────────────────────────────────────────────────────
@@ -906,10 +928,12 @@ mod tests {
         assert_eq!(cast_kind(oid::JSONB, oid::BOOL), Some(CastKind::Explicit));
     }
 
-    /// A real pg_cast row must beat the string I/O fallback. `int4 -> "char"` is
-    /// 'e' in pg_cast; the fallback would call it 'a' because `"char"` is
-    /// category 'S'. If the table lookup is ever moved after the fallback, this
-    /// is what catches it.
+    /// A real pg_cast row must beat the string I/O fallback. `int4 -> "char"`
+    /// is `'e'` in pg_cast, tabulated explicitly because `"char"` is category
+    /// `'Z'` and gets no help at all from the fallback (see
+    /// [`char_has_no_string_category_fallback`] for the general case). If the
+    /// table lookup is ever moved after (or dropped in favour of) a fallback,
+    /// this is what catches it.
     #[test]
     fn a_pg_cast_row_overrides_the_string_io_fallback() {
         assert_eq!(cast_kind(oid::INT4, oid::CHAR), Some(CastKind::Explicit));
@@ -928,6 +952,111 @@ mod tests {
             PgType::TEXT,
             CastContext::Assignment
         ));
+    }
+
+    /// `"char"` (oid 18) is `pg_type.typcategory = 'Z'`, not `'S'` — verified
+    /// against a live PostgreSQL 18 (`SELECT typname, typcategory FROM
+    /// pg_type WHERE typname = 'char'`). It must NOT be a member of
+    /// `is_string_category`, or the I/O fallback invents casts pg_cast does
+    /// not have. This was a real bug in this file: with `"char"` wrongly
+    /// treated as string category, `bool -> "char"`, `int8 -> "char"`, and
+    /// every other unrelated type paired with `"char"` silently became a
+    /// legal assignment cast, when Postgres rejects all of them outright
+    /// (`ERROR: cannot cast type ... to "char"`).
+    #[test]
+    fn char_has_no_string_category_fallback() {
+        assert!(!is_string_category(oid::CHAR));
+
+        // None of these have a pg_cast row, and "char" gets no fallback, so
+        // there must be no cast in either direction — not even explicit.
+        for other in [
+            oid::BOOL,
+            oid::BYTEA,
+            oid::INT2,
+            oid::INT8,
+            oid::OID,
+            oid::JSON,
+            oid::XML,
+            oid::FLOAT4,
+            oid::FLOAT8,
+            oid::NUMERIC,
+            oid::DATE,
+            oid::TIME,
+            oid::TIMESTAMP,
+            oid::TIMESTAMPTZ,
+            oid::INTERVAL,
+            oid::TIMETZ,
+            oid::UUID,
+            oid::JSONB,
+        ] {
+            assert_eq!(
+                cast_kind(other, oid::CHAR),
+                None,
+                "{other} -> \"char\" must not exist"
+            );
+            assert_eq!(
+                cast_kind(oid::CHAR, other),
+                None,
+                "\"char\" -> {other} must not exist"
+            );
+        }
+    }
+
+    /// `"char"`'s six real casts to/from the genuine string types, tabulated
+    /// explicitly since the fallback cannot serve them. `"char" -> text` is
+    /// implicit; the rest — both directions against bpchar and varchar — are
+    /// assignment. Verified against a live pg_cast.
+    #[test]
+    fn char_casts_to_real_string_types_are_tabulated_explicitly() {
+        assert_eq!(cast_kind(oid::CHAR, oid::TEXT), Some(CastKind::Implicit));
+        for other in [oid::BPCHAR, oid::VARCHAR] {
+            assert_eq!(
+                cast_kind(oid::CHAR, other),
+                Some(CastKind::Assignment),
+                "\"char\" -> {other}"
+            );
+        }
+        for from in [oid::TEXT, oid::BPCHAR, oid::VARCHAR] {
+            assert_eq!(
+                cast_kind(from, oid::CHAR),
+                Some(CastKind::Assignment),
+                "{from} -> \"char\""
+            );
+        }
+    }
+
+    /// `name` <-> `"char"` has no `pg_cast` row at all — both directions are
+    /// served by the fallback, and the two directions land in *different*
+    /// contexts because the fallback checks source and target independently:
+    /// `name -> "char"` only qualifies via `is_string_category(name)` (source
+    /// check, explicit), while `"char" -> name` qualifies via
+    /// `is_string_category(name)` on the *target* side (assignment). Verified
+    /// live: `INSERT` into a `"char"` column from a `name` value is rejected,
+    /// but `INSERT` into a `name` column from a `"char"` value succeeds.
+    #[test]
+    fn name_and_char_are_asymmetric_with_no_pg_cast_row() {
+        assert_eq!(cast_kind(oid::NAME, oid::CHAR), Some(CastKind::Explicit));
+        assert!(
+            !can_coerce(
+                PgType::new(oid::NAME),
+                PgType::new(oid::CHAR),
+                CastContext::Assignment
+            ),
+            "INSERT INTO t(charcol) VALUES (namecol) is an error in Postgres"
+        );
+
+        assert_eq!(
+            cast_kind(oid::CHAR, oid::NAME),
+            Some(CastKind::Assignment)
+        );
+        assert!(
+            can_coerce(
+                PgType::new(oid::CHAR),
+                PgType::new(oid::NAME),
+                CastContext::Assignment
+            ),
+            "INSERT INTO t(namecol) VALUES (charcol) is legal in Postgres"
+        );
     }
 
     /// bytea is category 'U', not 'S'. The integer<->bytea reinterpretations are
