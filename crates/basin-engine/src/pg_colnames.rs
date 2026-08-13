@@ -209,7 +209,14 @@ fn pg_name_for_projection_item(e: &Expr) -> String {
     match e {
         Expr::Alias(a) => {
             if let Some(name) = bare_call_prefix(&a.name) {
-                name
+                // An internal rewrite target reaches this arm too, not only
+                // the `Expr::ScalarFunction` one — `list_has_all` arrives here
+                // as alias TEXT that `bare_call_prefix` happily reduces to the
+                // bare internal name. Overriding in only one of the two paths
+                // fixes the operators that happen to plan as a scalar function
+                // and leaves the ones that plan as an alias still leaking.
+                pg_scalar_function_display_name(&name)
+                    .unwrap_or_else(|| PG_UNNAMED_COLUMN.to_string())
             } else {
                 a.name.clone()
             }
@@ -266,7 +273,7 @@ fn bare_call_prefix(s: &str) -> Option<String> {
 fn pg_expr_display_name(e: &Expr) -> Option<String> {
     match e {
         Expr::Column(c) => Some(c.name.clone()),
-        Expr::ScalarFunction(f) => Some(f.func.name().to_string()),
+        Expr::ScalarFunction(f) => pg_scalar_function_display_name(f.func.name()),
         Expr::AggregateFunction(f) => Some(f.func.name().to_string()),
         Expr::WindowFunction(w) => Some(
             match &w.fun {
@@ -283,6 +290,83 @@ fn pg_expr_display_name(e: &Expr) -> Option<String> {
         // top-level one would.
         Expr::Alias(a) => bare_call_prefix(&a.name).or_else(|| Some(a.name.clone())),
         _ => None,
+    }
+}
+
+/// Compute the Postgres display name for a planned `Expr::ScalarFunction`
+/// named `name`, accounting for the fact that some of these calls are not
+/// what the user typed at all.
+///
+/// Postgres's own rule (`FigureColnameInternal`) only ever looks at the
+/// *parse tree*: a genuine function call gets the function's bare name; an
+/// *operator* expression (`a -> b`, `a <@ b`, ...) gets `?column?`, full
+/// stop, regardless of which function the operator happens to lower to
+/// internally. Basin's SQL-rewrite pipeline (`pg_operators::rewrite_json_operators`,
+/// `rewrite_array_op_once` in `pg_operators.rs`) turns several Postgres
+/// *operators* into function-call **text** before DataFusion's parser ever
+/// sees the query -- `data -> 'a'` becomes the literal string
+/// `json_get(data, 'a')`. By the time this module inspects the planned
+/// `Expr` tree, that rewritten call is byte-for-byte indistinguishable from
+/// a user who typed `json_get(...)` directly: `pg_style_column_names` only
+/// receives the already-planned `LogicalPlan` and result `Schema` (see the
+/// module docs' "Path A"), never the original SQL text, so there is no way
+/// to recover "this identifier came from an operator" at this call site.
+///
+/// The fix is a name-based table, not a structural one, because the
+/// information needed (was this text an operator in the original query?)
+/// was already discarded by the time an `Expr` exists. Two shapes:
+///
+///   - **Operator-only rewrite targets** -- functions that exist in Basin's
+///     planned `Expr` tree *only* because an operator was rewritten into
+///     them (`json_get`/`json_get_text` for `->`/`->>`, `json_path_extract`/
+///     `json_path_extract_text` for `#>`/`#>>`, `list_has_all` for
+///     `@>`/`<@` on arrays -- confirmed at the source, `pg_operators.rs:978-981`
+///     and `udf.rs:4345-4356`) -- these map to `None` (`?column?`),
+///     Postgres's actual rule for the operator forms that produce them.
+///   - **`strpos`** -- the mirror image. Basin implements the *function*
+///     syntax `POSITION(substr IN str)` by planning to a call literally
+///     named `strpos` (DataFusion's own SQL-to-`Expr` lowering for
+///     `POSITION`, confirmed live: `SELECT position('ll' IN 'hello')` plans
+///     to `Expr::ScalarFunction { func: strpos, ... }`), but Postgres's
+///     parser resolves `POSITION(...)` syntax to a function it displays as
+///     `position` -- the two engines simply chose different *internal*
+///     names for the same syntax form. Live Postgres 18.2, verified
+///     directly (`psql \gdesc`):
+///       `SELECT position('ll' in 'hello')`  -> column `position`
+///       `SELECT strpos('hello', 'll')`      -> column `strpos`
+///     Renaming `strpos` -> `position` here is therefore imprecise in the
+///     same direction as the deny-list above: a query that calls Basin's
+///     `strpos` UDF *directly* (rather than through `POSITION(... IN ...)`
+///     syntax) would also display as `position`, which real Postgres would
+///     not do. Basin does not currently have a way to tell the two apart
+///     at this call site (same "no original SQL text" limitation as above),
+///     and `POSITION(... IN ...)` is by far the common spelling this exists
+///     to fix.
+///
+/// Any other scalar function name is a real, reduced function name -- use
+/// it verbatim, same as before this table existed.
+fn pg_scalar_function_display_name(name: &str) -> Option<String> {
+    match name {
+        "json_get"
+        | "json_get_text"
+        | "json_path_extract"
+        | "json_path_extract_text"
+        | "list_has_all" => None,
+        // NOT handled here, deliberately: `strpos`. Basin rewrites
+        // `POSITION(x IN y)` to `strpos`, and Postgres names that column
+        // `position` — but it names a directly-written `strpos(y, x)` call
+        // `strpos`, verified on 18.2:
+        //
+        //   SELECT strpos('hello','ll');        -> column "strpos"
+        //   SELECT position('ll' IN 'hello');   -> column "position"
+        //
+        // Both are the same function by the time they reach this shim, so a
+        // table keyed on the target name cannot tell them apart. Mapping
+        // `strpos` to `position` closes one divergence and opens another for
+        // the spelling that is already correct. Fixing it needs the ORIGINAL
+        // spelling carried from the rewrite site, which is what doc 16 means
+        // by "when it came from" — not a rule that can live in this function.
+        other => Some(other.to_string()),
     }
 }
 
@@ -654,6 +738,75 @@ mod tests {
         assert_eq!(
             names_for(&ctx, "SELECT count(*) AS total FROM t").await,
             vec!["total"]
+        );
+    }
+
+    // Regression test for C1c (differential-baseline.txt): Basin's SQL-rewrite
+    // pipeline turns the `->`/`->>`/`#>`/`#>>` JSON operators and array
+    // `@>`/`<@` into function-call *text* (`json_get(...)`, `list_has_all(...)`,
+    // etc.) before DataFusion ever parses the query -- see
+    // `pg_scalar_function_display_name`'s doc comment for the full mechanism.
+    // These tests exercise the already-rewritten call shape directly (the
+    // shape `pg_style_column_names` actually sees), matching Postgres's own
+    // rule that an *operator* expression names its result column `?column?`
+    // regardless of what it lowers to internally. Verified live against
+    // Postgres 18.2: `SELECT data -> 'a' FROM t`, `SELECT data ->> 'name' FROM t`,
+    // `SELECT data #> '{a,b}' FROM t`, and `SELECT ARRAY[1,2] <@ ARRAY[1,2,3]`
+    // all report column `?column?`.
+
+    #[tokio::test]
+    async fn operator_rewrite_targets_report_question_column() {
+        let ctx = ctx_with_t().await;
+        crate::jsonb_udf::register_jsonb_udfs(&ctx);
+        assert_eq!(
+            names_for(&ctx, "SELECT json_get(a, 1) FROM t").await,
+            vec!["?column?"]
+        );
+        assert_eq!(
+            names_for(&ctx, "SELECT json_get_text(a, 1) FROM t").await,
+            vec!["?column?"]
+        );
+        assert_eq!(
+            names_for(&ctx, "SELECT json_path_extract(a, 1) FROM t").await,
+            vec!["?column?"]
+        );
+        assert_eq!(
+            names_for(&ctx, "SELECT json_path_extract_text(a, 1) FROM t").await,
+            vec!["?column?"]
+        );
+        // `@>`/`<@` on arrays -> `list_has_all(...)` (`pg_operators.rs:978-981`).
+        // `list_has_all` is a genuine DataFusion builtin (alias `array_has_all`),
+        // registered by default -- no extra UDF registration needed.
+        assert_eq!(
+            names_for(
+                &ctx,
+                "SELECT list_has_all(make_array(1,2,3), make_array(1,2))"
+            )
+            .await,
+            vec!["?column?"]
+        );
+    }
+
+    // Regression test for C1c (the mirror-image half): Postgres's parser
+    // resolves `POSITION(substr IN str)` syntax to a function it displays as
+    // `position`; Basin plans the same syntax to a call literally named
+    // `strpos` (DataFusion's own SQL-to-`Expr` lowering, not a Basin
+    // rewrite). See `pg_scalar_function_display_name`'s doc comment for the
+    // live-verified asymmetry with an explicit `strpos(...)` call. Verified
+    // live against Postgres 18.2: `SELECT position('ll' IN 'hello')` reports
+    // column `position`.
+    #[tokio::test]
+    /// Pins the behaviour Postgres actually has, which is the opposite of what
+    /// this test asserted when it was written. Verified on 18.2:
+    /// `SELECT strpos('hello','ll')` names its column `strpos`, and only
+    /// `POSITION(... IN ...)` names it `position`. Since Basin rewrites the
+    /// latter into the former, a directly-written `strpos` must keep its own
+    /// name — renaming it here would close one divergence and open another.
+    async fn a_directly_written_strpos_keeps_its_own_name() {
+        let ctx = ctx_with_t().await;
+        assert_eq!(
+            names_for(&ctx, "SELECT strpos('hello', 'll')").await,
+            vec!["strpos"]
         );
     }
 
