@@ -19,14 +19,17 @@
 //! # What is in scope
 //!
 //! `FROM` (single table, comma-list, explicit `JOIN ... ON`), the `SELECT`
-//! list (including `*` expansion), `WHERE`, `GROUP BY` / `HAVING`,
-//! `ORDER BY`, `LIMIT` / `OFFSET`, `VALUES`, a `FROM`-less `SELECT`,
-//! `UNION` / `INTERSECT` / `EXCEPT`, plain `DISTINCT`, `WITH` / `WITH
-//! RECURSIVE` (see [`lower_with_clause`]), and window functions (`OVER
-//! (...)`, see [`apply_windows`]). Everything else — a named `WINDOW`
-//! clause referenced via `OVER <name>`, `DISTINCT ON`, `LATERAL`, a
-//! subquery or set-returning function in `FROM`, `NATURAL`/`USING` joins, a
-//! CTE's own column-alias list, a data-modifying CTE — returns
+//! list (including `*` expansion and set-returning functions such as
+//! `generate_series`/`unnest`, see [`apply_project_set`]), `WHERE`, `GROUP
+//! BY` / `HAVING`, `ORDER BY`, `LIMIT` / `OFFSET`, `VALUES`, a `FROM`-less
+//! `SELECT`, `UNION` / `INTERSECT` / `EXCEPT`, plain `DISTINCT`, `WITH` /
+//! `WITH RECURSIVE` (see [`lower_with_clause`]), and window functions
+//! (`OVER (...)`, see [`apply_windows`]). Everything else — a named
+//! `WINDOW` clause referenced via `OVER <name>`, `DISTINCT ON`, `LATERAL`,
+//! a subquery or set-returning function in `FROM`, `NATURAL`/`USING`
+//! joins, a CTE's own column-alias list, a data-modifying CTE, a
+//! set-returning function combined with `GROUP BY`/an aggregate, or one
+//! nested inside another set-returning function's own arguments — returns
 //! [`LowerError::Unsupported`] naming the construct. That is a correct
 //! outcome for this increment, not a bug.
 //!
@@ -656,6 +659,22 @@ fn lower_select_stmt_body(
         || having_expr.is_some()
         || raw_target.iter().any(|(e, _)| e.contains_aggregate());
 
+    // A live server DOES allow a set-returning call alongside `GROUP BY`/an
+    // aggregate (it expands rows AFTER aggregation finishes, over the
+    // aggregated output), but that needs `apply_project_set` to run on top
+    // of `having_applied` instead of `base_plan`, with its own width fixed
+    // up accordingly — a second, parallel wiring this increment does not
+    // add. Refusing outright keeps the refusal honest (a named
+    // `Unsupported`) rather than reaching `rewrite_post_agg`, which would
+    // reject a bare column inside the SRF's own arguments with a confusing
+    // "must appear in GROUP BY" message that has nothing to do with the real
+    // reason.
+    if has_agg && raw_target.iter().any(|(e, _)| e.contains_srf()) {
+        return Err(LowerError::Unsupported(
+            "a set-returning function combined with GROUP BY / an aggregate function is not yet lowered".into(),
+        ));
+    }
+
     let plan = if has_agg {
         let mut aggs = Vec::new();
         let target = raw_target
@@ -703,7 +722,7 @@ fn lower_select_stmt_body(
         // Window functions are computed over the post-WHERE, post-GROUP BY
         // (and post-HAVING) row set — `windows` sees exactly the rows/columns
         // `having_applied` produces, per the module docs.
-        let (windowed, target) = apply_windows(having_applied, agg_width, target);
+        let (windowed, target, _window_width) = apply_windows(having_applied, agg_width, target);
         let sorted = if order_keys.is_empty() {
             windowed
         } else {
@@ -730,12 +749,16 @@ fn lower_select_stmt_body(
         }
 
         let base_width = scope.total_len();
-        let (windowed, target) = apply_windows(base_plan, base_width, raw_target);
+        let (windowed, target, window_width) = apply_windows(base_plan, base_width, raw_target);
+        // Strictly after `apply_windows` — see `apply_project_set`'s own
+        // docs for why the order is fixed, not a choice, and why its width
+        // is `base_width + window_width`, not `base_width`.
+        let (srf_applied, target) = apply_project_set(windowed, base_width + window_width, target)?;
         let sorted = if order_keys.is_empty() {
-            windowed
+            srf_applied
         } else {
             LogicalPlan::Sort {
-                input: Box::new(windowed),
+                input: Box::new(srf_applied),
                 keys: order_keys,
             }
         };
@@ -1383,12 +1406,14 @@ fn lower_target_list(
             }
         }
 
+        // A set-returning call is left as `Expr::SetReturning` here, same as
+        // any other expression — [`apply_project_set`] is what turns it into
+        // a real [`LogicalPlan::ProjectSet`], once the aggregate/window
+        // shape of the rest of the statement is known (SRF expansion cannot
+        // be decided per-entry: two SRFs in the same list share ONE
+        // `ProjectSet`, run in lockstep, not one each — see that function's
+        // docs).
         let expr = lower_expr(val, ctx)?;
-        if expr.contains_srf() {
-            return Err(LowerError::Unsupported(
-                "set-returning functions in the SELECT list are not yet lowered".into(),
-            ));
-        }
         let alias = if !rt.name.is_empty() {
             rt.name.clone()
         } else {
@@ -1590,26 +1615,145 @@ fn stack_windows(input: LogicalPlan, groups: Vec<Vec<Expr>>) -> LogicalPlan {
 /// projection) is what fixes `input` here to `base_plan` (no `GROUP BY`) or
 /// the post-`HAVING` aggregate output (`GROUP BY` present), never anything
 /// already carrying the query's own final `ORDER BY`/`Project`.
+///
+/// The returned `usize` is how many columns got appended (`0` when `target`
+/// had no window calls at all) — [`apply_project_set`] needs it to know
+/// where ITS OWN appended columns must start, since it runs strictly after
+/// this (see that function's docs for why the order is fixed, not a choice).
 fn apply_windows(
     input: LogicalPlan,
     base_width: usize,
     target: Vec<(Expr, String)>,
-) -> (LogicalPlan, Vec<(Expr, String)>) {
+) -> (LogicalPlan, Vec<(Expr, String)>, usize) {
     let mut collected = Vec::new();
     for (e, _) in &target {
         collect_windows(e, &mut collected);
     }
     if collected.is_empty() {
-        return (input, target);
+        return (input, target, 0);
     }
     let groups = group_by_window_spec(collected);
     let flat: Vec<Expr> = groups.iter().flatten().cloned().collect();
+    let added = flat.len();
     let plan = stack_windows(input, groups);
     let target = target
         .into_iter()
         .map(|(e, alias)| (rewrite_post_window(&e, base_width, &flat), alias))
         .collect();
-    (plan, target)
+    (plan, target, added)
+}
+
+// ─── SET-RETURNING FUNCTIONS ────────────────────────────────────────────────
+
+/// Collect every distinct (structural-equality) set-returning call inside
+/// `expr` into `out`, the SRF analogue of [`collect_windows`] — but where
+/// that function may treat a match as a leaf with no further checking
+/// (Postgres rejects a window nested inside another window's own args at
+/// parse analysis, so there is never a second, deeper one to find), a live
+/// server DOES parse and run `generate_series(1, generate_series(1,3))`, so
+/// silently treating `expr` as a leaf here would drop the inner call on the
+/// floor rather than lowering it or refusing it. Basin's `ProjectSet`
+/// operator cannot evaluate that shape regardless: `basin-exec/src/cte.rs`'s
+/// `resolve_srf` requires every argument to be plain, single-row scalar
+/// eval, and `basin-exec/src/eval.rs` has no case for `Expr::SetReturning`
+/// at all (an aggregate/window expression hits that same "not scalar eval"
+/// wall in that file, for the same structural reason). Reporting a named
+/// [`LowerError::Unsupported`] here, at lowering time, is the alternative to
+/// that surfacing as an executor-internal error once a plan already claims
+/// to be buildable.
+fn collect_srfs(expr: &Expr, out: &mut Vec<Expr>) -> Result<(), LowerError> {
+    if let Expr::SetReturning { args, .. } = expr {
+        if args.iter().any(|a| a.contains_srf()) {
+            return Err(LowerError::Unsupported(
+                "a set-returning function nested inside another set-returning \
+                 function's arguments is not yet lowered"
+                    .into(),
+            ));
+        }
+        if !out.contains(expr) {
+            out.push(expr.clone());
+        }
+        return Ok(());
+    }
+    let mut err = None;
+    expr.for_each_child(&mut |c| {
+        if err.is_none() {
+            if let Err(e) = collect_srfs(c, out) {
+                err = Some(e);
+            }
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Replace every `Expr::SetReturning` inside `expr` with a `Column`
+/// reference into the [`LogicalPlan::ProjectSet`] [`apply_project_set`]
+/// built for `flat`, at `input_width + <its position in flat>` — the SRF
+/// mirror of [`rewrite_post_window`]; see that function for why stopping at
+/// the first match (rather than recursing into it) is correct once `flat`
+/// is known to hold no nested SRF (`collect_srfs` already refused that
+/// shape before this ever runs).
+fn rewrite_post_srf(expr: &Expr, input_width: usize, flat: &[Expr]) -> Expr {
+    try_transform(expr, &mut |e| {
+        if matches!(e, Expr::SetReturning { .. }) {
+            let pos = flat.iter().position(|s| s == e).expect(
+                "every Expr::SetReturning was collected into `flat` before this rewrite ran",
+            );
+            return Some(Ok(Expr::Column(ColumnRef {
+                relation: 0,
+                index: (input_width + pos) as u16,
+                name: "?column?".to_string(),
+            })));
+        }
+        None
+    })
+    .expect("rewrite_post_srf's callback never returns Err")
+}
+
+/// Extract every set-returning call inside `target`'s expressions into a
+/// single [`LogicalPlan::ProjectSet`] above `input`, and rewrite `target` to
+/// reference its appended columns instead of carrying `Expr::SetReturning`
+/// directly. All of `target`'s SRF calls go into ONE `ProjectSet` node,
+/// never one each: `LogicalPlan::ProjectSet`'s own docs (and a live server —
+/// `SELECT generate_series(1,2), generate_series(1,4)` is 4 rows, lockstep
+/// to the longest with NULL padding, not a 2×4 cartesian product) fix that
+/// as the meaning of "more than one SRF in a target list", so splitting them
+/// across multiple `ProjectSet`s would compute a different, wrong answer
+/// (each SRF's own natural length, cross-joined) rather than merely a
+/// differently-shaped plan for the same one.
+///
+/// Must run strictly AFTER [`apply_windows`], never before: a live server
+/// computes a window function over the PRE-expansion row set, not the
+/// post-expansion one — `SELECT generate_series(1,3), rank() OVER (ORDER BY
+/// 1)` gives `rank = 1` on all three expanded rows (there is only one row,
+/// with one rank, before `generate_series` explodes it into three), not
+/// three independently-ranked rows. `input_width` is `input`'s width AFTER
+/// any window columns `apply_windows` already appended, which is exactly
+/// what that function's own `usize` return value is for.
+fn apply_project_set(
+    input: LogicalPlan,
+    input_width: usize,
+    target: Vec<(Expr, String)>,
+) -> Result<(LogicalPlan, Vec<(Expr, String)>), LowerError> {
+    let mut collected = Vec::new();
+    for (e, _) in &target {
+        collect_srfs(e, &mut collected)?;
+    }
+    if collected.is_empty() {
+        return Ok((input, target));
+    }
+    let plan = LogicalPlan::ProjectSet {
+        input: Box::new(input),
+        srfs: collected.clone(),
+    };
+    let target = target
+        .into_iter()
+        .map(|(e, alias)| (rewrite_post_srf(&e, input_width, &collected), alias))
+        .collect();
+    Ok((plan, target))
 }
 
 fn sort_keys_contain_window(keys: &[SortKey]) -> bool {
@@ -2863,7 +3007,147 @@ mod tests {
         assert!(matches!(err, LowerError::Unsupported(_)));
     }
 
-    // --- 11: WITH / CTE -> Cte / CteRef -------------------------------------
+    // --- 11: Set-returning functions -> ProjectSet --------------------------
+
+    #[test]
+    fn a_single_srf_lowers_to_a_project_set_above_an_empty_input() {
+        let plan = lower("SELECT generate_series(1, 3)").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(exprs.len(), 1);
+        assert_eq!(exprs[0].0, col(0, "?column?"));
+
+        let LogicalPlan::ProjectSet { input, srfs } = *input else {
+            panic!("expected ProjectSet directly under Project, got {input:?}");
+        };
+        assert_eq!(srfs.len(), 1);
+        let Expr::SetReturning { func, args } = &srfs[0] else {
+            panic!("expected an Expr::SetReturning, got {:?}", srfs[0]);
+        };
+        assert_eq!(*func, crate::FuncId(Oid(1066)));
+        assert_eq!(*args, vec![int_lit(1), int_lit(3)]);
+        assert!(matches!(
+            *input,
+            LogicalPlan::Empty {
+                produce_one_row: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn two_srfs_of_different_lengths_share_one_project_set_not_a_cartesian_product() {
+        // A separate ProjectSet per SRF (or a cartesian product of their
+        // lengths) would silently compute the pre-10 rule. The fix is that
+        // BOTH calls land in ONE ProjectSet node, which is what makes the
+        // executor's lockstep-to-the-longest/NULL-pad rule (verified
+        // against a live PostgreSQL 18 server — see `LogicalPlan::
+        // ProjectSet`'s own docs) the meaning of this plan, rather than a
+        // 2x4 cross join.
+        let plan = lower("SELECT generate_series(1,2), generate_series(1,4)").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(exprs[0].0, col(0, "?column?"));
+        assert_eq!(exprs[1].0, col(1, "?column?"));
+
+        let LogicalPlan::ProjectSet { srfs, .. } = *input else {
+            panic!("expected a single ProjectSet under Project");
+        };
+        assert_eq!(
+            srfs.len(),
+            2,
+            "both SRFs belong to the SAME ProjectSet node, not one each"
+        );
+    }
+
+    #[test]
+    fn an_srf_alongside_a_plain_column_leaves_the_column_untouched_and_appends_the_srf() {
+        let plan = lower("SELECT a, generate_series(1,3) FROM t").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(exprs[0], (col(1, "a"), "a".to_string()));
+        // `t` is 3 columns wide (id, a, b); the SRF's own output column is
+        // appended right after it, exactly like a window function's.
+        assert_eq!(exprs[1].0, col(3, "?column?"));
+
+        let LogicalPlan::ProjectSet { input, srfs } = *input else {
+            panic!("expected ProjectSet directly under Project");
+        };
+        assert_eq!(srfs.len(), 1);
+        assert!(matches!(*input, LogicalPlan::Scan { .. }));
+    }
+
+    #[test]
+    fn an_srf_nested_inside_another_srfs_arguments_is_rejected() {
+        // A live PostgreSQL server parses AND RUNS
+        // `generate_series(1, generate_series(1,3))` — this is not invalid
+        // SQL. It is invalid for Basin specifically: `ProjectSet::
+        // resolve_srf` (`basin-exec/src/cte.rs`) requires every argument to
+        // be plain scalar eval, and `eval::eval` has no case for
+        // `Expr::SetReturning` at all — see `collect_srfs`'s docs. Refusing
+        // here, by name, is the alternative to that surfacing as an
+        // executor-internal error once a plan already claims to be
+        // buildable.
+        let err = lower("SELECT generate_series(1, generate_series(1,3))").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("nested"),
+            "message should call out the nesting: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_srf_combined_with_an_aggregate_is_rejected_with_the_real_reason() {
+        // Before this rejection existed, such a query would have reached
+        // `rewrite_post_agg` and failed with "column must appear in the
+        // GROUP BY clause" — technically true of a bare column inside the
+        // SRF's own arguments, but not the actual reason this doesn't lower,
+        // and confusing for anyone hitting it. This asserts the real reason
+        // is what gets reported.
+        let err = lower("SELECT sum(id), generate_series(1,3) FROM t").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("GROUP BY") || msg.contains("aggregate"),
+            "message should name the real reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_srf_sits_above_a_window_node_since_windows_see_pre_expansion_rows() {
+        // Verified against a live server: `SELECT generate_series(1,3),
+        // rank() OVER (ORDER BY 1)` gives `rank = 1` on all three expanded
+        // rows — the window function saw the single pre-expansion row, not
+        // the three post-expansion ones. `ProjectSet` must therefore sit
+        // ABOVE `Window`, not below it, and its own appended column must
+        // land after the window's.
+        let plan =
+            lower("SELECT generate_series(1,3), rank() OVER (ORDER BY a) FROM t").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        // `t` is 3 columns wide; the window's own column lands at 3, and the
+        // SRF's own column is appended after THAT, at 4.
+        assert_eq!(exprs[0].0, col(4, "?column?"));
+        assert_eq!(exprs[1].0, col(3, "?column?"));
+
+        let LogicalPlan::ProjectSet { input, srfs } = *input else {
+            panic!("expected ProjectSet directly under Project, got {input:?}");
+        };
+        assert_eq!(srfs.len(), 1);
+        assert!(
+            matches!(*input, LogicalPlan::Window { .. }),
+            "ProjectSet must sit directly above Window, got {input:?}"
+        );
+    }
+
+    // --- 12: WITH / CTE -> Cte / CteRef -------------------------------------
 
     #[test]
     fn a_cte_lowers_to_cte_wrapping_a_cteref() {
