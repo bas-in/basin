@@ -223,6 +223,41 @@ const OID_RTRIM_2: u32 = 876; // rtrim(text, text)
 const OID_REPLACE: u32 = 2087; // replace(text, text, text)
 const OID_STRPOS: u32 = 868; // strpos(text, text)
 
+// ─── Math — trig/log/exp/power (see docs/migration/df-removal/19-expires-at-removal.md
+// entry 1: these OIDs already existed in `basin_pgtype::func::FUNCS` as
+// planner-resolution groundwork, unbacked here. Every OID below was read from
+// the same live PostgreSQL 18 `pg_proc` that table's own module docs describe
+// querying — not recalled from memory. Numeric-argument overloads that would
+// need arbitrary-precision transcendental math (`sqrt`/`ln`/`log`/`exp`/
+// `power` on `numeric`) are deliberately NOT in this list — see the "Math —
+// numeric transcendental overloads" comment further down for why routing them
+// through `f64` instead would be the exact silent-wrong-answer class of bug
+// this file's own module docs warn against, and why leaving them unresolved
+// (falling through to the `other =>` arm) is the honest choice instead.
+const OID_SQRT_FLOAT8: u32 = 1344; // sqrt(double precision)
+const OID_CBRT_FLOAT8: u32 = 1345; // cbrt(double precision)
+const OID_POWER_FLOAT8: u32 = 1368; // power(double precision, double precision)
+const OID_LN_FLOAT8: u32 = 1341; // ln(double precision)
+const OID_LOG_FLOAT8: u32 = 1340; // log(double precision) — base 10, NOT natural log
+const OID_EXP_FLOAT8: u32 = 1347; // exp(double precision)
+const OID_TRUNC_FLOAT8: u32 = 1343; // trunc(double precision)
+const OID_TRUNC_NUMERIC: u32 = 1710; // trunc(numeric)
+const OID_TRUNC_NUMERIC_N: u32 = 1709; // trunc(numeric, int)
+const OID_DEGREES_FLOAT8: u32 = 1608; // degrees(double precision)
+const OID_RADIANS_FLOAT8: u32 = 1609; // radians(double precision)
+const OID_PI: u32 = 1610; // pi() — niladic
+const OID_SIGN_FLOAT8: u32 = 2310; // sign(double precision)
+const OID_SIGN_NUMERIC: u32 = 1706; // sign(numeric)
+const OID_CEILING_FLOAT8: u32 = 2320; // ceiling(double precision) — SQL-standard alias of ceil
+const OID_CEILING_NUMERIC: u32 = 2167; // ceiling(numeric)
+const OID_ACOS_FLOAT8: u32 = 1601; // acos(double precision)
+const OID_ASIN_FLOAT8: u32 = 1600; // asin(double precision)
+const OID_ATAN_FLOAT8: u32 = 1602; // atan(double precision)
+const OID_ATAN2_FLOAT8: u32 = 1603; // atan2(double precision, double precision)
+const OID_COS_FLOAT8: u32 = 1605; // cos(double precision)
+const OID_SIN_FLOAT8: u32 = 1604; // sin(double precision)
+const OID_TAN_FLOAT8: u32 = 1606; // tan(double precision)
+
 /// Evaluate a scalar expression against every row of `batch`, producing one
 /// Arrow array of length `batch.num_rows()`.
 pub fn eval(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
@@ -1152,6 +1187,83 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
             eval_strpos(&s, &needle)
         }
 
+        OID_SQRT_FLOAT8 => float8_unary_checked(&a(0)?, pg_sqrt_f64),
+        OID_CBRT_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::cbrt,
+        ))),
+        OID_POWER_FLOAT8 => {
+            let base = a(0)?;
+            let exp = a(1)?;
+            float8_binary_checked(&base, &exp, pg_power_f64)
+        }
+        OID_LN_FLOAT8 => float8_unary_checked(&a(0)?, pg_ln_f64),
+        OID_LOG_FLOAT8 => float8_unary_checked(&a(0)?, pg_log10_f64),
+        OID_EXP_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::exp,
+        ))),
+        OID_TRUNC_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::trunc,
+        ))),
+        OID_TRUNC_NUMERIC => decimal_trunc_fixed(&a(0)?, 0),
+        OID_TRUNC_NUMERIC_N => {
+            let val = a(0)?;
+            let ndigits = a(1)?;
+            decimal_trunc_per_row(&val, &ndigits)
+        }
+        OID_DEGREES_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::to_degrees,
+        ))),
+        OID_RADIANS_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::to_radians,
+        ))),
+        OID_PI => Ok(Arc::new(Float64Array::from(vec![
+            std::f64::consts::PI;
+            batch.num_rows()
+        ]))),
+        OID_SIGN_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            pg_sign_f64,
+        ))),
+        OID_SIGN_NUMERIC => decimal_sign(&a(0)?),
+        OID_CEILING_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::ceil,
+        ))),
+        OID_CEILING_NUMERIC => decimal_ceil(&a(0)?),
+        OID_ACOS_FLOAT8 => float8_unary_checked(&a(0)?, pg_acos_f64),
+        OID_ASIN_FLOAT8 => float8_unary_checked(&a(0)?, pg_asin_f64),
+        OID_ATAN_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::atan,
+        ))),
+        OID_ATAN2_FLOAT8 => {
+            let y_arr = a(0)?;
+            let x_arr = a(1)?;
+            let y = downcast_array::<Float64Array>(&y_arr, "double precision")?;
+            let x = downcast_array::<Float64Array>(&x_arr, "double precision")?;
+            Ok(Arc::new(
+                arity::binary::<_, _, _, Float64Type>(y, x, f64::atan2)
+                    .map_err(|e| map_arrow(e, "atan2"))?,
+            ))
+        }
+        OID_COS_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::cos,
+        ))),
+        OID_SIN_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::sin,
+        ))),
+        OID_TAN_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::tan,
+        ))),
+
         other => Err(ExecError::Internal(format!(
             "scalar function oid {other} is not implemented in eval yet — the bridge should \
              fall back to DataFusion for it rather than guess"
@@ -1681,6 +1793,290 @@ fn decimal_floor(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
     Ok(Arc::new(out))
 }
 
+// ─── Math — trig/log/exp/power (float8) ────────────────────────────────────
+//
+// Every closure below is `f64 -> Result<f64, ExecError>` rather than the
+// infallible `f64 -> f64` the simpler functions above use directly with
+// `arity::unary` — `sqrt`/`ln`/`log`/`asin`/`acos` all have real domains
+// narrower than "every finite f64", and Postgres ERRORS outside them rather
+// than returning `NaN`/`-inf` the way the underlying libm call would. Using
+// `try_unary` (via [`float8_unary_checked`]) is what turns that into a
+// catchable [`ExecError`] instead of a silently wrong numeric answer reaching
+// the client.
+
+/// Apply a fallible `f64 -> f64` closure elementwise, NULL-in/NULL-out (the
+/// null slot is never passed to `f`, same guarantee [`arity::try_unary`]
+/// gives every other decimal path in this file — see the module docs' point
+/// 7). Shared by every float8 math function below that has a real domain
+/// restriction (`sqrt`, `ln`, `log`, `asin`, `acos`).
+fn float8_unary_checked(
+    arr: &ArrayRef,
+    f: impl Fn(f64) -> Result<f64, ExecError>,
+) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Float64Array>(arr, "double precision")?;
+    let mut out = Vec::with_capacity(a.len());
+    for i in 0..a.len() {
+        if a.is_null(i) {
+            out.push(None);
+        } else {
+            out.push(Some(f(a.value(i))?));
+        }
+    }
+    Ok(Arc::new(Float64Array::from(out)))
+}
+
+/// [`float8_unary_checked`]'s two-argument counterpart, for `power(float8,
+/// float8)` — the one float8 math function here whose domain restriction
+/// depends on both arguments together (negative base, non-integer exponent),
+/// not on one argument in isolation.
+fn float8_binary_checked(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+    f: impl Fn(f64, f64) -> Result<f64, ExecError>,
+) -> Result<ArrayRef, ExecError> {
+    let l = downcast_array::<Float64Array>(lhs, "double precision")?;
+    let r = downcast_array::<Float64Array>(rhs, "double precision")?;
+    let n = l.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if l.is_null(i) || r.is_null(i) {
+            out.push(None);
+        } else {
+            out.push(Some(f(l.value(i), r.value(i))?));
+        }
+    }
+    Ok(Arc::new(Float64Array::from(out)))
+}
+
+/// `sqrt(double precision)`. Postgres errors rather than returning `NaN` for
+/// a negative input. Verified against a live PostgreSQL 18:
+/// `SELECT sqrt(-1::float8)` raises `ERROR: 2201F: cannot take square root of
+/// a negative number` (SQLSTATE 2201F, `invalid_argument_for_power_function`
+/// — the same SQLSTATE Postgres uses for `power`'s domain error below, not a
+/// dedicated "sqrt" code). `f64::sqrt` on a negative number silently produces
+/// `NaN`, which is why this cannot be `arity::unary(f64::sqrt)`.
+fn pg_sqrt_f64(x: f64) -> Result<f64, ExecError> {
+    if x < 0.0 {
+        return Err(ExecError::TypeMismatch(
+            "cannot take square root of a negative number".to_string(),
+        ));
+    }
+    Ok(x.sqrt())
+}
+
+/// `ln(double precision)`: natural log. Distinct from `log(double precision)`
+/// ([`pg_log10_f64`]), which is base 10 — confirmed live that Postgres's
+/// one-argument `log` is NOT natural log, a common point of confusion.
+/// Verified live: `SELECT ln(0::float8)` raises `ERROR: 2201E: cannot take
+/// logarithm of zero`; `SELECT ln(-1::float8)` raises `ERROR: 2201E: cannot
+/// take logarithm of a negative number` (SQLSTATE 2201E,
+/// `invalid_argument_for_logarithm`, both cases — same code, two message
+/// shapes, matched exactly here since the shapes differ in real Postgres).
+fn pg_ln_f64(x: f64) -> Result<f64, ExecError> {
+    reject_nonpositive_log_argument(x)?;
+    Ok(x.ln())
+}
+
+/// `log(double precision)`: base 10, one-argument form. There is no
+/// `log(float8, float8)` two-argument overload in real Postgres — only
+/// `numeric` has an explicit-base form (`basin_pgtype::func`'s module docs
+/// confirm exactly three `log` `pg_proc` rows exist, not four) — so this is
+/// the only `log` float8 entry point. Verified live: `SELECT log(0::float8)`
+/// and `SELECT log(-1::float8)` raise the same two SQLSTATE-2201E shapes as
+/// `ln` above.
+fn pg_log10_f64(x: f64) -> Result<f64, ExecError> {
+    reject_nonpositive_log_argument(x)?;
+    Ok(x.log10())
+}
+
+/// Shared domain check for `ln`/`log`: zero and negative arguments are two
+/// different Postgres error messages (both SQLSTATE 2201E), not one generic
+/// "invalid argument" — matched exactly rather than collapsed into a single
+/// wording.
+fn reject_nonpositive_log_argument(x: f64) -> Result<(), ExecError> {
+    if x == 0.0 {
+        return Err(ExecError::TypeMismatch(
+            "cannot take logarithm of zero".to_string(),
+        ));
+    }
+    if x < 0.0 {
+        return Err(ExecError::TypeMismatch(
+            "cannot take logarithm of a negative number".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `power(double precision, double precision)`. `power(0, 0) = 1` needs no
+/// special case — confirmed live, and `0f64.powf(0.0) == 1.0` in Rust too
+/// (IEEE 754's own rule, not a Postgres-specific one). The one real domain
+/// restriction: a negative base raised to a non-integer exponent is a
+/// complex number, and Postgres errors rather than returning `NaN` the way
+/// `f64::powf` does on its own. Verified live: `SELECT power(-2::float8,
+/// 0.5::float8)` raises `ERROR: 2201F: a negative number raised to a
+/// non-integer power yields a complex result` (SQLSTATE 2201F, the same code
+/// `sqrt`'s domain error uses). `power(-2, 2)` and `power(-2, 3)` (integer
+/// exponents) are fine and must NOT hit this check — `exponent.fract() !=
+/// 0.0` is exactly Postgres's own "is the exponent integral" test.
+fn pg_power_f64(base: f64, exponent: f64) -> Result<f64, ExecError> {
+    if base < 0.0 && exponent.fract() != 0.0 {
+        return Err(ExecError::TypeMismatch(
+            "a negative number raised to a non-integer power yields a complex result".to_string(),
+        ));
+    }
+    Ok(base.powf(exponent))
+}
+
+/// `asin(double precision)`. Verified live: `SELECT asin(2::float8)` raises
+/// `ERROR: 22003: input is out of range` — SQLSTATE 22003
+/// (`numeric_value_out_of_range`), a genuinely different code from the
+/// `ln`/`sqrt`/`power` domain errors above, not the same one reused.
+/// `f64::asin` outside `[-1, 1]` silently returns `NaN`, which is why this
+/// needs the checked path rather than `arity::unary(f64::asin)`.
+fn pg_asin_f64(x: f64) -> Result<f64, ExecError> {
+    reject_out_of_trig_domain(x)?;
+    Ok(x.asin())
+}
+
+/// `acos(double precision)`. See [`pg_asin_f64`] — same domain `[-1, 1]`,
+/// same SQLSTATE 22003 "input is out of range" on a live PostgreSQL 18.
+fn pg_acos_f64(x: f64) -> Result<f64, ExecError> {
+    reject_out_of_trig_domain(x)?;
+    Ok(x.acos())
+}
+
+fn reject_out_of_trig_domain(x: f64) -> Result<(), ExecError> {
+    if !(-1.0..=1.0).contains(&x) {
+        return Err(ExecError::TypeMismatch("input is out of range".to_string()));
+    }
+    Ok(())
+}
+
+/// `sign(double precision)`. NOT `f64::signum` — Rust's `signum` returns
+/// `1.0` for `+0.0` and `-1.0` for `-0.0` (it reports the sign bit, not
+/// "is this positive"), where Postgres's `sign(0::float8)` is confirmed live
+/// to be `0`, not `1` or `-1`.
+fn pg_sign_f64(x: f64) -> f64 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        // Covers +0.0, -0.0, and NaN (comparisons against NaN are always
+        // false, so both branches above fall through here) — NaN is not a
+        // documented Postgres `sign` input and this file does not special
+        // case it further.
+        0.0
+    }
+}
+
+/// `sign(numeric)`: `-1`, `0` or `1`, at the array's own physical scale —
+/// same "output keeps the input's scale" convention [`decimal_round_value`]'s
+/// doc explains for `round`/`ceil`/`floor`. Pure integer comparison, no
+/// transcendental math needed, unlike `sqrt`/`ln`/`log`/`exp`/`power` on
+/// `numeric` (see the "Math — numeric transcendental overloads" comment)
+/// — which is exactly why this one IS implemented here. Verified live:
+/// `sign(-5::numeric) = -1`.
+fn decimal_sign(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Decimal128Array>(arr, "numeric")?;
+    let (precision, scale) = (a.precision(), a.scale());
+    let divisor = pow10(scale as i32).unwrap_or(1);
+    let out = arity::unary::<Decimal128Type, _, Decimal128Type>(a, |v| match v.cmp(&0) {
+        std::cmp::Ordering::Greater => divisor,
+        std::cmp::Ordering::Less => -divisor,
+        std::cmp::Ordering::Equal => 0,
+    });
+    let out = out
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| map_arrow(e, "sign"))?;
+    Ok(Arc::new(out))
+}
+
+/// `trunc(numeric)` / `trunc(numeric, ndigits)` with a single, query-wide
+/// `ndigits` (0 for the one-argument form) — the fixed-`ndigits` counterpart
+/// to [`decimal_round_fixed`], with truncation instead of rounding.
+fn decimal_trunc_fixed(arr: &ArrayRef, ndigits: i32) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Decimal128Array>(arr, "numeric")?;
+    let (precision, scale) = (a.precision(), a.scale());
+    let scale_i32 = scale as i32;
+    let out = arity::try_unary::<Decimal128Type, _, Decimal128Type>(a, |v| {
+        Ok::<_, ArrowError>(decimal_trunc_value(v, scale_i32, ndigits))
+    })
+    .map_err(|e| map_arrow(e, "trunc"))?;
+    let out = out
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| map_arrow(e, "trunc"))?;
+    Ok(Arc::new(out))
+}
+
+/// `trunc(numeric, ndigits)` where `ndigits` is a per-row expression — the
+/// general case [`decimal_trunc_fixed`] wraps, mirroring
+/// [`decimal_round_per_row`].
+fn decimal_trunc_per_row(arr: &ArrayRef, ndigits: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Decimal128Array>(arr, "numeric")?;
+    let n = downcast_array::<Int32Array>(ndigits, "integer")?;
+    let (precision, scale) = (a.precision(), a.scale());
+    let scale_i32 = scale as i32;
+    let out =
+        arity::try_binary::<&Decimal128Array, &Int32Array, _, Decimal128Type>(a, n, |v, nd| {
+            Ok::<_, ArrowError>(decimal_trunc_value(v, scale_i32, nd))
+        })
+        .map_err(|e| map_arrow(e, "trunc"))?;
+    let out = out
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| map_arrow(e, "trunc"))?;
+    Ok(Arc::new(out))
+}
+
+/// `trunc(numeric[, ndigits])`'s rule: truncate toward zero (unlike `round`,
+/// no tie-breaking question exists here at all). `m` is the `Decimal128`
+/// physical mantissa at `scale` decimal places, same representation
+/// [`decimal_round_value`] documents. Integer division in Rust already
+/// truncates toward zero for negative operands (unlike, e.g., Python's floor
+/// division), which is exactly Postgres's `trunc` direction — verified live:
+/// `trunc(-3.14159::numeric, 2) = -3.14` (not `-3.15`, which flooring toward
+/// negative infinity would give), `trunc(12345::numeric, -2) = 12300`.
+fn decimal_trunc_value(m: i128, scale: i32, ndigits: i32) -> i128 {
+    let digits_to_drop = scale - ndigits;
+    if digits_to_drop <= 0 {
+        // Truncating to at least as many digits as are physically stored is
+        // a no-op, same reasoning as decimal_round_value's early return.
+        return m;
+    }
+    match pow10(digits_to_drop) {
+        Some(divisor) => (m / divisor) * divisor,
+        // More digits than Decimal128 can represent at all: truncating at
+        // that magnitude zeroes the value out entirely.
+        None => 0,
+    }
+}
+
+// ─── Math — numeric transcendental overloads: deliberately NOT implemented ─
+//
+// `sqrt(numeric)` (1730), `ln(numeric)` (1734), `log(numeric)` (1741),
+// `log(numeric, numeric)` (1736), `exp(numeric)` (1732) and
+// `power(numeric, numeric)` (2169) are real `pg_proc` rows (see
+// `basin_pgtype::func::FUNCS`) with NO arm in `eval_scalar_fn` — a call to
+// any of them falls through to the `other =>` catch-all below and, today,
+// falls back to DataFusion (see that arm's own comment).
+//
+// This is a deliberate omission, not an oversight: Postgres's `numeric`
+// transcendental functions are computed with arbitrary-precision decimal
+// arithmetic (`numeric.c`'s own `sqrt_var`/`ln_var`/`exp_var`), not IEEE 754
+// `f64`. The float8 implementations directly above this comment (`pg_sqrt_f64`
+// etc.) cannot be reused for the numeric overloads by just converting through
+// `f64` and back to `Decimal128` — that would silently produce a numeric
+// *shaped* answer with float *precision*, which is exactly the class of bug
+// this file's own module docs (point 7's sibling functions) and
+// docs/migration/df-removal/19-expires-at-removal.md warn against: "Silently
+// computing a numeric result with float semantics is exactly the class of
+// error this program keeps finding." `sign`/`trunc`/`ceiling` on `numeric`
+// ARE implemented above because they need only integer comparison/division on
+// the `Decimal128` mantissa, never a transcendental function — a genuinely
+// different, exact computation, not a shortcut of this one. A real
+// implementation needs its own arbitrary-precision decimal routines and is
+// left as a named follow-up rather than a routed-through-f64 approximation.
+
 /// Look up an operator's `pg_operator.oprname` by oid. `None` for the three
 /// `eval.rs`-local sentinels ([`AND_OP`], [`OR_OP`], [`NOT_OP`]) as well as
 /// for any genuinely unknown oid — callers that care about the difference
@@ -1840,6 +2236,18 @@ mod tests {
 
     fn decimal_array(v: &ArrayRef) -> &Decimal128Array {
         v.as_any().downcast_ref::<Decimal128Array>().unwrap()
+    }
+
+    fn f64_array(v: &ArrayRef) -> &Float64Array {
+        v.as_any().downcast_ref::<Float64Array>().unwrap()
+    }
+
+    fn lit_f64(v: f64) -> Expr {
+        Expr::Literal(Datum::Float64(v), PgType::FLOAT8)
+    }
+
+    fn lit_f64_null() -> Expr {
+        Expr::Literal(Datum::Null, PgType::FLOAT8)
     }
 
     // ── 1. Integer overflow must error ──────────────────────────────────
@@ -3357,5 +3765,350 @@ mod tests {
         };
         let out = eval(&e, &batch).unwrap();
         assert!(out.is_null(0), "n = NULL is NULL, never true");
+    }
+
+    // ─── Math — trig/log/exp/power (doc 19, entry 1) ─────────────────────
+
+    fn assert_type_mismatch_contains(err: ExecError, needle: &str) {
+        match err {
+            ExecError::TypeMismatch(msg) => assert!(
+                msg.contains(needle),
+                "expected error containing {needle:?}, got {msg:?}"
+            ),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    /// `sqrt(-1::float8)` must ERROR, not return `NaN` — verified live
+    /// against PostgreSQL 18 (`ERROR: 2201F: cannot take square root of a
+    /// negative number`).
+    #[test]
+    fn sqrt_float8_of_negative_errors_instead_of_returning_nan() {
+        let batch = one_row();
+        let err = eval(&sf(OID_SQRT_FLOAT8, vec![lit_f64(-1.0)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(err, "cannot take square root of a negative number");
+    }
+
+    #[test]
+    fn sqrt_float8_basic_and_null() {
+        let batch = batch_f64(vec![Some(4.0), None]);
+        let result = eval(&sf(OID_SQRT_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        let arr = f64_array(&result);
+        assert_eq!(arr.value(0), 2.0);
+        assert!(arr.is_null(1), "NULL in, NULL out");
+    }
+
+    /// `ln(0)` and `ln(-1)` must ERROR with the two distinct Postgres message
+    /// shapes — verified live: `ERROR: 2201E: cannot take logarithm of zero`
+    /// and `ERROR: 2201E: cannot take logarithm of a negative number`.
+    #[test]
+    fn ln_float8_zero_and_negative_error_with_distinct_messages() {
+        let batch = one_row();
+        let zero_err = eval(&sf(OID_LN_FLOAT8, vec![lit_f64(0.0)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(zero_err, "cannot take logarithm of zero");
+
+        let neg_err = eval(&sf(OID_LN_FLOAT8, vec![lit_f64(-1.0)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(neg_err, "cannot take logarithm of a negative number");
+    }
+
+    #[test]
+    fn ln_float8_basic_and_null() {
+        let batch = batch_f64(vec![Some(std::f64::consts::E), None]);
+        let result = eval(&sf(OID_LN_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        let arr = f64_array(&result);
+        assert!((arr.value(0) - 1.0).abs() < 1e-12, "ln(e) must be 1");
+        assert!(arr.is_null(1));
+    }
+
+    /// `log(double precision)` with one argument is BASE 10, not natural log
+    /// — verified live: `log(100::float8) = 2`, while `ln(100::float8)` is
+    /// not. Getting these backwards is the exact silent, plausible mistake
+    /// the task warns about.
+    #[test]
+    fn log_float8_one_arg_is_base_10_not_natural_log() {
+        let batch = one_row();
+        let log_result = eval(&sf(OID_LOG_FLOAT8, vec![lit_f64(100.0)]), &batch).unwrap();
+        assert_eq!(f64_array(&log_result).value(0), 2.0, "log(100) must be 2 (base 10)");
+
+        let ln_result = eval(&sf(OID_LN_FLOAT8, vec![lit_f64(100.0)]), &batch).unwrap();
+        assert!(
+            (f64_array(&ln_result).value(0) - 4.605_170_185_988_091).abs() < 1e-9,
+            "ln(100) must NOT equal log(100) — natural log, not base 10"
+        );
+    }
+
+    #[test]
+    fn log_float8_zero_and_negative_error() {
+        let batch = one_row();
+        let zero_err = eval(&sf(OID_LOG_FLOAT8, vec![lit_f64(0.0)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(zero_err, "cannot take logarithm of zero");
+        let neg_err = eval(&sf(OID_LOG_FLOAT8, vec![lit_f64(-1.0)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(neg_err, "cannot take logarithm of a negative number");
+    }
+
+    #[test]
+    fn exp_float8_basic_and_null() {
+        let batch = batch_f64(vec![Some(1.0), None]);
+        let result = eval(&sf(OID_EXP_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        let arr = f64_array(&result);
+        assert!((arr.value(0) - std::f64::consts::E).abs() < 1e-12);
+        assert!(arr.is_null(1));
+    }
+
+    /// Verified live: `cbrt(27) = 3`, `cbrt(-27) = -3` (cube root is defined
+    /// for negative numbers, unlike square root).
+    #[test]
+    fn cbrt_float8_handles_negative_input() {
+        let batch = batch_f64(vec![Some(27.0), Some(-27.0), None]);
+        let result = eval(&sf(OID_CBRT_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        let arr = f64_array(&result);
+        assert_eq!(arr.value(0), 3.0);
+        assert_eq!(arr.value(1), -3.0);
+        assert!(arr.is_null(2));
+    }
+
+    /// `power(0, 0) = 1` — verified live, needs no special case in this
+    /// implementation (IEEE 754's own `pow` rule).
+    #[test]
+    fn power_float8_zero_to_the_zero_is_one() {
+        let batch = one_row();
+        let result = eval(
+            &sf(OID_POWER_FLOAT8, vec![lit_f64(0.0), lit_f64(0.0)]),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(f64_array(&result).value(0), 1.0);
+    }
+
+    /// A negative base with a non-integer exponent is a complex result and
+    /// must ERROR — verified live: `ERROR: 2201F: a negative number raised
+    /// to a non-integer power yields a complex result`. A negative base with
+    /// an INTEGER exponent (even stored as a float) must NOT hit this check.
+    #[test]
+    fn power_float8_negative_base_fractional_exponent_errors_integer_exponent_does_not() {
+        let batch = one_row();
+        let err = eval(
+            &sf(OID_POWER_FLOAT8, vec![lit_f64(-2.0), lit_f64(0.5)]),
+            &batch,
+        )
+        .unwrap_err();
+        assert_type_mismatch_contains(
+            err,
+            "a negative number raised to a non-integer power yields a complex result",
+        );
+
+        let ok = eval(
+            &sf(OID_POWER_FLOAT8, vec![lit_f64(-2.0), lit_f64(3.0)]),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(f64_array(&ok).value(0), -8.0, "power(-2, 3) = -8, no error");
+    }
+
+    #[test]
+    fn power_float8_null_propagates() {
+        let batch = one_row();
+        let result = eval(
+            &sf(OID_POWER_FLOAT8, vec![lit_f64_null(), lit_f64(2.0)]),
+            &batch,
+        )
+        .unwrap();
+        assert!(f64_array(&result).is_null(0));
+    }
+
+    /// `degrees`/`radians` are exact conversions of `pi()` — verified live:
+    /// `degrees(pi()) = 180` exactly, not merely close.
+    #[test]
+    fn degrees_of_pi_is_exactly_180() {
+        let batch = one_row();
+        let pi_val = eval(&sf(OID_PI, vec![]), &batch).unwrap();
+        let pi_expr = lit_f64(f64_array(&pi_val).value(0));
+        let result = eval(&sf(OID_DEGREES_FLOAT8, vec![pi_expr]), &batch).unwrap();
+        assert_eq!(f64_array(&result).value(0), 180.0);
+    }
+
+    /// `radians(180) = pi()` exactly — verified live.
+    #[test]
+    fn radians_of_180_equals_pi_exactly() {
+        let batch = one_row();
+        let result = eval(&sf(OID_RADIANS_FLOAT8, vec![lit_f64(180.0)]), &batch).unwrap();
+        assert_eq!(f64_array(&result).value(0), std::f64::consts::PI);
+    }
+
+    #[test]
+    fn pi_returns_a_row_per_input_row_not_just_one_value() {
+        let batch = batch_f64(vec![Some(1.0), Some(2.0), Some(3.0)]);
+        let result = eval(&sf(OID_PI, vec![]), &batch).unwrap();
+        let arr = f64_array(&result);
+        assert_eq!(arr.len(), 3, "pi() is niladic but must still fill every row");
+        for i in 0..3 {
+            assert_eq!(arr.value(i), std::f64::consts::PI);
+        }
+    }
+
+    /// `sign(double precision)`: `-1`/`0`/`1` — verified live
+    /// `sign(-5::float8) = -1`, and specifically NOT `f64::signum`'s
+    /// "sign bit" answer of `1.0` for `+0.0`/`-1.0` for `-0.0`.
+    #[test]
+    fn sign_float8_zero_is_zero_not_signum_of_the_sign_bit() {
+        let batch = batch_f64(vec![Some(-5.0), Some(0.0), Some(5.0), Some(-0.0), None]);
+        let result = eval(&sf(OID_SIGN_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        let arr = f64_array(&result);
+        assert_eq!(arr.value(0), -1.0);
+        assert_eq!(arr.value(1), 0.0);
+        assert_eq!(arr.value(2), 1.0);
+        assert_eq!(arr.value(3), 0.0, "sign(-0.0) must be 0, not -1 (f64::signum's answer)");
+        assert!(arr.is_null(4));
+    }
+
+    /// `sign(numeric)` — verified live `sign(-5::numeric) = -1`.
+    #[test]
+    fn sign_numeric_matches_float8() {
+        let batch = decimal_batch("x", vec![Some(-50), Some(0), Some(50)], 5, 1); // -5.0, 0.0, 5.0
+        let result = eval(&sf(OID_SIGN_NUMERIC, vec![col(0, "x")]), &batch).unwrap();
+        let arr = decimal_array(&result);
+        assert_eq!(arr.value(0), -10); // -1.0 at scale 1
+        assert_eq!(arr.value(1), 0);
+        assert_eq!(arr.value(2), 10); // 1.0 at scale 1
+    }
+
+    /// `asin`/`acos` outside `[-1, 1]` must ERROR (SQLSTATE 22003, "input is
+    /// out of range") rather than silently return `NaN` — verified live.
+    #[test]
+    fn asin_and_acos_out_of_domain_error() {
+        let batch = one_row();
+        let asin_err = eval(&sf(OID_ASIN_FLOAT8, vec![lit_f64(2.0)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(asin_err, "input is out of range");
+        let acos_err = eval(&sf(OID_ACOS_FLOAT8, vec![lit_f64(2.0)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(acos_err, "input is out of range");
+    }
+
+    #[test]
+    fn trig_family_basic_values_and_null() {
+        let batch = one_row();
+        let sin_r = eval(
+            &sf(OID_SIN_FLOAT8, vec![lit_f64(std::f64::consts::FRAC_PI_2)]),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(f64_array(&sin_r).value(0), 1.0);
+
+        let cos_r = eval(&sf(OID_COS_FLOAT8, vec![lit_f64(0.0)]), &batch).unwrap();
+        assert_eq!(f64_array(&cos_r).value(0), 1.0);
+
+        let tan_r = eval(&sf(OID_TAN_FLOAT8, vec![lit_f64(0.0)]), &batch).unwrap();
+        assert_eq!(f64_array(&tan_r).value(0), 0.0);
+
+        let atan_r = eval(&sf(OID_ATAN_FLOAT8, vec![lit_f64(1.0)]), &batch).unwrap();
+        assert!((f64_array(&atan_r).value(0) - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+
+        let atan2_r = eval(
+            &sf(OID_ATAN2_FLOAT8, vec![lit_f64(1.0), lit_f64(1.0)]),
+            &batch,
+        )
+        .unwrap();
+        assert!((f64_array(&atan2_r).value(0) - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+
+        let null_sin = eval(&sf(OID_SIN_FLOAT8, vec![lit_f64_null()]), &batch).unwrap();
+        assert!(f64_array(&null_sin).is_null(0));
+    }
+
+    /// `ceiling` is the SQL-standard-named alias of `ceil` — same behaviour,
+    /// genuinely different `pg_proc` oid per the module docs — for both
+    /// `numeric` and `float8`.
+    #[test]
+    fn ceiling_matches_ceil_for_both_numeric_and_float8() {
+        let float_batch = batch_f64(vec![Some(4.1)]);
+        let ceiling_f = eval(&sf(OID_CEILING_FLOAT8, vec![col(0, "x")]), &float_batch).unwrap();
+        assert_eq!(f64_array(&ceiling_f).value(0), 5.0);
+
+        let numeric_batch = decimal_batch("x", vec![Some(-41)], 3, 1); // -4.1
+        let ceiling_n =
+            eval(&sf(OID_CEILING_NUMERIC, vec![col(0, "x")]), &numeric_batch).unwrap();
+        assert_eq!(decimal_array(&ceiling_n).value(0), -40); // -4.0
+    }
+
+    /// `trunc` truncates toward zero, unlike `floor` — verified live:
+    /// `trunc(3.7) = 3` but `trunc(-3.7) = -3`, not `-4`.
+    #[test]
+    fn trunc_float8_truncates_toward_zero() {
+        let batch = batch_f64(vec![Some(3.7), Some(-3.7), None]);
+        let result = eval(&sf(OID_TRUNC_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        let arr = f64_array(&result);
+        assert_eq!(arr.value(0), 3.0);
+        assert_eq!(arr.value(1), -3.0, "trunc(-3.7) must be -3, not -4 (floor's answer)");
+        assert!(arr.is_null(2));
+    }
+
+    /// `trunc(numeric)` (no explicit scale) truncates to an integer, toward
+    /// zero — verified live `trunc(-3.7::numeric) = -3`.
+    #[test]
+    fn trunc_numeric_no_scale_truncates_toward_zero() {
+        let batch = decimal_batch("x", vec![Some(-37)], 3, 1); // -3.7
+        let result = eval(&sf(OID_TRUNC_NUMERIC, vec![col(0, "x")]), &batch).unwrap();
+        assert_eq!(decimal_array(&result).value(0), -30); // -3.0
+    }
+
+    /// `trunc(numeric, ndigits)` takes a scale, including a NEGATIVE one
+    /// (truncating to the left of the decimal point) — verified live:
+    /// `trunc(-3.14159::numeric, 2) = -3.14`, `trunc(12345::numeric, -2) =
+    /// 12300`.
+    #[test]
+    fn trunc_numeric_takes_a_scale_including_negative() {
+        let batch = decimal_batch("x", vec![Some(-314159)], 6, 5); // -3.14159
+        let ndigits = batch_i32("n", vec![Some(2)]);
+        let combined_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Decimal128(6, 5), true),
+            Field::new("n", DataType::Int32, true),
+        ]));
+        let combined = RecordBatch::try_new(
+            combined_schema,
+            vec![batch.column(0).clone(), ndigits.column(0).clone()],
+        )
+        .unwrap();
+        let result = eval(
+            &sf(OID_TRUNC_NUMERIC_N, vec![col(0, "x"), col(1, "n")]),
+            &combined,
+        )
+        .unwrap();
+        assert_eq!(decimal_array(&result).value(0), -314000); // -3.14000 at scale 5
+
+        // Negative ndigits: truncate to the left of the decimal point.
+        let whole = decimal_batch("y", vec![Some(12345)], 5, 0); // 12345
+        let neg_ndigits = batch_i32("n", vec![Some(-2)]);
+        let neg_schema = Arc::new(Schema::new(vec![
+            Field::new("y", DataType::Decimal128(5, 0), true),
+            Field::new("n", DataType::Int32, true),
+        ]));
+        let neg_combined = RecordBatch::try_new(
+            neg_schema,
+            vec![whole.column(0).clone(), neg_ndigits.column(0).clone()],
+        )
+        .unwrap();
+        let neg_result = eval(
+            &sf(OID_TRUNC_NUMERIC_N, vec![col(0, "y"), col(1, "n")]),
+            &neg_combined,
+        )
+        .unwrap();
+        assert_eq!(decimal_array(&neg_result).value(0), 12300);
+    }
+
+    /// The 30 `pg_proc` rows named in docs/migration/df-removal/
+    /// 19-expires-at-removal.md entry 1 include numeric-argument
+    /// transcendental overloads (`sqrt`/`ln`/`log`/`exp`/`power` on
+    /// `numeric`) that this file deliberately does NOT implement — see the
+    /// "Math — numeric transcendental overloads" comment above
+    /// [`decimal_sign`]. This test pins that the gap is honest (falls
+    /// through to the `other =>` internal-error arm, which the bridge above
+    /// this crate turns into a DataFusion fallback) rather than silently
+    /// routed through float arithmetic.
+    #[test]
+    fn numeric_transcendental_overloads_remain_unbacked_not_routed_through_float() {
+        let batch = decimal_batch("x", vec![Some(40)], 3, 1); // 4.0
+        let err = eval(&sf(1730, vec![col(0, "x")]), &batch).unwrap_err(); // sqrt(numeric)
+        match err {
+            ExecError::Internal(_) => {}
+            other => panic!("expected Internal (unimplemented), got {other:?}"),
+        }
     }
 }
