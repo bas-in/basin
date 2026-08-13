@@ -104,6 +104,32 @@ group-wise tier**; its own header says that is future work. So re-hosting
 `array_agg` means building infrastructure Basin does not have, or accepting a
 documented performance regression.
 
+> **Measured 2026-08-13, and it changes this entry.** A first vectorised tier
+> was built and benchmarked in release against a faithful stand-in for the
+> existing row-wise algorithm:
+>
+> | Shape | Row-wise | Vectorised | |
+> |---|---:|---:|---:|
+> | 1M rows / 100k groups | 99 ms | 165 ms | **0.60×** |
+> | 1M rows / 10 groups | 77 ms | 102 ms | **0.76×** |
+>
+> Correct on all 334 tests, and slower on both shapes. It is preserved on
+> `spike/vectorised-aggregate` and deliberately not merged.
+>
+> This entry assumed the expensive part of re-hosting `array_agg` is that the
+> tier does not exist. That was wrong. The expensive part is building one that
+> **beats the scalar loop** — DataFusion's own generic accumulator was 6.5×
+> slower than Postgres, which is why `PgArrayAggUdaf` hand-rolls
+> `lexsort_to_indices` + `interleave` rather than looping. Reproducing that
+> specific algorithm is the work; "add a vectorised tier" is not a plan.
+>
+> A caution about the measurement itself: the benchmark was initially broken in
+> a way that hid this. It pulled a single batch from the operator and compared
+> its row count to the full group count — asserting `8192 == 100000` — because
+> the operator emits groups in output-sized batches like every other one in the
+> crate. A benchmark that measures the first 8192 groups and calls it the whole
+> aggregation would have reported a flattering number just as confidently.
+
 ## Traps worth knowing before anyone starts
 
 These are the findings that change how the work should be approached, rather
