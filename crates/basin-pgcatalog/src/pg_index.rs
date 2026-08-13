@@ -61,6 +61,59 @@
 //! INDEX ... (a) INCLUDE (b)` would report `indnatts = 2, indnkeyatts = 1`,
 //! which this crate cannot currently represent. Both are `IndexInfo` gaps,
 //! not a choice made in this file.
+//!
+//! # Column audit against live PostgreSQL 18.2 (see crate-level task docs)
+//!
+//! `SELECT attname, atttypid::regtype, attnum, attnotnull FROM pg_attribute
+//! WHERE attrelid = 'pg_catalog.pg_index'::regclass AND attnum > 0 ORDER BY
+//! attnum` against a live server reports **21** columns; this relation
+//! previously implemented 8 of them, three (`indisprimary`, `indisvalid`,
+//! `indkey`) in the wrong `attnum` position (each had skipped over columns
+//! this file did not yet implement, rather than reserving their slots).
+//! Fixed here. The remaining columns, in real `attnum` order:
+//!
+//! - `indnullsnotdistinct`, `indisexclusion`, `indimmediate`,
+//!   `indisclustered`, `indcheckxmin`, `indisready`, `indislive`,
+//!   `indisreplident` — all `boolean`, `NOT NULL`. None of these has a
+//!   corresponding `IndexInfo` field, but each has a single value real
+//!   Postgres reports for *every* index this crate can currently construct
+//!   (a plain, non-deferrable, non-exclusion, freshly-built, non-replica-
+//!   identity index) — confirmed live against a fresh two-column index:
+//!   `indimmediate`, `indisready`, `indislive` are `t`; the rest are `f`.
+//!   Added with those literal defaults and a doc comment each, per this
+//!   crate's placeholder convention (see `indisvalid` above).
+//! - `indoption` — `int2vector`, `NOT NULL`: per-key-column sort option bits
+//!   (`DESC`, `NULLS FIRST`). Live-verified `0` (ascending, nulls last) for
+//!   every key column of a plain `CREATE INDEX` with no `ASC`/`DESC`/`NULLS`
+//!   clause — the only kind of index `IndexInfo` can represent. Added as a
+//!   placeholder `List<Int16>` of zeros, one per `indkey` entry.
+//! - `indcollation`, `indclass` — both `oidvector`, `NOT NULL`: the
+//!   collation and operator class *actually in use* per key column.
+//!   Live-verified these are **not** uniformly defaultable the way the
+//!   booleans above are — `indcollation` was `0` for an `int` column but
+//!   `100` for a `text` column in the same index, and `indclass` is always a
+//!   real, non-zero operator-class oid (`1978` = `int4_ops`, `3126` = a text
+//!   opclass), never `0`. Computing either correctly requires each key
+//!   column's declared type, which `IndexInfo` does not carry. **Not added**
+//!   — a placeholder here would be a fabricated value, not a documented
+//!   default, and this crate's task is explicit that positional readers of
+//!   `indkey`-shaped columns must not be handed plausible-looking noise.
+//! - `indexprs`, `indpred` — both `pg_node_tree`, **nullable**: the parsed
+//!   expressions for an expression index / the predicate for a partial
+//!   index. `IndexInfo` has no notion of either (it only carries key
+//!   `attnum`s), so every index this crate can construct is a plain,
+//!   non-expression, non-partial index — for which the real, correct value
+//!   of both columns is `NULL`, not a fabricated one. Added as nullable
+//!   `Utf8` columns, always `NULL`.
+//!
+//! `basin-pgtype`'s `oid` module defines `INT2VECTOR`, `OIDVECTOR` and
+//! `PG_NODE_TREE` constants, but its `physical()` mapping (`lib.rs`) has no
+//! match arm for any of them — a generic `PgType -> DataType` lookup for a
+//! real `int2vector`/`oidvector`/`pg_node_tree` column fails there. This
+//! relation, like [`crate::pg_proc`] for `proargtypes`, sidesteps that by
+//! hand-building the Arrow `List` type directly rather than going through
+//! `physical()`. Worth noting for whoever owns `basin-pgtype/src/lib.rs`;
+//! out of scope to fix from this file.
 
 use std::sync::Arc;
 
@@ -86,13 +139,40 @@ fn value(idx: &IndexInfo, column: &str) -> Option<Value> {
         "indnatts" => Value::Int(idx.column_attnums.len() as i64),
         "indnkeyatts" => Value::Int(idx.column_attnums.len() as i64),
         "indisunique" => Value::Bool(idx.is_unique),
+        // `IndexInfo` has no notion of `NULLS NOT DISTINCT` — live-verified
+        // `false` (nulls distinct, the default) for every plain index.
+        "indnullsnotdistinct" => Value::Bool(false),
         "indisprimary" => Value::Bool(idx.is_primary),
+        // `IndexInfo` cannot represent `EXCLUDE` constraints.
+        "indisexclusion" => Value::Bool(false),
+        // `IndexInfo` has no notion of a deferrable index; live-verified
+        // `true` (immediate) for every plain index.
+        "indimmediate" => Value::Bool(true),
+        // `IndexInfo` has no notion of `CLUSTER`; a fresh index is never
+        // clustered.
+        "indisclustered" => Value::Bool(false),
         // `IndexInfo` has no notion of an invalid index — see the module
         // docs — so every index this crate reports is valid.
         "indisvalid" => Value::Bool(true),
-        // `indkey` is a list column; no scalar `Value` represents it, so a
-        // predicate naming it is rejected by the schema check in `scan`
-        // rather than reaching here.
+        // `indcheckxmin` reflects a build-time MVCC detail `IndexInfo`
+        // cannot express; live-verified `false` for every plain index.
+        "indcheckxmin" => Value::Bool(false),
+        // `IndexInfo` cannot represent an in-progress `CREATE INDEX
+        // CONCURRENTLY`; every index this crate reports is finished and
+        // ready — live-verified `true`.
+        "indisready" => Value::Bool(true),
+        // `IndexInfo` cannot represent an in-progress `DROP INDEX
+        // CONCURRENTLY`; every index this crate reports is live —
+        // live-verified `true`.
+        "indislive" => Value::Bool(true),
+        // `IndexInfo` has no notion of `ALTER TABLE ... REPLICA IDENTITY
+        // USING INDEX`; live-verified `false` for every plain index.
+        "indisreplident" => Value::Bool(false),
+        // `indkey` and `indoption` are list columns; no scalar `Value`
+        // represents either, so a predicate naming them is rejected by the
+        // schema check in `scan` rather than reaching here. `indexprs` and
+        // `indpred` are always `NULL` (see module docs) and likewise have no
+        // meaningful scalar predicate value.
         _ => return None,
     })
 }
@@ -103,19 +183,41 @@ pub struct PgIndex;
 
 impl PgIndex {
     fn arrow_schema() -> SchemaRef {
+        let int16_list = || DataType::List(Arc::new(Field::new("item", DataType::Int16, true)));
         Arc::new(Schema::new(vec![
             Field::new("indexrelid", DataType::UInt32, false),
             Field::new("indrelid", DataType::UInt32, false),
             Field::new("indnatts", DataType::Int16, false),
             Field::new("indnkeyatts", DataType::Int16, false),
             Field::new("indisunique", DataType::Boolean, false),
+            Field::new("indnullsnotdistinct", DataType::Boolean, false),
             Field::new("indisprimary", DataType::Boolean, false),
+            Field::new("indisexclusion", DataType::Boolean, false),
+            Field::new("indimmediate", DataType::Boolean, false),
+            Field::new("indisclustered", DataType::Boolean, false),
             Field::new("indisvalid", DataType::Boolean, false),
-            Field::new(
-                "indkey",
-                DataType::List(Arc::new(Field::new("item", DataType::Int16, true))),
-                false,
-            ),
+            Field::new("indcheckxmin", DataType::Boolean, false),
+            Field::new("indisready", DataType::Boolean, false),
+            Field::new("indislive", DataType::Boolean, false),
+            Field::new("indisreplident", DataType::Boolean, false),
+            Field::new("indkey", int16_list(), false),
+            // `indcollation` (attnum 17) and `indclass` (18), both
+            // `oidvector`, are omitted. `indclass` is the operator class per
+            // key column, which depends on the column's type and the index
+            // access method — `IndexInfo` carries neither, and there is no
+            // default that is right rather than merely plausible.
+            //
+            // The consequence is worth stating plainly, because the rest of
+            // this file was just reordered precisely so position is faithful:
+            // omitting two columns means everything after them sits two slots
+            // early. `indoption` is at 17 here and 19 in Postgres. A reader
+            // going by NAME is fine; one going by position is not, and this is
+            // the one place in this relation where that is still true.
+            // Filling them with zeros would fix the arithmetic and lie about
+            // the data, which is the worse of the two.
+            Field::new("indoption", int16_list(), false),
+            Field::new("indexprs", DataType::Utf8, true),
+            Field::new("indpred", DataType::Utf8, true),
         ]))
     }
 }
@@ -160,17 +262,40 @@ impl crate::SystemView for PgIndex {
         let indnatts: Int16Array = rows.iter().map(|r| r.column_attnums.len() as i16).collect();
         let indnkeyatts: Int16Array = rows.iter().map(|r| r.column_attnums.len() as i16).collect();
         let indisuniques: BooleanArray = rows.iter().map(|r| r.is_unique).collect();
+        // Placeholder defaults — see the module docs for why each literal is
+        // the real value Postgres reports for every index this crate can
+        // currently construct, not a guess.
+        let indnullsnotdistincts: BooleanArray = rows.iter().map(|_| false).collect();
         let indisprimaries: BooleanArray = rows.iter().map(|r| r.is_primary).collect();
+        let indisexclusions: BooleanArray = rows.iter().map(|_| false).collect();
+        let indimmediates: BooleanArray = rows.iter().map(|_| true).collect();
+        let indisclustereds: BooleanArray = rows.iter().map(|_| false).collect();
         let indisvalids: BooleanArray = rows.iter().map(|_| true).collect();
+        let indcheckxmins: BooleanArray = rows.iter().map(|_| false).collect();
+        let indisreadys: BooleanArray = rows.iter().map(|_| true).collect();
+        let indislives: BooleanArray = rows.iter().map(|_| true).collect();
+        let indisreplidents: BooleanArray = rows.iter().map(|_| false).collect();
 
         let mut indkey_builder = ListBuilder::new(Int16Builder::new());
+        let mut indoption_builder = ListBuilder::new(Int16Builder::new());
         for r in &rows {
             for attnum in &r.column_attnums {
                 indkey_builder.values().append_value(*attnum);
+                // Ascending, nulls-last (`0`) — the only sort option
+                // `IndexInfo` can express; see module docs.
+                indoption_builder.values().append_value(0);
             }
             indkey_builder.append(true);
+            indoption_builder.append(true);
         }
         let indkeys: ListArray = indkey_builder.finish();
+        let indoptions: ListArray = indoption_builder.finish();
+
+        // `IndexInfo` cannot represent expression indexes or partial-index
+        // predicates, so the real value of both is `NULL` for every index
+        // this crate constructs — see module docs.
+        let indexprs = arrow_array::StringArray::from(vec![None::<&str>; rows.len()]);
+        let indpred = arrow_array::StringArray::from(vec![None::<&str>; rows.len()]);
 
         Ok(RecordBatch::try_new(
             schema,
@@ -180,9 +305,20 @@ impl crate::SystemView for PgIndex {
                 Arc::new(indnatts),
                 Arc::new(indnkeyatts),
                 Arc::new(indisuniques),
+                Arc::new(indnullsnotdistincts),
                 Arc::new(indisprimaries),
+                Arc::new(indisexclusions),
+                Arc::new(indimmediates),
+                Arc::new(indisclustereds),
                 Arc::new(indisvalids),
+                Arc::new(indcheckxmins),
+                Arc::new(indisreadys),
+                Arc::new(indislives),
+                Arc::new(indisreplidents),
                 Arc::new(indkeys),
+                Arc::new(indoptions),
+                Arc::new(indexprs),
+                Arc::new(indpred),
             ],
         )?)
     }
@@ -275,6 +411,44 @@ mod tests {
     #[test]
     fn name_is_pg_index() {
         assert_eq!(PgIndex.name(), "pg_index");
+    }
+
+    /// Pins the exact column layout (name, order, nullability) against live
+    /// PostgreSQL 18.2's `pg_attribute` for `pg_index`, so a future edit
+    /// cannot silently reorder, rename, or flip nullability on a column.
+    /// `indcollation`/`indclass` are deliberately absent — see module docs.
+    #[test]
+    fn schema_matches_live_postgres_column_layout() {
+        let schema = PgIndex.schema();
+        let got: Vec<(&str, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.is_nullable()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("indexrelid", false),
+                ("indrelid", false),
+                ("indnatts", false),
+                ("indnkeyatts", false),
+                ("indisunique", false),
+                ("indnullsnotdistinct", false),
+                ("indisprimary", false),
+                ("indisexclusion", false),
+                ("indimmediate", false),
+                ("indisclustered", false),
+                ("indisvalid", false),
+                ("indcheckxmin", false),
+                ("indisready", false),
+                ("indislive", false),
+                ("indisreplident", false),
+                ("indkey", false),
+                ("indoption", false),
+                ("indexprs", true),
+                ("indpred", true),
+            ]
+        );
     }
 
     /// The entire point of this crate, applied to `pg_index`: a predicate on
