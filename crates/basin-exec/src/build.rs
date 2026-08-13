@@ -1644,6 +1644,20 @@ fn agg_func_of(oid: u32) -> Option<AggFunc> {
         2115 | 2116 | 2120 | 2130 => AggFunc::Max,
         2131 | 2132 | 2136 | 2146 => AggFunc::Min,
         2100 | 2101 | 2103 | 2105 => AggFunc::Avg,
+        // `array_agg(anynonarray)` and `array_agg(anyarray)` — read
+        // individually from a live PostgreSQL 18.2 `pg_proc`, not
+        // transcribed as a block (see `window_func_of`'s doc for why that
+        // burned this file before: 3108/3110/3111/3112 were assigned to
+        // the wrong window functions because lag/lead's overloads
+        // interleave in the real table).
+        2335 | 4053 => AggFunc::ArrayAgg,
+        // `string_agg(text, text)` is 3538, `string_agg(bytea, bytea)` is
+        // 3545 — not adjacent to array_agg's OIDs or to each other. The
+        // `delim_col` placeholder here is always overwritten in `agg_spec`
+        // once the call's second argument (the delimiter, resolved to a
+        // column per row) is known; `agg_func_of` only sees the OID, not
+        // the argument list.
+        3538 | 3545 => AggFunc::StringAgg { delim_col: 0 },
         _ => return None,
     })
 }
@@ -1683,6 +1697,22 @@ fn agg_spec(e: &Expr, alias: &str) -> Result<AggregateSpec, BuildError> {
                     Some(column_index(a).ok_or(BuildError::NonColumnKey("aggregate"))?)
                 }
             };
+            // `string_agg(value, delimiter)`'s delimiter is read per row
+            // from a resolved column (`AggFunc::StringAgg::delim_col`'s own
+            // doc), not carried as a constant — a literal delimiter still
+            // arrives here as a column reference because the optimizer
+            // materialises any non-column aggregate argument beneath the
+            // aggregate first (see `agg_spec`'s own doc). `agg_func_of`
+            // cannot fill this in itself since it only sees the OID, not
+            // the argument list.
+            if let AggFunc::StringAgg { .. } = f {
+                let delim_expr = args.get(1).ok_or_else(|| {
+                    BuildError::Unsupported("string_agg without a delimiter argument".into())
+                })?;
+                let delim_col = column_index(delim_expr)
+                    .ok_or(BuildError::NonColumnKey("string_agg delimiter"))?;
+                f = AggFunc::StringAgg { delim_col };
+            }
             let filter_col = match filter {
                 None => None,
                 Some(x) => {
@@ -2076,6 +2106,242 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 2);
+    }
+
+    // ── array_agg / string_agg OID WIRING ───────────────────────────────
+    //
+    // `aggregate.rs` (commit 2d4d481f) implements both accumulators and is
+    // unit-tested against them directly via `AggregateSpec` literals — see
+    // `array_agg_spec`/`string_agg_spec` in that file's own test module.
+    // What was missing was `agg_func_of` ever mapping `array_agg`'s and
+    // `string_agg`'s real `pg_proc` OIDs to those variants, so every call
+    // hit the `ok_or_else` in `agg_spec` and fell back. These tests pin the
+    // OIDs (dumped from a live PostgreSQL 18.2 — see the query in
+    // `agg_func_of`'s own comment) and exercise the full `LogicalPlan ->
+    // build() -> RecordBatch` path, not just the accumulator in isolation.
+
+    /// A table with a `Utf8` pair, for `string_agg` — `table()`'s two
+    /// `Int32` columns can't stand in for a value/delimiter pair.
+    fn table_text() -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("grp", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("delim", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                // Every row's delimiter is the same literal here, but it is
+                // still a resolved COLUMN, not a constant folded into the
+                // spec — `string_agg`'s delimiter is read per row (see
+                // `AggFunc::StringAgg::delim_col`'s doc), which is exactly
+                // what distinguishes it from every other aggregate's single
+                // `input_col`.
+                Arc::new(StringArray::from(vec![",", ",", "|"])),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    fn resolver_text() -> MemTableResolver {
+        let (schema, batch) = table_text();
+        let mut r = MemTableResolver::new();
+        r.insert(TableId(1), schema, vec![batch]);
+        r
+    }
+
+    fn agg_expr(oid: u32, args: Vec<Expr>) -> Expr {
+        Expr::Aggregate {
+            func: basin_plan::FuncId(basin_pgtype::Oid(oid)),
+            args,
+            distinct: false,
+            filter: None,
+            order_by: vec![],
+        }
+    }
+
+    /// `array_agg(anynonarray)` is oid 2335 on a live PostgreSQL 18.2 —
+    /// `array_agg(id)` over an `int4` column resolves to this overload, not
+    /// 4053 (`array_agg(anyarray)`, i.e. `array_agg` of an *array-typed*
+    /// column, which `id` is not). Ungrouped, so the whole table collapses
+    /// to one output row holding every `id` in scan order.
+    #[test]
+    fn array_agg_oid_2335_reaches_the_array_agg_accumulator() {
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            group: vec![],
+            aggs: vec![agg_expr(2335, vec![col(0, "id")])],
+            grouping_sets: None,
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1, "ungrouped: one output row");
+        let list = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        assert!(!list.is_null(0));
+        let elems = list
+            .value(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (0..elems.len()).map(|i| elems.value(i)).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "array_agg(id) with no ORDER BY still preserves scan order"
+        );
+    }
+
+    /// `string_agg(text, text)` is oid 3538. Grouped by `grp`, with a
+    /// per-row delimiter column (see `table_text`'s doc) — this is the shape
+    /// that specifically exercises `agg_spec` filling in `delim_col` from
+    /// `args[1]` rather than `agg_func_of`'s placeholder `0`.
+    #[test]
+    fn string_agg_oid_3538_reaches_the_string_agg_accumulator_with_its_delimiter_column() {
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                table: TableId(1),
+                projection: vec![ColId(0), ColId(1), ColId(2)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            group: vec![col(0, "grp")],
+            aggs: vec![agg_expr(3538, vec![col(1, "name"), col(2, "delim")])],
+            grouping_sets: None,
+        };
+        let batches = drain(build(&plan, &resolver_text()).unwrap());
+        let mut rows: Vec<(i32, Option<String>)> = Vec::new();
+        for b in &batches {
+            let grp = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let sa = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((
+                    grp.value(i),
+                    (!sa.is_null(i)).then(|| sa.value(i).to_string()),
+                ));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![(1, Some("a,b".into())), (2, Some("c".into()))],
+            "group 1 joins on its own rows' delimiter ','; group 2's row uses '|'"
+        );
+    }
+
+    /// `array_agg(x ORDER BY y)` is real syntax, but `AggregateSpec` has no
+    /// field to carry the ordering — the refusal a few lines above (`if
+    /// !order_by.is_empty() { ... }`) is unconditional, for every aggregate,
+    /// and must survive wiring `array_agg`'s OID in. Silently dropping the
+    /// `ORDER BY` would return an array in scan order while claiming to
+    /// honour the query's requested order — wrong data, not a missing
+    /// feature.
+    #[test]
+    fn array_agg_order_by_still_refuses_rather_than_silently_reordering() {
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            group: vec![],
+            aggs: vec![Expr::Aggregate {
+                func: basin_plan::FuncId(basin_pgtype::Oid(2335)),
+                args: vec![col(0, "id")],
+                distinct: false,
+                filter: None,
+                order_by: vec![PlanSortKey {
+                    expr: col(1, "v"),
+                    descending: false,
+                    nulls_first: false,
+                }],
+            }],
+            grouping_sets: None,
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("array_agg(x ORDER BY y) has nowhere to carry the ordering"),
+        };
+        assert_eq!(
+            err,
+            BuildError::Unsupported("ORDER BY inside an aggregate".into())
+        );
+    }
+
+    // ── VALUES IN FROM ──────────────────────────────────────────────────
+    //
+    // `basin-plan` commit 8a87750d lowers `SELECT * FROM (VALUES ...) AS
+    // v(i, s)` — confirmed by that crate's own
+    // `a_values_list_in_from_may_be_column_aliased` test — to a `Project`
+    // (renaming to the alias list) over a `LogicalPlan::Values` (still
+    // carrying its own default `column1`/`column2` names internally; the
+    // alias list only renames the outer `Scope`'s copy of the schema, per
+    // `build_range_subselect`'s doc, not the `Values` node's own). Both
+    // `LogicalPlan::Project` and `LogicalPlan::Values` already had
+    // operators and builder arms *before* that lowering commit (`Values`
+    // since c14120ea) — so despite that commit's own message saying "VALUES
+    // in FROM still falls back", nothing here was actually missing; this
+    // test exists to nail that down rather than take it on faith.
+    #[test]
+    fn values_in_from_with_a_column_alias_list_builds_end_to_end() {
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Values {
+                rows: vec![
+                    vec![
+                        Expr::Literal(Datum::Int32(1), PgType::INT4),
+                        Expr::Literal(Datum::Utf8("a".into()), PgType::TEXT),
+                    ],
+                    vec![
+                        Expr::Literal(Datum::Int32(2), PgType::INT4),
+                        Expr::Literal(Datum::Utf8("b".into()), PgType::TEXT),
+                    ],
+                ],
+                schema: vec![
+                    ("column1".into(), PgType::INT4),
+                    ("column2".into(), PgType::TEXT),
+                ],
+            }),
+            exprs: vec![(col(0, "i"), "i".into()), (col(1, "s"), "s".into())],
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        assert_eq!(
+            batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["i", "s"],
+            "the alias list renames the output columns, not just the Scope"
+        );
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let ss: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(ss, vec!["a".to_string(), "b".to_string()]);
     }
 
     /// An unimplemented plan shape must say so by name rather than silently

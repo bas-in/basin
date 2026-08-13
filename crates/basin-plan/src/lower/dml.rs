@@ -458,6 +458,22 @@ fn lower_set_list(
                 "multi-column assignment (`SET (a, b) = ...`) is not yet lowered".into(),
             ));
         }
+        // `SET a = DEFAULT` is valid Postgres (confirmed on live Postgres
+        // 18.2: it resets the column to its own default expression, same as
+        // an omitted INSERT column), and `DEFAULT` here is its own node
+        // (`SetToDefault`), not a literal. `lower::expr::lower_expr` has no
+        // named case for it, so left alone this falls through to that
+        // module's generic "this expression node kind is not yet lowered" —
+        // accurate but doesn't name `DEFAULT`. This crate has no
+        // column-default catalog to substitute a real expression for it
+        // (same gap documented on this module's INSERT `RETURNING` handling
+        // below), so it is rejected here, by name, instead.
+        if matches!(val_node.node.as_ref(), Some(NodeEnum::SetToDefault(_))) {
+            return Err(LowerError::Unsupported(format!(
+                "SET \"{}\" = DEFAULT is not yet lowered (no column-default catalog available to lowering)",
+                rt.name
+            )));
+        }
         let expr = lower_expr(val_node, ctx)?;
         out.push((ColId(pos as u16), expr));
     }
@@ -777,6 +793,53 @@ fn lower_conflict_target(
         .collect()
 }
 
+/// `INSERT INTO t VALUES (DEFAULT, ...)`: `DEFAULT` used as a value
+/// expression is its own parse-tree node (`SetToDefault`), distinct from a
+/// literal — confirmed on live Postgres 18.2 (`transformInsertRow`
+/// substitutes the column's own default, or NULL, for it at execution time).
+/// This crate has no default-expression catalog to draw that substitution
+/// from (see this module's doc comment on the identical limitation for
+/// `RETURNING`), and `lower::expr::lower_expr` has no named case for
+/// `SetToDefault` — left alone, this fails deep inside
+/// `select::lower_select` with that module's generic "this expression node
+/// kind is not yet lowered" fallback, which is accurate but does not name
+/// `DEFAULT`. This checks for it up front, over the same `values_lists` this
+/// module's own doc comment says `select::lower_select` is deliberately left
+/// to lower, so the message does name it.
+fn reject_default_in_values(select_node: &Node) -> Result<(), LowerError> {
+    let Some(NodeEnum::SelectStmt(select)) = select_node.node.as_ref() else {
+        return Ok(());
+    };
+    for row in &select.values_lists {
+        let Some(NodeEnum::List(l)) = row.node.as_ref() else {
+            continue;
+        };
+        for item in &l.items {
+            if matches!(item.node.as_ref(), Some(NodeEnum::SetToDefault(_))) {
+                return Err(LowerError::Unsupported(
+                    "DEFAULT as a value expression (e.g. `VALUES (DEFAULT, ...)`) is not yet lowered"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The target table's column names this INSERT's own column list leaves
+/// out. Postgres fills each from its DEFAULT (or NULL, or errors if NOT NULL
+/// with none — all three confirmed on live Postgres 18.2) at write time, a
+/// substitution this crate cannot perform during lowering: `TableResolver`
+/// exposes only `(TableId, Schema)`, no default-expression catalog.
+fn omitted_insert_columns(columns: &[ColId], table_schema: &Schema) -> Vec<String> {
+    table_schema
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !columns.iter().any(|c| c.0 as usize == *i))
+        .map(|(_, (name, _))| name.clone())
+        .collect()
+}
+
 fn lower_insert(stmt: &InsertStmt, res: &Resolvers) -> Result<LogicalPlan, LowerError> {
     if stmt.with_clause.is_some() {
         return Err(LowerError::Unsupported(
@@ -806,6 +869,7 @@ fn lower_insert(stmt: &InsertStmt, res: &Resolvers) -> Result<LogicalPlan, Lower
             "INSERT ... DEFAULT VALUES is not yet lowered".into(),
         ));
     };
+    reject_default_in_values(select_node)?;
     let input = select::lower_select(select_node, res.tables, res.operators, res.functions)?;
     if let Some(width) = plan_width(&input) {
         if width != columns.len() {
@@ -817,6 +881,34 @@ fn lower_insert(stmt: &InsertStmt, res: &Resolvers) -> Result<LogicalPlan, Lower
     }
 
     let qualifier = target_qualifier(relation);
+    let omitted = omitted_insert_columns(&columns, &table_schema);
+
+    // `RETURNING *`/`<qualifier>.*` expands against whatever scope it is
+    // given (`lower_returning`'s `star_columns`), so if that scope were the
+    // column-list-restricted one built below, a partial column list would
+    // make `*` silently expand to *fewer* columns than Postgres's real
+    // `RETURNING *` returns (which sees the full post-write row — defaults
+    // included, confirmed on live Postgres 18.2) — wrong output with no
+    // error at all. Caught here, before that scope is even built, with a
+    // message that says why, rather than left to silently under-return.
+    if !omitted.is_empty() {
+        for item in &stmt.returning_list {
+            let Some(NodeEnum::ResTarget(rt)) = item.node.as_ref() else {
+                continue;
+            };
+            let Some(NodeEnum::ColumnRef(cr)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+            else {
+                continue;
+            };
+            if star_marker(cr)?.is_some() {
+                return Err(LowerError::Unsupported(format!(
+                    "RETURNING * is not yet lowered for this INSERT: column(s) {} were not given a value, and their DEFAULT/NULL is not available to lowering",
+                    omitted.join(", ")
+                )));
+            }
+        }
+    }
+
     // RETURNING sees exactly `input`'s columns, under the target table's real
     // names rather than VALUES's synthetic `column1`/`column2` — see this
     // module's doc comment on why that (not the full table schema) is the
@@ -836,7 +928,21 @@ fn lower_insert(stmt: &InsertStmt, res: &Resolvers) -> Result<LogicalPlan, Lower
     let resolver = FlatScopeResolver(&scope);
     let lctx = expr_ctx(res, &resolver);
     let ctx = lctx.ctx();
-    let returning = lower_returning(&stmt.returning_list, &scope, &ctx)?;
+    let returning = match lower_returning(&stmt.returning_list, &scope, &ctx) {
+        Ok(r) => r,
+        // A name that *is* a real column of the target table, just not one
+        // this INSERT gave a value to, is not "unknown" in any useful sense
+        // — it exists but is unavailable, for the same default-catalog
+        // reason `*` is rejected above. Naming that reason (rather than
+        // `UnknownName`, which reads identically for a column that plain
+        // does not exist) keeps the refusal honest instead of misleading.
+        Err(LowerError::UnknownName(name)) if omitted.iter().any(|o| o == &name) => {
+            return Err(LowerError::Unsupported(format!(
+                "RETURNING \"{name}\" is not yet lowered: \"{name}\" was not given a value by this INSERT, and its DEFAULT/NULL is not available to lowering"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
 
     let on_conflict = lower_on_conflict(
         stmt.on_conflict_clause.as_deref(),
@@ -1102,6 +1208,20 @@ mod tests {
     }
 
     #[test]
+    fn insert_multi_row_values_lowers_every_row() {
+        let plan = lower("INSERT INTO t (id, a, b) VALUES (1, 2, 'x'), (3, 4, 'y')").unwrap();
+        let LogicalPlan::Insert { input, .. } = plan else {
+            panic!("expected Insert");
+        };
+        let LogicalPlan::Values { rows, .. } = *input else {
+            panic!("expected Values under Insert");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 3);
+        assert_eq!(rows[1].len(), 3);
+    }
+
+    #[test]
     fn insert_unknown_target_column_is_rejected() {
         let err = lower("INSERT INTO t (nope) VALUES (1)").unwrap_err();
         assert_eq!(err, LowerError::UnknownName("nope".into()));
@@ -1160,9 +1280,58 @@ mod tests {
     #[test]
     fn insert_returning_a_column_not_in_the_column_list_is_unresolvable() {
         // `b` was never listed, so there is no expression carrying its value
-        // for RETURNING to name — see the module doc comment.
+        // for RETURNING to name — see the module doc comment. This must be
+        // `Unsupported`, naming `b`, not `UnknownName` — `b` is a real
+        // column of `t`, so `UnknownName` (which reads identically for an
+        // actually-nonexistent column) would be misleading.
         let err = lower("INSERT INTO t (id, a) VALUES (1, 2) RETURNING b").unwrap_err();
-        assert_eq!(err, LowerError::UnknownName("b".into()));
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains('b'), "{msg}");
+    }
+
+    #[test]
+    fn insert_returning_star_with_a_partial_column_list_is_rejected() {
+        // Postgres's real `RETURNING *` returns the full post-write row
+        // (defaults included — confirmed on live Postgres 18.2). Silently
+        // expanding `*` against only the given columns would return *fewer*
+        // columns with no error at all, so this must refuse outright.
+        let err = lower("INSERT INTO t (id, a) VALUES (1, 2) RETURNING *").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains('b'), "{msg}");
+    }
+
+    #[test]
+    fn insert_returning_star_with_every_column_given_a_value_works() {
+        // No column is omitted here (the column list covers the whole
+        // table), so `*` is exactly `input`'s columns — no silent gap, no
+        // refusal needed.
+        let plan = lower("INSERT INTO t (id, a, b) VALUES (1, 2, 'x') RETURNING *").unwrap();
+        let LogicalPlan::Insert { returning, .. } = plan else {
+            panic!("expected Insert");
+        };
+        assert_eq!(
+            returning.unwrap(),
+            vec![
+                (col(0, "id"), "id".into()),
+                (col(1, "a"), "a".into()),
+                (col(2, "b"), "b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_returning_star_with_no_column_list_works() {
+        // No column list at all defaults to every column in table order
+        // (Postgres's own rule), so again nothing is omitted.
+        let plan = lower("INSERT INTO t VALUES (1, 2, 'x') RETURNING *").unwrap();
+        let LogicalPlan::Insert { returning, .. } = plan else {
+            panic!("expected Insert");
+        };
+        assert_eq!(returning.unwrap().len(), 3);
     }
 
     #[test]
@@ -1259,6 +1428,19 @@ mod tests {
     fn update_set_target_not_a_table_column_is_rejected() {
         let err = lower("UPDATE t SET nope = 1").unwrap_err();
         assert_eq!(err, LowerError::UnknownName("nope".into()));
+    }
+
+    #[test]
+    fn update_set_multi_column_assignment_is_unsupported() {
+        // `SET (a, b) = (1, 2)`: both targets share one `MultiAssignRef`
+        // value node pointing at the same RowExpr `source` (told apart by
+        // `colno`) — confirmed via `pg_query::parse`'s own output for this
+        // statement.
+        let err = lower("UPDATE t SET (a, b) = (1, 2)").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("multi-column"), "{msg}");
     }
 
     #[test]
@@ -1399,6 +1581,37 @@ mod tests {
     }
 
     #[test]
+    fn on_conflict_do_update_excluded_can_reference_a_column_omitted_from_the_insert_list() {
+        // Unlike plain `RETURNING` (restricted to columns the INSERT itself
+        // gave a value, above): `excluded` here resolves against the *full*
+        // target-table schema even though `b` was never listed. This is
+        // deliberate, not an oversight — confirmed on live Postgres 18.2,
+        // `excluded.<omitted column>` reads that column's real DEFAULT (`b`
+        // there had `default 42`, and `excluded.b` read `42`). Nothing
+        // downstream type-checks `on_conflict`'s `set`/`predicate` against
+        // `input`'s (narrower) schema the way `crate::schema::output_schema`
+        // does for `RETURNING` (see this module's doc comment on that
+        // coupling), so there is no silent-truncation risk in exposing the
+        // full row here — only in restricting it to match RETURNING would
+        // be *wrong*, refusing valid, idiomatic upsert SQL for no reason.
+        let plan = lower(
+            "INSERT INTO t (id) VALUES (1) \
+             ON CONFLICT (id) DO UPDATE SET b = excluded.b",
+        )
+        .unwrap();
+        let LogicalPlan::Insert { on_conflict, .. } = plan else {
+            panic!("expected Insert");
+        };
+        let Some(OnConflict::DoUpdate { set, .. }) = on_conflict else {
+            panic!("expected DoUpdate");
+        };
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].0, ColId(2)); // b's position in t
+                                         // excluded.b -> table width 3 + position 2 = index 5.
+        assert_eq!(set[0].1, col(5, "b"));
+    }
+
+    #[test]
     fn on_conflict_do_update_with_where_clause() {
         let plan = lower(
             "INSERT INTO t (id, a) VALUES (1, 2) \
@@ -1469,6 +1682,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, LowerError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn insert_values_default_is_unsupported() {
+        // `DEFAULT` in a VALUES row is its own parse node (`SetToDefault`),
+        // not a literal — confirmed on live Postgres 18.2. No
+        // default-expression catalog exists to lower it, and the message
+        // must name `DEFAULT`, not fall back to `lower::expr`'s generic
+        // "this expression node kind" wording.
+        let err = lower("INSERT INTO t (id, a) VALUES (DEFAULT, 1)").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("DEFAULT"), "{msg}");
+    }
+
+    #[test]
+    fn insert_values_default_in_a_later_row_is_still_caught() {
+        let err = lower("INSERT INTO t (id, a) VALUES (1, 2), (3, DEFAULT)").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("DEFAULT"), "{msg}");
+    }
+
+    #[test]
+    fn update_set_default_is_unsupported() {
+        // `SET a = DEFAULT` is valid Postgres (confirmed on live Postgres
+        // 18.2: resets the column to its own default), but needs the same
+        // unavailable default-expression catalog.
+        let err = lower("UPDATE t SET a = DEFAULT").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("DEFAULT") && msg.contains('a'), "{msg}");
+    }
+
+    #[test]
+    fn on_conflict_do_update_set_default_is_unsupported() {
+        let err = lower(
+            "INSERT INTO t (id, a) VALUES (1, 2) \
+             ON CONFLICT (id) DO UPDATE SET a = DEFAULT",
+        )
+        .unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("DEFAULT"), "{msg}");
     }
 
     // ─── Insert column list shorter than the table ──────────────────────
