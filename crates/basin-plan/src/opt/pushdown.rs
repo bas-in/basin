@@ -36,6 +36,18 @@
 //! Whatever a conjunct cannot move through is re-wrapped in a `Filter`
 //! exactly where it got stuck; nothing is ever dropped.
 //!
+//! # Which side of a join a predicate belongs to
+//!
+//! Deciding that is [`super::column_side`]'s job and nothing else's — read
+//! it before touching the `Join` arm. The short version: a
+//! [`crate::ColumnRef`] above a join arrives in either of two shapes,
+//! `crate::lower`'s flat `relation: 0` index across left++right, or
+//! `crate::opt::decorrelate`'s tagged
+//! `relation: 1` with a right-relative index, and the rule that resolves both
+//! is **position first, tag second**. Reading the tag alone silently sends
+//! every flat right-side predicate into the left input; that is the bug
+//! `tests/anti_join_pushdown.rs` exists to keep fixed.
+//!
 //! # Correctness rules, and the wrong answers they prevent
 //!
 //! - **Outer joins.** A `WHERE` predicate sitting above a join is evaluated
@@ -123,7 +135,8 @@
 use crate::{ColumnRef, Expr, JoinKind, LogicalPlan, OpId, Subscript};
 use basin_pgtype::Oid;
 
-use super::OptimizerRule;
+use super::projection::output_width;
+use super::{column_side, OptimizerRule, Side};
 
 /// See the "note on how conjunction is recognized" in the module docs. Chosen
 /// as `u32::MAX` specifically because every real `pg_operator` oid is a small
@@ -371,24 +384,31 @@ fn push_into(plan: LogicalPlan, preds: Vec<Expr>) -> LogicalPlan {
             filter,
         } if !candidates.is_empty() => {
             let (left_ok, right_ok) = allowed_sides(kind);
+            // The two widths that decide attribution — see `super::column_side`.
+            // These are the *inputs'* widths, not the join's output width, and
+            // that distinction only shows up for a semi/anti join, whose
+            // output is its left side alone. That is fine either way: a flat
+            // index above such a join can only be `< left_width` to begin
+            // with, and `right_width` is used solely to range-check a tagged
+            // `relation: 1` reference, which addresses the right *input*.
+            let left_width = output_width(&left);
+            let right_width = output_width(&right);
             let mut to_left = Vec::new();
             let mut to_right = Vec::new();
             for p in candidates {
-                let uses_left = touches_relation(&p, 0);
-                let uses_right = touches_relation(&p, 1);
-                match (uses_left, uses_right) {
+                match attribute(&p, left_width, right_width) {
                     // Straddles both sides: cannot become a single-input
                     // predicate on either child, and must not be folded
                     // into `Join::filter` either (see the outer-join note
                     // in the module docs) — stays above the join.
-                    (true, true) => blocked.push(p),
-                    (true, false) if left_ok => to_left.push(p),
-                    (false, true) if right_ok => to_right.push(rebase_right(p)),
+                    Side::Both | Side::Unattributable => blocked.push(p),
+                    Side::Left if left_ok => to_left.push(p),
+                    Side::Right if right_ok => to_right.push(rebase_right(p, left_width)),
                     // No column reference at all (e.g. a constant
                     // predicate) — either side is semantically fine;
                     // prefer whichever the join kind allows.
-                    (false, false) if left_ok => to_left.push(p),
-                    (false, false) if right_ok => to_right.push(rebase_right(p)),
+                    Side::Neither if left_ok => to_left.push(p),
+                    Side::Neither if right_ok => to_right.push(rebase_right(p, left_width)),
                     _ => blocked.push(p),
                 }
             }
@@ -407,7 +427,37 @@ fn push_into(plan: LogicalPlan, preds: Vec<Expr>) -> LogicalPlan {
             mut filters,
             snapshot,
         } if !candidates.is_empty() => {
-            filters.extend(candidates);
+            // The invariant tripwire. A `Scan` is where a pushed predicate
+            // stops, so it is also where a mis-attribution upstream becomes
+            // undetectable: `Scan::filters`' indices are positions within
+            // `Scan::projection`, and an index past the end of that list is
+            // read by `opt::projection::remap_expr` (and again by
+            // `basin_exec::build`), neither of which can tell a stale index
+            // from a valid one.
+            //
+            // There is no *correct* recovery from a stray index — it is a bug
+            // upstream, and no placement of the predicate makes it mean
+            // something. What this guard buys is which failure you get. The
+            // `debug_assert` makes it loud under `cargo test` and names the
+            // rule that mis-attributed, instead of surfacing three rules
+            // later as an out-of-bounds panic inside projection pruning. The
+            // runtime partition keeps a release build from doing the one
+            // genuinely silent thing: `Scan::filters` is the interface to
+            // row-group / bloom / zone-map pruning in `basin-storage` (see
+            // the module docs), so a stray index landed *there* can skip real
+            // data and return a wrong answer with nothing to announce it.
+            // Left above the scan, it stays a visible failure.
+            let width = projection.len();
+            let (fits, strays): (Vec<Expr>, Vec<Expr>) =
+                candidates.into_iter().partition(|p| fits_scan(p, width));
+            debug_assert!(
+                strays.is_empty(),
+                "filter pushdown reached a {width}-column scan of {table:?} with a \
+                 predicate referencing a column outside it: {strays:?} — some rule \
+                 above attributed this predicate to the wrong input",
+            );
+            blocked.extend(strays);
+            filters.extend(fits);
             LogicalPlan::Scan {
                 table,
                 projection,
@@ -469,26 +519,68 @@ fn is_unpushable(expr: &Expr) -> bool {
     expr.contains_srf() || expr.any(&mut |e| matches!(e, Expr::Subquery { .. }))
 }
 
-/// Whether `expr` references any column of the given relation index (0 or 1
-/// — see `ColumnRef::relation`'s doc comment).
-fn touches_relation(expr: &Expr, relation: u16) -> bool {
-    expr.any(&mut |e| matches!(e, Expr::Column(c) if c.relation == relation))
+/// Whether every column `expr` reads addresses a `width`-column input, with
+/// the relation-0 tag a single-input predicate is required to carry by the
+/// time it reaches one. See the `Scan` arm of [`push_into`].
+fn fits_scan(expr: &Expr, width: usize) -> bool {
+    !expr.any(
+        &mut |e| matches!(e, Expr::Column(c) if c.relation != 0 || (c.index as usize) >= width),
+    )
 }
 
-/// Rewrite a predicate that [`touches_relation`] confirmed only uses
-/// relation 1 (a join's right side) so it can sit directly over that side as
-/// a single-input predicate, where relation 0 means "the input" again.
-fn rebase_right(expr: Expr) -> Expr {
-    map_columns(&expr, &mut |c| {
-        if c.relation == 1 {
-            Expr::Column(ColumnRef {
-                relation: 0,
-                index: c.index,
-                name: c.name.clone(),
-            })
-        } else {
-            Expr::Column(c.clone())
+/// Fold every column in `expr` through [`super::column_side`] into the one
+/// side the whole predicate can be attributed to.
+fn attribute(expr: &Expr, left_width: usize, right_width: usize) -> Side {
+    let mut acc = Side::Neither;
+    expr.any(&mut |e| {
+        if let Expr::Column(c) = e {
+            acc = match (acc, column_side(c, left_width, right_width)) {
+                (Side::Unattributable, _) | (_, Side::Unattributable) => Side::Unattributable,
+                (Side::Neither, s) | (s, Side::Neither) => s,
+                (Side::Left, Side::Left) => Side::Left,
+                (Side::Right, Side::Right) => Side::Right,
+                _ => Side::Both,
+            };
         }
+        // Never short-circuit: `any` stops at the first `true`, and every
+        // column has to be seen for the fold above to be a fold.
+        false
+    });
+    acc
+}
+
+/// Rewrite a predicate that [`attribute`] confirmed reads only a join's right
+/// input, so it can sit directly over that input as a single-input predicate,
+/// where relation 0 means "the input" again.
+///
+/// Both conventions [`super::column_side`] describes are undone here, and
+/// they need opposite treatment:
+///
+/// - A flat `relation: 0` reference is already relation-0, but its index is a
+///   position in left++right, so it is rebased by SUBTRACTING `left_width`.
+/// - A tagged `relation: 1` reference already has a right-relative index, so
+///   only its tag changes.
+///
+/// Retagging a flat reference 1→0 without subtracting (or subtracting from a
+/// tagged one) would produce a predicate that reads a real, in-range, and
+/// entirely unrelated column of the right input — a wrong answer with no
+/// panic to announce it.
+fn rebase_right(expr: Expr, left_width: usize) -> Expr {
+    map_columns(&expr, &mut |c| match c.relation {
+        0 if (c.index as usize) >= left_width => Expr::Column(ColumnRef {
+            relation: 0,
+            index: c.index - left_width as u16,
+            name: c.name.clone(),
+        }),
+        1 => Expr::Column(ColumnRef {
+            relation: 0,
+            index: c.index,
+            name: c.name.clone(),
+        }),
+        // A flat left-side index, or anything else: `attribute` returned
+        // `Side::Right` for the whole predicate, so this arm is only
+        // reachable for a constant predicate's (nonexistent) columns.
+        _ => Expr::Column(c.clone()),
     })
 }
 
@@ -807,6 +899,135 @@ mod tests {
         // The right-side predicate must be rebased from relation 1 to
         // relation 0 once it sits directly over the right scan alone.
         assert_eq!(rf, vec![eq(col(0, 0), lit(2))]);
+    }
+
+    /// The FLAT convention, which is the one `crate::lower` actually emits:
+    /// every `WHERE` column is tagged `relation: 0` and indexed across
+    /// left++right. With two-column scans on both sides, `relation: 0 /
+    /// index: 2` is the right side's column 0.
+    ///
+    /// Before [`column_side`] existed, this predicate read as left-only (its
+    /// tag says relation 0) and was pushed into a left `Scan` that has no
+    /// column 2, which projection pruning then panicked on. The real query
+    /// was the anti-join idiom `LEFT JOIN u ON u.tid = t.id WHERE u.tid IS
+    /// NULL`; see `tests/anti_join_pushdown.rs`.
+    #[test]
+    fn flat_right_side_index_pushes_right_not_left() {
+        let join = LogicalPlan::Join {
+            left: Box::new(scan(1, vec![])),
+            right: Box::new(scan(2, vec![])),
+            kind: JoinKind::Inner,
+            on: vec![],
+            filter: None,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(join),
+            // Flat index 2 = right side's column 0 (left is 2 columns wide).
+            predicate: eq(col(0, 2), lit(5)),
+        };
+
+        let rewritten = FilterPushdown.rewrite(&plan).expect("must push");
+        let LogicalPlan::Join { left, right, .. } = rewritten else {
+            panic!("expected Join to survive, got {rewritten:?}");
+        };
+        let LogicalPlan::Scan { filters: lf, .. } = *left else {
+            panic!("left side must be a scan");
+        };
+        let LogicalPlan::Scan { filters: rf, .. } = *right else {
+            panic!("right side must be a scan");
+        };
+        assert!(
+            lf.is_empty(),
+            "a flat right-side index must not reach the left scan, which has \
+             no such column: {lf:?}"
+        );
+        // Rebased by SUBTRACTING the left width, not by retagging: flat 2
+        // becomes the right input's own column 0. (`name` is carried through
+        // untouched — it is for error messages, never for resolution — so the
+        // expectation keeps the original `c2`.)
+        assert_eq!(
+            rf,
+            vec![eq(
+                Expr::Column(ColumnRef {
+                    relation: 0,
+                    index: 0,
+                    name: "c2".to_string(),
+                }),
+                lit(5)
+            )]
+        );
+    }
+
+    /// The same flat reference over a LEFT JOIN, where the right side is the
+    /// null-supplying one: it must not move at all. Pre-fix it moved into the
+    /// LEFT input — both the wrong side *and* an out-of-range index.
+    #[test]
+    fn flat_right_side_index_over_left_join_does_not_move() {
+        let join = LogicalPlan::Join {
+            left: Box::new(scan(1, vec![])),
+            right: Box::new(scan(2, vec![])),
+            kind: JoinKind::Left,
+            on: vec![],
+            filter: None,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(join),
+            predicate: Expr::IsNull {
+                arg: Box::new(col(0, 2)),
+                negated: false,
+            },
+        };
+
+        assert!(
+            FilterPushdown.rewrite(&plan).is_none(),
+            "the anti-join idiom's predicate must stay above the LEFT JOIN"
+        );
+    }
+
+    /// A flat reference that straddles the boundary — one column each side —
+    /// is two-sided even though both carry `relation: 0`.
+    #[test]
+    fn flat_indices_spanning_both_sides_are_two_sided() {
+        let join = LogicalPlan::Join {
+            left: Box::new(scan(1, vec![])),
+            right: Box::new(scan(2, vec![])),
+            kind: JoinKind::Inner,
+            on: vec![],
+            filter: None,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(join),
+            predicate: eq(col(0, 1), col(0, 2)),
+        };
+
+        assert!(
+            FilterPushdown.rewrite(&plan).is_none(),
+            "left col 1 and right col 0 straddle the join and must not be pushed"
+        );
+    }
+
+    /// The invariant, stated as behaviour rather than prose: a column index
+    /// that addresses neither input is never attributed to one. It stays
+    /// above the join, where it is at least still visible.
+    #[test]
+    fn an_index_past_both_inputs_is_never_pushed() {
+        let join = LogicalPlan::Join {
+            left: Box::new(scan(1, vec![])),
+            right: Box::new(scan(2, vec![])),
+            kind: JoinKind::Inner,
+            on: vec![],
+            filter: None,
+        };
+        // Left and right are 2 columns each, so 4 is past the end of both.
+        let plan = LogicalPlan::Filter {
+            input: Box::new(join),
+            predicate: eq(col(0, 4), lit(1)),
+        };
+
+        assert!(
+            FilterPushdown.rewrite(&plan).is_none(),
+            "an unattributable column must not be guessed onto a side"
+        );
     }
 
     /// Wrong answer this prevents: pushing `r.y = 5` into the right side of

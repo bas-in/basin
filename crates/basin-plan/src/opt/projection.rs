@@ -101,7 +101,7 @@
 
 use std::collections::BTreeSet;
 
-use super::OptimizerRule;
+use super::{OptimizerRule, Side};
 use crate::{ColumnRef, Expr, FrameBound, JoinKind, LogicalPlan, SortKey, WindowFrame};
 
 /// Removes entries from every `LogicalPlan::Scan { projection }` that nothing
@@ -166,7 +166,14 @@ fn apply_remap(remap: &Remap, e: &Expr, relation: u16) -> Expr {
 /// `schema.rs`) and, being general schema inference, would need to resolve
 /// types this rule has no use for. This only ever needs a count, computed
 /// straight from each variant's own shape.
-fn output_width(plan: &LogicalPlan) -> usize {
+///
+/// `pub(crate)` because `opt::pushdown` needs the same count for the same
+/// reason: a `relation: 0` column reference above a join is a FLAT position
+/// across left++right, so the left input's width is the only thing that says
+/// which side it belongs to. Both rules reading one implementation is the
+/// point — the two disagreeing about a join's width is precisely how a
+/// right-side predicate ended up in a left-side `Scan`.
+pub(crate) fn output_width(plan: &LogicalPlan) -> usize {
     match plan {
         LogicalPlan::Scan { projection, .. } => projection.len(),
         LogicalPlan::Values { schema, .. }
@@ -224,6 +231,19 @@ fn collect_columns(e: &Expr, relation: u16, out: &mut BTreeSet<u16>) {
         }
     }
     e.for_each_child(&mut |c| collect_columns(c, relation, out));
+}
+
+/// Collect every [`Expr::Column`]'s [`ColumnRef`] reachable from `e`,
+/// regardless of its `relation` tag — the input [`super::column_side`] needs,
+/// which has to see the tag rather than be filtered by it.
+///
+/// Same [`Expr::for_each_child`] traversal, and so the same subquery
+/// boundary, as [`collect_columns`].
+fn collect_column_refs(e: &Expr, out: &mut Vec<ColumnRef>) {
+    if let Expr::Column(cr) = e {
+        out.push(cr.clone());
+    }
+    e.for_each_child(&mut |c| collect_column_refs(c, out));
 }
 
 /// Rewrite every [`Expr::Column`] in relation `relation` through `remap`.
@@ -795,34 +815,39 @@ fn prune(plan: &LogicalPlan, required: &BTreeSet<u16>) -> (LogicalPlan, Remap, b
             // Attribute a join condition's columns to their side by POSITION,
             // not by `ColumnRef::relation`.
             //
-            // Lowering emits every column with `relation: 0` and a FLAT index
-            // across the concatenated scope — see `Scope::resolve` in
-            // lower/select.rs, which hardcodes `relation: 0` for both qualified
-            // and unqualified lookups. So `collect_columns(expr, 1, ..)` found
-            // nothing, the build side's required set came back empty, and this
-            // rule pruned away the very column the join keys on.
+            // Two `ColumnRef` conventions are live across a join, and the rule
+            // that resolves both — position first, tag second — is written
+            // once, in `opt::pushdown::column_side`. Read that; the summary
+            // here exists only because this arm needs a *different* input to
+            // apply it to on each of the three lines below, not because the
+            // rule differs.
             //
-            // That is not a cosmetic mismatch: it produced a plan whose join
-            // key indexed a zero-column schema, which arrow answered by
-            // panicking and taking the session down (fixed defensively in
-            // basin-exec's HashJoin, but the cause is here). The `required` set
-            // a few lines above already uses this same flat convention; the
-            // join keys were the one place that did not.
-            // BOTH conventions are live in this codebase and both must work.
-            // A `relation: 1` reference is already attributed to the build
-            // side. A `relation: 0` reference is a flat position, so it belongs
-            // to whichever side its index falls in.
-            // An `on` pair is ALREADY per-side. `lower/select.rs`'s
+            // - Lowering emits every column with `relation: 0` and a FLAT
+            //   index across the concatenated scope (see `Scope::resolve` in
+            //   lower/select.rs, which hardcodes `relation: 0` for qualified
+            //   and unqualified lookups alike).
+            // - `opt::decorrelate` emits genuine `relation: 1` references
+            //   whose index is already right-relative.
+            //
+            // Reading the tag alone here made `collect_columns(expr, 1, ..)`
+            // find nothing, so the build side's required set came back empty
+            // and this rule pruned away the very column the join keys on: a
+            // plan whose join key indexed a zero-column schema, which arrow
+            // answered by panicking and taking the session down (fixed
+            // defensively in basin-exec's HashJoin, but the cause was here).
+            //
+            // An `on` pair is the ONE place the flat rule does not apply,
+            // because the pair is already per-side: `lower/select.rs`'s
             // `split_equijoin_conjuncts` rebases the right operand to be
             // right-schema-relative before the pair reaches a plan, so its
             // index is not a flat position and must not be treated as one.
             //
-            // My earlier fix here did treat it as one. It was written to close
-            // a panic where the build side got pruned to zero columns, and it
-            // replaced that wrong plan with a different wrong plan: applying
-            // the flat rule to an already-rebased right index attributes the
-            // join key to the LEFT side, so the right side loses it again. The
-            // symptom was identical, which is why it survived.
+            // An earlier fix here did treat it as one. It was written to close
+            // the zero-column-build-side panic and replaced that wrong plan
+            // with a different wrong plan: applying the flat rule to an
+            // already-rebased right index attributes the join key to the LEFT
+            // side, so the right side loses it again. The symptom was
+            // identical, which is why it survived.
             for (l, r) in on {
                 collect_columns(l, 0, &mut left_required);
                 collect_columns(l, 1, &mut right_required);
@@ -834,18 +859,35 @@ fn prune(plan: &LogicalPlan, required: &BTreeSet<u16>) -> (LogicalPlan, Remap, b
 
             // A join `filter` is NOT rebased — it is an arbitrary residual
             // predicate over the concatenated output, so a flat position is
-            // exactly what it holds.
+            // exactly what it holds, and both conventions can appear in one.
+            // `super::column_side` is the single implementation of that
+            // reading, shared with `opt::pushdown`; see its docs.
             if let Some(f) = filter {
-                let mut flat = BTreeSet::new();
-                collect_columns(f, 0, &mut flat);
-                for p in flat {
-                    if (p as usize) >= left_width {
-                        right_required.insert(p - left_width as u16);
-                    } else {
-                        left_required.insert(p);
+                let mut cols = Vec::new();
+                collect_column_refs(f, &mut cols);
+                for c in cols {
+                    match super::column_side(&c, left_width, right_width) {
+                        Side::Left => {
+                            left_required.insert(c.index);
+                        }
+                        Side::Right => {
+                            // Undo whichever convention this one arrived in,
+                            // to a position within the right input alone.
+                            let i = if c.relation == 0 {
+                                c.index - left_width as u16
+                            } else {
+                                c.index
+                            };
+                            right_required.insert(i);
+                        }
+                        // Neither input can supply it, so neither input's
+                        // required set gains anything it cannot honour. The
+                        // reference is left for `remap_expr` to reject by
+                        // name below rather than turned into a plausible
+                        // in-range index on an unrelated column.
+                        _ => {}
                     }
                 }
-                collect_columns(f, 1, &mut right_required);
             }
 
             let (new_left, left_remap, left_changed) = prune(left, &left_required);
