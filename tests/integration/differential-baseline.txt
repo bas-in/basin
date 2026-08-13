@@ -34,7 +34,6 @@ diff_drop_schema_with_tables_restrict_errors
 diff_error_division_by_zero
 diff_jsonb_array_elements_literal_srf
 diff_jsonb_arrow_op
-diff_jsonb_double_arrow_op
 diff_jsonb_each_srf
 diff_jsonb_path_op
 diff_lateral_basic
