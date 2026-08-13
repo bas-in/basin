@@ -87,23 +87,23 @@ async fn fallback_histogram_over_representative_sql() {
     // Catch panics per query. A panic here is itself a finding — a query that
     // aborts rather than returning an error would take down a real session —
     // so one bad shape must not hide the histogram for all the others.
+    // ONE pass. An earlier version ran the list twice — once for the
+    // histogram and once for attribution — which doubled every count and made
+    // the coverage figure meaningless.
     let total = queries.len();
     let mut panicked: Vec<&str> = Vec::new();
-    for q in queries {
-        let res = std::panic::AssertUnwindSafe(s.execute(q))
-            .catch_unwind()
-            .await;
-        if res.is_err() {
-            panicked.push(q);
-        }
-    }
     // Per-query attribution. The aggregate histogram says WHAT KIND of gaps
     // remain; this says WHICH query hit which, which is what actually picks the
     // next piece of work.
     eprintln!("\n─── per query ───");
     for q in queries {
         let before = eng.owned_engine_served_count();
-        let _ = s.execute(q).await;
+        let res = std::panic::AssertUnwindSafe(s.execute(q))
+            .catch_unwind()
+            .await;
+        if res.is_err() {
+            panicked.push(q);
+        }
         let verdict = if eng.owned_engine_served_count() > before {
             "served"
         } else {

@@ -775,10 +775,32 @@ fn prune(plan: &LogicalPlan, required: &BTreeSet<u16>) -> (LogicalPlan, Remap, b
             // A `relation: 1` reference is already attributed to the build
             // side. A `relation: 0` reference is a flat position, so it belongs
             // to whichever side its index falls in.
-            let mut collect_both_conventions = |e: &Expr| {
-                collect_columns(e, 1, &mut right_required);
+            // An `on` pair is ALREADY per-side. `lower/select.rs`'s
+            // `split_equijoin_conjuncts` rebases the right operand to be
+            // right-schema-relative before the pair reaches a plan, so its
+            // index is not a flat position and must not be treated as one.
+            //
+            // My earlier fix here did treat it as one. It was written to close
+            // a panic where the build side got pruned to zero columns, and it
+            // replaced that wrong plan with a different wrong plan: applying
+            // the flat rule to an already-rebased right index attributes the
+            // join key to the LEFT side, so the right side loses it again. The
+            // symptom was identical, which is why it survived.
+            for (l, r) in on {
+                collect_columns(l, 0, &mut left_required);
+                collect_columns(l, 1, &mut right_required);
+                collect_columns(r, 1, &mut right_required);
+                // The right operand carries `relation: 0` from lowering even
+                // though its index is right-relative, so read it as right.
+                collect_columns(r, 0, &mut right_required);
+            }
+
+            // A join `filter` is NOT rebased — it is an arbitrary residual
+            // predicate over the concatenated output, so a flat position is
+            // exactly what it holds.
+            if let Some(f) = filter {
                 let mut flat = BTreeSet::new();
-                collect_columns(e, 0, &mut flat);
+                collect_columns(f, 0, &mut flat);
                 for p in flat {
                     if (p as usize) >= left_width {
                         right_required.insert(p - left_width as u16);
@@ -786,13 +808,7 @@ fn prune(plan: &LogicalPlan, required: &BTreeSet<u16>) -> (LogicalPlan, Remap, b
                         left_required.insert(p);
                     }
                 }
-            };
-            for (l, r) in on {
-                collect_both_conventions(l);
-                collect_both_conventions(r);
-            }
-            if let Some(f) = filter {
-                collect_both_conventions(f);
+                collect_columns(f, 1, &mut right_required);
             }
 
             let (new_left, left_remap, left_changed) = prune(left, &left_required);
