@@ -128,6 +128,12 @@ pub(crate) struct EngineInner {
     /// see `owned_engine`'s module docs, "Reporting why, not just how many",
     /// and [`Engine::owned_engine_fallback_reason_counts`].
     pub(crate) owned_engine_fallback_reasons: crate::owned_engine::FallbackReasonCounters,
+    /// Shadow-compare tallies behind `BASIN_OWNED_ENGINE_SHADOW_COMPARE` —
+    /// how many served SELECTs were also re-run through DataFusion and
+    /// diffed, how many of those disagreed, and a bounded sample of the
+    /// disagreements. See `owned_engine`'s module docs, "Shadow-compare",
+    /// and [`Engine::owned_engine_shadow_compare_count`].
+    pub(crate) owned_engine_shadow_compare: crate::owned_engine::ShadowCompareCounters,
     /// Sum, across every plan the owned-engine bridge has run through
     /// `basin_plan::opt::optimize_default`, of the number of *productive*
     /// passes the fixpoint driver made (see `basin_plan::opt::driver`) —
@@ -589,6 +595,7 @@ impl Engine {
             owned_engine_served_count: AtomicU64::new(0),
             owned_engine_fallback_count: AtomicU64::new(0),
             owned_engine_fallback_reasons: crate::owned_engine::FallbackReasonCounters::new(),
+            owned_engine_shadow_compare: crate::owned_engine::ShadowCompareCounters::new(),
             owned_engine_optimizer_passes_total: AtomicU64::new(0),
             owned_engine_optimizer_plans_count: AtomicU64::new(0),
             owned_engine_optimizer_zero_pass_count: AtomicU64::new(0),
@@ -1514,6 +1521,48 @@ impl Engine {
         self.inner.owned_engine_fallback_reasons.snapshot()
     }
 
+    /// Crate-private hook bumped by `owned_engine::record_shadow_result` once
+    /// per served SELECT that shadow-compare actually re-ran and diffed —
+    /// whether or not the two engines agreed.
+    pub(crate) fn note_owned_engine_shadow_compare(&self) {
+        self.inner.owned_engine_shadow_compare.note_compared();
+    }
+
+    /// Crate-private hook bumped by `owned_engine::record_shadow_result`
+    /// alongside [`Engine::note_owned_engine_shadow_compare`] when the two
+    /// engines disagreed, recording `detail` in the bounded sample.
+    pub(crate) fn note_owned_engine_shadow_compare_divergence(&self, sql: &str, detail: String) {
+        self.inner
+            .owned_engine_shadow_compare
+            .note_divergence(sql, detail);
+    }
+
+    /// How many SELECTs the owned engine served were ALSO re-run through
+    /// DataFusion and diffed, behind `BASIN_OWNED_ENGINE_SHADOW_COMPARE`.
+    /// Zero unless that flag is on. The denominator for
+    /// [`Engine::owned_engine_shadow_compare_divergence_count`] — a
+    /// divergence count of 0 means nothing without knowing how many
+    /// comparisons produced it. See `owned_engine`'s module docs,
+    /// "Shadow-compare".
+    pub fn owned_engine_shadow_compare_count(&self) -> u64 {
+        self.inner.owned_engine_shadow_compare.compared()
+    }
+
+    /// Of [`Engine::owned_engine_shadow_compare_count`], how many comparisons
+    /// found the two engines disagreeing. Unlike the sample below this is
+    /// uncapped.
+    pub fn owned_engine_shadow_compare_divergence_count(&self) -> u64 {
+        self.inner.owned_engine_shadow_compare.diverged()
+    }
+
+    /// A bounded sample (at most
+    /// `owned_engine::MAX_RECORDED_DIVERGENCES`) of the disagreements
+    /// [`Engine::owned_engine_shadow_compare_divergence_count`] counts, each
+    /// naming the statement and the first cell/shape difference found.
+    pub fn owned_engine_shadow_compare_divergences(&self) -> Vec<ShadowDivergence> {
+        self.inner.owned_engine_shadow_compare.divergences()
+    }
+
     /// Crate-private hook bumped by `owned_engine::try_execute_inner` every
     /// time `basin_plan::opt::optimize_default` finishes running on a
     /// lowered plan — regardless of whether that plan goes on to be served
@@ -2267,7 +2316,9 @@ impl Drop for ProjectSession {
     }
 }
 
-pub use crate::owned_engine::FallbackReasonCountersSnapshot;
+pub use crate::owned_engine::{
+    compare_shadow_results, FallbackReasonCountersSnapshot, ShadowDivergence,
+};
 pub use crate::pk_row_cache::PkRowCacheCountersSnapshot;
 pub use crate::prepared::{BoundStatement, ScalarParam, StatementHandle, StatementSchema};
 pub use crate::region::{ForwardContext, WriteForwarder};

@@ -12,7 +12,7 @@
 //!    and its answer matches what the same SQL returns via DataFusion (flag
 //!    off) — proving the bridge doesn't just "not crash" but returns the
 //!    right rows.
-//! 3. A construct the owned pipeline does not support (`SELECT DISTINCT`,
+//! 3. A construct the owned pipeline does not support (`GROUP BY ROLLUP`,
 //!    per `basin-plan/src/lower/select.rs`'s documented scope) still returns
 //!    the correct answer — it must fall back to DataFusion rather than
 //!    error — and the fallback counter, not the served counter, is the one
@@ -91,6 +91,24 @@ fn flatten_id_name(batches: &[RecordBatch]) -> Vec<(i64, Option<String>)> {
             let id = ids.value(r);
             let name = (!names.is_null(r)).then(|| names.value(r).to_string());
             out.push((id, name));
+        }
+    }
+    out
+}
+
+/// Flatten two BIGINT columns, the shape a `GROUP BY ... count(*)` result
+/// has. The first is nullable (a `ROLLUP` grand-total row carries a NULL
+/// grouping key), the second is a count and never is.
+fn flatten_two_i64(batches: &[RecordBatch]) -> Vec<(Option<i64>, i64)> {
+    let mut out = Vec::new();
+    for b in batches {
+        let keys = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let counts = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        for r in 0..b.num_rows() {
+            out.push((
+                (!keys.is_null(r)).then(|| keys.value(r)),
+                counts.value(r),
+            ));
         }
     }
     out
@@ -190,11 +208,19 @@ async fn flag_on_serves_a_simple_select_matching_datafusion() {
 }
 
 /// Property 3: a construct outside the owned pipeline's documented scope
-/// (`SELECT DISTINCT ON (...)` — `basin-plan/src/lower/select.rs` names this
-/// explicitly as `LowerError::Unsupported`, distinct from plain `DISTINCT`,
-/// which that same file now lowers) must still produce the correct answer,
-/// via a silent fallback to DataFusion, and record itself as a fallback
-/// rather than a served query or a client-visible error.
+/// (`GROUP BY ROLLUP (...)` — a grouping-set construct
+/// `basin-plan/src/lower/select.rs` reports as `LowerError::Unsupported`)
+/// must still produce the correct answer, via a silent fallback to
+/// DataFusion, and record itself as a fallback rather than a served query or
+/// a client-visible error.
+///
+/// This test used `SELECT DISTINCT ON (...)` until `basin-plan` grew
+/// DISTINCT ON lowering, at which point the query started being SERVED and
+/// the test failed — correctly, because its premise had expired. The
+/// assertions below are unchanged in strength; only the construct they are
+/// pointed at moved to one the pipeline genuinely does not implement yet.
+/// The expected rows were checked against a live PostgreSQL 18.2:
+/// `(1, 2), (2, 1), (NULL, 3)`.
 #[tokio::test]
 async fn unsupported_construct_falls_back_instead_of_erroring() {
     let _guard = env_lock();
@@ -210,16 +236,18 @@ async fn unsupported_construct_falls_back_instead_of_erroring() {
     )
     .await;
 
-    // DISTINCT ON is explicitly unsupported by `lower_select_stmt` today (see
-    // that function's `stmt.distinct_clause` guard) — must fall back, not
-    // error, and still return the deduplicated rows. (Plain DISTINCT is now
-    // lowered and served, so it no longer exercises this fallback path.)
-    let batches = rows(&sess, "SELECT DISTINCT ON (id) id, name FROM d ORDER BY id").await;
-    let got = flatten_id_name(&batches);
+    // ROLLUP must fall back, not error, and the fallback must still compute
+    // the whole grouping set — the two per-id groups AND the grand total.
+    let batches = rows(
+        &sess,
+        "SELECT id, count(*) FROM d GROUP BY ROLLUP (id) ORDER BY id",
+    )
+    .await;
+    let got = flatten_two_i64(&batches);
     assert_eq!(
         got,
-        vec![(1, Some("x".to_string())), (2, Some("y".to_string()))],
-        "a fallback must still return the correct (deduplicated) answer"
+        vec![(Some(1), 2), (Some(2), 1), (None, 3)],
+        "a fallback must still return the correct answer, grand total included"
     );
 
     assert_eq!(
@@ -233,7 +261,7 @@ async fn unsupported_construct_falls_back_instead_of_erroring() {
         "the fallback counter is exactly the one that should move here"
     );
 
-    // DISTINCT ON is a construct nothing downstream implements yet
+    // ROLLUP is a construct nothing downstream implements yet
     // (`LowerError::Unsupported`), not an ineligible table or a genuine
     // error — it must land in exactly the `unsupported` bucket, and the
     // histogram must still sum to the flat fallback count.

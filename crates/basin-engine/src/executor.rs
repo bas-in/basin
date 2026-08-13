@@ -2049,7 +2049,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 // any ineligibility or lowering/build/exec error, so this
                 // call changes nothing about today's behaviour by default.
                 let node = tree.stmts().next().expect("kinds[0] implies stmts[0]");
-                if let Some(result) = crate::owned_engine::try_execute(sess, node).await {
+                if let Some(result) = crate::owned_engine::try_execute(sess, node, sql).await {
                     return Ok(result);
                 }
             }
@@ -10728,6 +10728,47 @@ mod df_plan_error_tests {
             other => panic!("expected Internal, got {other:?}"),
         }
     }
+}
+
+/// The incumbent DataFusion answer for `sql`, for `owned_engine`'s
+/// shadow-compare mode (see that module's "Shadow-compare" docs) to diff the
+/// owned engine's answer against.
+///
+/// This is not simply `exec_select(sess, sql, ...)`: the normal path reaches
+/// `exec_select` only *after* [`needs_rewrite_pipeline`] /
+/// [`needs_enum_ordering_rewrite`] have had their say (see
+/// `dispatch_parsed_statement`'s caller), and those rewrites are what make
+/// `col::jsonb -> 'k'`, enum ordering, vector operators and ~40 other forms
+/// mean what Postgres says they mean. Handing `exec_select` the raw text
+/// instead would make the oracle disagree with the engine it is supposed to
+/// be an oracle FOR — every divergence it reported would have to be
+/// hand-checked against "did a rewrite just not run?" first.
+///
+/// It is still not byte-for-byte the full statement path: the SELECT branch
+/// of `dispatch_parsed_statement` also consults index probes and fast paths
+/// that can short-circuit before `exec_select`. Those change which files are
+/// read, not which rows come back, so they are exactly the difference this
+/// comparison is allowed to ignore.
+pub(crate) async fn exec_select_reference(
+    sess: &ProjectSession,
+    sql: &str,
+) -> Result<ExecResult> {
+    let rewritten: String;
+    let effective = if needs_rewrite_pipeline(sql) {
+        rewritten = run_full_rewrite_pipeline(sess, sql).await?;
+        rewritten.as_str()
+    } else if needs_enum_ordering_rewrite(sql) {
+        rewritten = crate::enum_ordinal::rewrite_enum_ordering(
+            &sess.engine.config().catalog,
+            &sess.project,
+            sql,
+        )
+        .await?;
+        rewritten.as_str()
+    } else {
+        sql
+    };
+    exec_select(sess, effective, false, Some(sql)).await
 }
 
 // `gin_original_sql`: the original (pre-operator-rewrite) SQL for GIN pruning

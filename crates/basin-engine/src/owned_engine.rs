@@ -104,9 +104,99 @@
 //! `basin-catalog`'s `TableMetadata`, keyed only by `(ProjectId,
 //! TableName)`) — [`build_resolver`] mints one per referenced table, scoped
 //! to the single resolver instance built for one statement.
+//!
+//! # Shadow-compare: a free differential oracle, behind `BASIN_OWNED_ENGINE_SHADOW_COMPARE`
+//!
+//! Every time [`try_execute`] serves a `SELECT`, both engines are already
+//! reachable in the same process against the same committed data — the
+//! owned engine just answered, and [`crate::executor::exec_select`] is the
+//! unchanged DataFusion path this bridge falls back to for everything else.
+//! Behind a second, independent flag ([`shadow_compare_enabled`]), served
+//! queries are ALSO run through that path — via
+//! [`crate::executor::exec_select_reference`], which applies the same
+//! string-rewrite pipeline the normal statement path applies before it
+//! reaches `exec_select`, so the oracle is comparing like with like — and
+//! the two results diffed by
+//! [`shadow_compare`] — turning every test in this crate that exercises real
+//! SQL into a differential-equivalence check against the incumbent, with no
+//! second oracle to install and no fixture to maintain. Four design
+//! decisions this mode had to make, in the order the task asked for them:
+//!
+//! 1. **Row order.** A statement with no top-level `ORDER BY` has no
+//!    guaranteed row order (Postgres itself makes no promise, and Basin
+//!    inherits that), so two independent physical engines are not going to
+//!    coincidentally agree on one. [`compare_results`] checks the parsed
+//!    `SelectStmt::sort_clause` and compares POSITIONALLY only when it is
+//!    non-empty; otherwise it sorts both row lists by an identical canonical
+//!    key ([`row_sort_key`]) and compares the sorted lists position for
+//!    position. A naive unconditional positional diff would report a false
+//!    divergence on nearly every `GROUP BY`/join/no-`ORDER BY` query in the
+//!    corpus, drowning the real findings in noise.
+//! 2. **Floating point.** Cell comparison ([`cell_eq`]/[`float_eq`]) uses a
+//!    tolerance — `1e-9` absolute or `1e-9` relative to the larger operand,
+//!    whichever is looser — not exact bit equality. Two engines that sum,
+//!    average, or otherwise accumulate the same `FLOAT4`/`FLOAT8` values in
+//!    a different order (different join order, different hash-group
+//!    iteration order, ...) will legitimately land on different but equally
+//!    correct IEEE-754 results at the ULP level; exact equality would flag
+//!    that as a divergence on nearly every aggregate query, which is not
+//!    what this mode exists to find. `NUMERIC`/`DECIMAL` and every other
+//!    type are compared EXACTLY (via their rendered text — see
+//!    [`display_cell`]): decimal arithmetic has no equivalent
+//!    summation-order slack, so exactness there is a real signal, not noise.
+//! 3. **Side effects — safe by construction, not by convention.** DML must
+//!    never run twice (a second `exec_select`-equivalent for an INSERT would
+//!    double-write). [`shadow_compare`] enforces this structurally, as its
+//!    very first act and before anything is executed: [`shadow_target`]
+//!    `match`es `stmt_node` against `NodeEnum::SelectStmt` and yields
+//!    `None` for anything else, on which `shadow_compare` returns
+//!    immediately. (That guard is a named function purely so it can be
+//!    unit-tested directly against a parsed `INSERT`/`UPDATE`/`DELETE`
+//!    node — see this file's tests.) This does not lean on today's single
+//!    call site only ever reaching [`try_execute`] for `StmtKind::Select`
+//!    (see `executor.rs`) — `try_execute_inner` already lowers `INSERT`/
+//!    `UPDATE`/`DELETE` via `basin_plan::lower::dml::lower_dml` for exactly
+//!    this reason, so a future call site wiring DML through this same bridge
+//!    must not silently start double-executing writes just because this flag
+//!    happens to be on. The guard is the enforcement; nothing upstream has
+//!    to remember to keep it safe.
+//!
+//!    Matching the outermost node kind is NOT on its own enough, which is
+//!    worth stating because the obvious one-line version of this guard is
+//!    unsafe: `WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT *
+//!    FROM x` is a perfectly ordinary data-modifying CTE, and `pg_query`
+//!    roots it at a `SelectStmt` whose `with_clause` holds the `InsertStmt`.
+//!    [`shadow_target`] therefore also requires [`is_side_effect_free`],
+//!    which walks the `WITH` list (and each set-operation arm's own) and
+//!    insists every CTE body is itself a side-effect-free `SelectStmt`.
+//! 4. **Cost.** This mode runs every served query twice end to end. That is
+//!    the whole point (this is a diagnostic/measurement mode, not a
+//!    performance-sensitive one — see `tests/shadow_compare.rs` and
+//!    `tests/fallback_histogram.rs`, which it is modelled on) and it is
+//!    exactly why the flag defaults OFF and is independent of
+//!    `BASIN_OWNED_ENGINE` itself.
+//!
+//! One case the four decisions above do not cover, because it is not a
+//! difference between two answers: the incumbent path *erroring* on a
+//! statement the owned engine served. That is recorded as a divergence too
+//! — the engines disagreed about whether the statement is even executable,
+//! which is exactly the kind of thing this mode exists to surface.
+//!
+//! Divergences are counted and logged (capped at
+//! [`MAX_RECORDED_DIVERGENCES`] entries — a diagnostic aid, not an
+//! unbounded audit log) behind [`crate::Engine::owned_engine_shadow_compare_count`],
+//! [`crate::Engine::owned_engine_shadow_compare_divergence_count`], and
+//! [`crate::Engine::owned_engine_shadow_compare_divergences`] — mirroring
+//! the shape [`crate::Engine::owned_engine_served_count`] /
+//! [`crate::Engine::owned_engine_fallback_reason_counts`] already
+//! established for the fallback ratio.
 
 use std::collections::{HashMap, HashSet};
 
+use arrow::util::display::{ArrayFormatter, FormatOptions};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, Float64Type};
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field};
 use pg_query::protobuf::{node::Node as NodeEnum, Node, SelectStmt, SetOperation, WithClause};
 
@@ -132,6 +222,17 @@ pub(crate) fn enabled() -> bool {
     std::env::var("BASIN_OWNED_ENGINE").as_deref() == Ok("1")
 }
 
+/// Whether shadow-compare is enabled — see the module docs' "Shadow-compare"
+/// section. Same convention as [`enabled`]: absent, empty, or anything but
+/// exactly `"1"` means OFF. Independent of `BASIN_OWNED_ENGINE` itself as an
+/// env var (a caller could in principle set this without that one), but
+/// inert unless it is also `"1"`: [`try_execute`] returns before ever
+/// checking this when the owned engine itself is off, so there is nothing to
+/// shadow-compare against.
+pub(crate) fn shadow_compare_enabled() -> bool {
+    std::env::var("BASIN_OWNED_ENGINE_SHADOW_COMPARE").as_deref() == Ok("1")
+}
+
 /// Attempt to serve `stmt_node` (a single `SELECT` statement's already-parsed
 /// `pg_query` node, as classified by the caller) through the owned pipeline.
 ///
@@ -141,7 +242,16 @@ pub(crate) fn enabled() -> bool {
 /// through to the existing DataFusion path unchanged. Every `None` is logged
 /// at debug with its reason so the served-vs-fallback ratio (the counters
 /// this bumps) can be explained, not just observed.
-pub(crate) async fn try_execute(sess: &ProjectSession, stmt_node: &Node) -> Option<ExecResult> {
+///
+/// `sql` is the original statement text, needed only for the shadow-compare
+/// mode (see the module docs) to re-run the same statement through
+/// [`crate::executor::exec_select`] — it is otherwise unused, since every
+/// other part of this bridge works from the already-parsed `stmt_node`.
+pub(crate) async fn try_execute(
+    sess: &ProjectSession,
+    stmt_node: &Node,
+    sql: &str,
+) -> Option<ExecResult> {
     if !enabled() {
         return None;
     }
@@ -165,6 +275,9 @@ pub(crate) async fn try_execute(sess: &ProjectSession, stmt_node: &Node) -> Opti
         Ok(result) => {
             sess.engine.note_owned_engine_served();
             tracing::debug!(target: "basin_engine::owned_engine", "owned engine served a SELECT");
+            if shadow_compare_enabled() {
+                shadow_compare(sess, stmt_node, sql, &result).await;
+            }
             Some(result)
         }
         Err(reason) => {
@@ -360,6 +473,516 @@ impl FallbackReasonCountersSnapshot {
             + self.build_error
             + self.exec_error
     }
+}
+
+// ─── Shadow-compare ─────────────────────────────────────────────────────
+
+/// How many divergence descriptions
+/// [`crate::Engine::owned_engine_shadow_compare_divergences`] retains before
+/// it stops recording new ones. The *count*
+/// ([`crate::Engine::owned_engine_shadow_compare_divergence_count`]) keeps
+/// rising past this — only the descriptions are capped. A run that diverges
+/// on every one of thousands of queries would otherwise accumulate an
+/// unbounded `Vec<String>` inside a long-lived `Engine`, and the first
+/// handful of examples is what actually gets read; the counter is what gets
+/// tracked.
+pub(crate) const MAX_RECORDED_DIVERGENCES: usize = 64;
+
+/// Both halves of the float tolerance from the module docs' decision 2: a
+/// difference is ignored when it is within `1e-9` absolutely, OR within
+/// `1e-9` relative to the larger operand — whichever admits more.
+const FLOAT_TOLERANCE: f64 = 1e-9;
+
+/// One recorded disagreement between the owned engine's answer and the
+/// incumbent DataFusion path's answer for the same statement. See the module
+/// docs' "Shadow-compare" section and
+/// [`crate::Engine::owned_engine_shadow_compare_divergences`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowDivergence {
+    /// The statement text both engines were given.
+    pub sql: String,
+    /// What differed, rendered for a human reading the log — the FIRST
+    /// disagreement found, not an exhaustive diff: one concrete
+    /// "row 3 column 1: owned 4, DataFusion 5" is what identifies the bug,
+    /// and a full diff of a million-row result is not readable anyway.
+    pub detail: String,
+}
+
+/// Tally + bounded sample behind
+/// [`crate::Engine::owned_engine_shadow_compare_count`],
+/// [`crate::Engine::owned_engine_shadow_compare_divergence_count`] and
+/// [`crate::Engine::owned_engine_shadow_compare_divergences`]. Same shape
+/// (and same `Relaxed`, approximate-operational-counter rationale) as
+/// [`FallbackReasonCounters`] above; the one addition is the sample `Vec`,
+/// which needs a real lock because it is not a single word.
+#[derive(Debug, Default)]
+pub(crate) struct ShadowCompareCounters {
+    compared: std::sync::atomic::AtomicU64,
+    diverged: std::sync::atomic::AtomicU64,
+    /// Capped at [`MAX_RECORDED_DIVERGENCES`]. `std::sync::Mutex` rather
+    /// than an async lock: every critical section here is a `push` or a
+    /// `clone`, never an `.await`.
+    divergences: std::sync::Mutex<Vec<ShadowDivergence>>,
+}
+
+impl ShadowCompareCounters {
+    pub(crate) const fn new() -> Self {
+        Self {
+            compared: std::sync::atomic::AtomicU64::new(0),
+            diverged: std::sync::atomic::AtomicU64::new(0),
+            divergences: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn note_compared(&self) {
+        self.compared
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_divergence(&self, sql: &str, detail: String) {
+        self.diverged
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Recover from poison rather than propagate: this is a diagnostic
+        // sample list, so a panic elsewhere while holding the lock cannot
+        // have left an invariant broken that matters here — and turning a
+        // diagnostic into a second panic would be strictly worse.
+        let mut recorded = self
+            .divergences
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if recorded.len() < MAX_RECORDED_DIVERGENCES {
+            recorded.push(ShadowDivergence {
+                sql: sql.to_string(),
+                detail,
+            });
+        }
+    }
+
+    pub(crate) fn compared(&self) -> u64 {
+        self.compared.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn diverged(&self) -> u64 {
+        self.diverged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn divergences(&self) -> Vec<ShadowDivergence> {
+        self.divergences
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// The structural side-effect guard from the module docs' decision 3: the
+/// ONLY thing shadow-compare will ever re-execute is a `SelectStmt` that is
+/// side-effect free all the way down ([`is_side_effect_free`]).
+///
+/// Factored out of [`shadow_compare`] purely so it can be unit-tested
+/// directly against a parsed `INSERT`/`UPDATE`/`DELETE` node — the guard is
+/// what stops a future DML-carrying call site from double-writing, so it
+/// needs a test that does not depend on today's call site only ever handing
+/// this module SELECTs.
+fn shadow_target(stmt_node: &Node) -> Option<&SelectStmt> {
+    match stmt_node.node.as_ref() {
+        Some(NodeEnum::SelectStmt(select)) if is_side_effect_free(select) => Some(select.as_ref()),
+        _ => None,
+    }
+}
+
+/// Whether re-running this `SelectStmt` is guaranteed to write nothing.
+///
+/// "It parsed as a `SelectStmt`" is NOT that guarantee, which is the whole
+/// reason this function exists: `WITH x AS (INSERT INTO t VALUES (1)
+/// RETURNING id) SELECT * FROM x` — a data-modifying CTE, ordinary Postgres
+/// — roots at a `SelectStmt` whose `with_clause` holds the `InsertStmt`.
+/// A guard that only inspected the outermost node kind would wave that
+/// through and double-write on every execution with the flag on. This walks
+/// the `WITH` list (and each set-operation arm, which carries its own) and
+/// requires every CTE body to itself be a side-effect-free `SelectStmt`.
+///
+/// Deliberately conservative: any CTE body this cannot positively identify
+/// as a `SelectStmt` — including node kinds that do not exist yet — is
+/// treated as writable. Being wrong in that direction costs one skipped
+/// comparison; being wrong the other way corrupts the user's data.
+fn is_side_effect_free(select: &SelectStmt) -> bool {
+    if let Some(with) = select.with_clause.as_ref() {
+        for cte in &with.ctes {
+            let Some(NodeEnum::CommonTableExpr(cte)) = cte.node.as_ref() else {
+                return false;
+            };
+            match cte.ctequery.as_ref().and_then(|q| q.node.as_ref()) {
+                Some(NodeEnum::SelectStmt(body)) => {
+                    if !is_side_effect_free(body) {
+                        return false;
+                    }
+                }
+                // INSERT/UPDATE/DELETE/MERGE — or anything unrecognised.
+                _ => return false,
+            }
+        }
+    }
+    // `a UNION b` puts each arm in `larg`/`rarg`, and an arm can carry its
+    // own `WITH`.
+    for arm in [select.larg.as_ref(), select.rarg.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if !is_side_effect_free(arm) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Re-run `sql` through the incumbent DataFusion path and diff its answer
+/// against the one the owned engine just produced. See the module docs'
+/// "Shadow-compare" section for the four decisions this encodes.
+///
+/// Never returns an error and never affects what the client sees: a failure
+/// on the incumbent side is itself recorded as a divergence (the two paths
+/// disagreed on whether the statement even succeeds, which is exactly the
+/// kind of finding this mode exists for) and execution continues.
+async fn shadow_compare(sess: &ProjectSession, stmt_node: &Node, sql: &str, owned: &ExecResult) {
+    // Decision 3. Structural, first thing, before anything is executed.
+    let Some(select) = shadow_target(stmt_node) else {
+        tracing::debug!(
+            target: "basin_engine::owned_engine",
+            "shadow-compare declined a non-SELECT node — re-executing it could double-write"
+        );
+        return;
+    };
+
+    let reference = match crate::executor::exec_select_reference(sess, sql).await {
+        Ok(reference) => reference,
+        Err(e) => {
+            record_shadow_result(
+                sess,
+                sql,
+                Some(format!(
+                    "the owned engine served this statement but the incumbent \
+                     DataFusion path errored on it: {e}"
+                )),
+            );
+            return;
+        }
+    };
+
+    let detail = compare_results(select, owned, &reference);
+    record_shadow_result(sess, sql, detail);
+}
+
+/// Bump the comparison counter and, when `detail` is `Some`, the divergence
+/// counter + bounded sample, and log. The single place every shadow-compare
+/// outcome funnels through, so the two counters cannot drift apart — the
+/// same reason [`record_fallback`] exists.
+fn record_shadow_result(sess: &ProjectSession, sql: &str, detail: Option<String>) {
+    sess.engine.note_owned_engine_shadow_compare();
+    if let Some(detail) = detail {
+        tracing::warn!(
+            target: "basin_engine::owned_engine",
+            sql = %sql,
+            detail = %detail,
+            "shadow-compare divergence: the owned engine and DataFusion disagree"
+        );
+        sess.engine
+            .note_owned_engine_shadow_compare_divergence(sql, detail);
+    } else {
+        tracing::debug!(
+            target: "basin_engine::owned_engine",
+            sql = %sql,
+            "shadow-compare agreed"
+        );
+    }
+}
+
+/// One cell of one result row, normalised so the two engines' answers are
+/// comparable without depending on either one's physical types.
+///
+/// `Float` exists as its own variant rather than being rendered to text like
+/// everything else because it is the one type compared with a tolerance
+/// (module docs, decision 2) — a rendered `"0.30000000000000004"` vs
+/// `"0.3"` cannot be compared with one, and both engines rendering the same
+/// `f64` is not guaranteed either.
+#[derive(Debug, Clone, PartialEq)]
+enum Cell {
+    Null,
+    /// A `FLOAT4` (widened to `f64`) or `FLOAT8` value.
+    Float(f64),
+    /// Every other type — including `NUMERIC`/`DECIMAL` — as its exactly
+    /// rendered text. See [`display_cell`].
+    Text(String),
+}
+
+/// Render one non-float cell to the exact text it is compared by, via
+/// Arrow's own display formatter — which is type-aware (a `Decimal128` keeps
+/// its scale, a `Date32` renders as a date, a list renders its elements)
+/// rather than a `Debug` dump of the physical representation, so two engines
+/// that answer with the same *value* in different but equivalent physical
+/// encodings still compare equal.
+///
+/// Builds a formatter per cell rather than per column: this whole mode
+/// already runs every query twice end to end (decision 4), so the constant
+/// factor here is not the thing worth optimising, and per-cell keeps the
+/// call sites trivial.
+fn display_cell(array: &dyn Array, row: usize) -> String {
+    match ArrayFormatter::try_new(array, &FormatOptions::default()) {
+        Ok(formatter) => formatter.value(row).to_string(),
+        // A type Arrow itself declines to format. Fall back to something
+        // stable and comparable rather than skipping the cell: two identical
+        // unformattable values still produce the same string, so this can
+        // only ever under-report, never invent a divergence.
+        Err(_) => format!("<unformattable {}>", array.data_type()),
+    }
+}
+
+/// Flatten batches into plain rows, so a comparison never depends on how
+/// either engine happened to chunk its output.
+fn rows_of(batches: &[RecordBatch]) -> Vec<Vec<Cell>> {
+    let mut out: Vec<Vec<Cell>> = Vec::new();
+    for batch in batches {
+        let base = out.len();
+        out.resize_with(base + batch.num_rows(), Vec::new);
+        for column in batch.columns() {
+            for row in 0..batch.num_rows() {
+                let cell = if column.is_null(row) {
+                    Cell::Null
+                } else {
+                    match column.data_type() {
+                        DataType::Float64 => {
+                            Cell::Float(column.as_primitive::<Float64Type>().value(row))
+                        }
+                        DataType::Float32 => {
+                            Cell::Float(column.as_primitive::<Float32Type>().value(row) as f64)
+                        }
+                        _ => Cell::Text(display_cell(column.as_ref(), row)),
+                    }
+                };
+                out[base + row].push(cell);
+            }
+        }
+    }
+    out
+}
+
+/// Whether two floats agree within the module docs' decision-2 tolerance.
+///
+/// `NaN` is treated as equal to `NaN` deliberately: IEEE-754 says otherwise,
+/// but two engines both answering "not a number" AGREE, and reporting that
+/// as a divergence would fire on every `0/0`, every `avg()` of an empty
+/// float group, and every `'NaN'::float8` in the corpus. Infinities compare
+/// by exact equality (`+inf == +inf`, `+inf != -inf`) — no tolerance is
+/// meaningful there, and `inf - inf` is `NaN`, which would otherwise make
+/// the subtraction below silently declare them unequal.
+fn float_eq(a: f64, b: f64) -> bool {
+    if a.is_nan() || b.is_nan() {
+        return a.is_nan() && b.is_nan();
+    }
+    if a == b {
+        return true;
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return false;
+    }
+    let diff = (a - b).abs();
+    diff <= FLOAT_TOLERANCE || diff <= FLOAT_TOLERANCE * a.abs().max(b.abs())
+}
+
+/// Whether two cells agree — tolerant for floats, exact for everything else.
+/// See the module docs' decision 2.
+fn cell_eq(a: &Cell, b: &Cell) -> bool {
+    match (a, b) {
+        (Cell::Null, Cell::Null) => true,
+        (Cell::Float(x), Cell::Float(y)) => float_eq(*x, *y),
+        (Cell::Text(x), Cell::Text(y)) => x == y,
+        // One engine typed the column as FLOAT and the other did not (a
+        // literal `1.5` lowered to `Decimal128` on one side and `Float64` on
+        // the other, say). That is a *type* difference, not a value one, and
+        // this mode is looking for wrong answers: if the non-float side
+        // parses back to the same number within tolerance, the answers
+        // agree. If it does not parse at all, they genuinely differ.
+        (Cell::Float(x), Cell::Text(y)) | (Cell::Text(y), Cell::Float(x)) => {
+            y.parse::<f64>().map(|y| float_eq(*x, y)).unwrap_or(false)
+        }
+        // NULL against a value is always a divergence — the one case where
+        // being forgiving would hide a real bug.
+        _ => false,
+    }
+}
+
+/// The canonical key both sides are sorted by when the statement has no
+/// `ORDER BY` (module docs, decision 1). Identical on both sides by
+/// construction — it is derived only from the normalised [`Cell`]s, never
+/// from either engine's physical types or batch layout.
+///
+/// Floats are keyed by a fixed 9-significant-digit rendering rather than
+/// their full precision, so a pair of values the tolerance would call equal
+/// almost always lands in the same key and therefore the same sorted
+/// position. "Almost always" is the honest word: two tolerance-equal values
+/// straddling a rounding boundary would sort apart and be reported as a
+/// divergence. That is a false positive in a diagnostic mode, not a wrong
+/// answer to a client, and it needs a divergence-free duplicate float key to
+/// even arise.
+fn row_sort_key(row: &[Cell]) -> String {
+    let mut key = String::new();
+    for cell in row {
+        match cell {
+            // NUL sorts before every printable rendering, so NULLs cluster
+            // at one end on both sides — and is distinct from the empty
+            // string, which contributes no bytes before the separator.
+            Cell::Null => key.push('\u{0}'),
+            Cell::Float(v) => key.push_str(&format!("{v:+.9e}")),
+            Cell::Text(t) => key.push_str(t),
+        }
+        key.push('\u{1}');
+    }
+    key
+}
+
+/// How a cell is named in a divergence message.
+fn describe_cell(cell: &Cell) -> String {
+    match cell {
+        Cell::Null => "NULL".to_string(),
+        Cell::Float(v) => format!("{v}"),
+        Cell::Text(t) => format!("{t:?}"),
+    }
+}
+
+/// Diff the owned engine's answer against the incumbent's, returning `None`
+/// when they agree and `Some(detail)` describing the first disagreement
+/// otherwise.
+///
+/// `select` is consulted for exactly one thing: whether the statement has a
+/// top-level `ORDER BY`, which decides positional vs. canonically-sorted
+/// comparison (module docs, decision 1).
+///
+/// Column *names* are deliberately not compared. The owned engine derives
+/// output names from `basin-plan`'s lowering and DataFusion from its own
+/// planner; a differing label on an unaliased expression column is a
+/// cosmetic difference, and this mode is looking for wrong values.
+fn compare_results(
+    select: &SelectStmt,
+    owned: &ExecResult,
+    reference: &ExecResult,
+) -> Option<String> {
+    let (owned_schema, owned_batches, ref_schema, ref_batches) = match (owned, reference) {
+        (
+            ExecResult::Rows {
+                schema: owned_schema,
+                batches: owned_batches,
+            },
+            ExecResult::Rows {
+                schema: ref_schema,
+                batches: ref_batches,
+            },
+        ) => (owned_schema, owned_batches, ref_schema, ref_batches),
+        (ExecResult::Empty { tag: owned_tag }, ExecResult::Empty { tag: ref_tag }) => {
+            return (owned_tag != ref_tag).then(|| {
+                format!("command tag differs: owned {owned_tag:?}, DataFusion {ref_tag:?}")
+            });
+        }
+        (ExecResult::Rows { .. }, ExecResult::Empty { tag }) => {
+            return Some(format!(
+                "owned engine returned a result set, DataFusion returned the bare tag {tag:?}"
+            ));
+        }
+        (ExecResult::Empty { tag }, ExecResult::Rows { .. }) => {
+            return Some(format!(
+                "owned engine returned the bare tag {tag:?}, DataFusion returned a result set"
+            ));
+        }
+    };
+
+    if owned_schema.fields().len() != ref_schema.fields().len() {
+        return Some(format!(
+            "column count differs: owned {}, DataFusion {}",
+            owned_schema.fields().len(),
+            ref_schema.fields().len()
+        ));
+    }
+
+    let mut owned_rows = rows_of(owned_batches);
+    let mut ref_rows = rows_of(ref_batches);
+
+    if owned_rows.len() != ref_rows.len() {
+        return Some(format!(
+            "row count differs: owned {}, DataFusion {}",
+            owned_rows.len(),
+            ref_rows.len()
+        ));
+    }
+
+    // Decision 1: positional only when the statement actually asked for an
+    // order; otherwise both sides are put in the same canonical order first.
+    let ordered = !select.sort_clause.is_empty();
+    if !ordered {
+        owned_rows.sort_by_cached_key(|row| row_sort_key(row));
+        ref_rows.sort_by_cached_key(|row| row_sort_key(row));
+    }
+    let how = if ordered {
+        "positional compare — the statement has ORDER BY"
+    } else {
+        "compared after a canonical sort — the statement has no ORDER BY"
+    };
+
+    for (r, (owned_row, ref_row)) in owned_rows.iter().zip(ref_rows.iter()).enumerate() {
+        for (c, (owned_cell, ref_cell)) in owned_row.iter().zip(ref_row.iter()).enumerate() {
+            if !cell_eq(owned_cell, ref_cell) {
+                return Some(format!(
+                    "row {r} column {c} differs ({how}): owned {}, DataFusion {}",
+                    describe_cell(owned_cell),
+                    describe_cell(ref_cell)
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Apply shadow-compare's rules to two answers to `sql` that the caller
+/// already has — the same [`compare_results`] the flag-on path uses, minus
+/// the flag and minus the second execution.
+///
+/// This exists because the flag-on path can only ever compare two answers
+/// that *agree*: both engines read the same committed files, so a passing
+/// end-to-end run proves the oracle ran, not that it can tell a divergence
+/// apart from a benign difference. Given two results the caller obtained
+/// deliberately (the same rows in a different order, one value changed, a
+/// float perturbed by a ULP) this pins the rules themselves. See
+/// `tests/shadow_compare.rs`.
+///
+/// Returns `None` when the two answers agree, `Some(detail)` otherwise —
+/// including when `sql` is not a single, side-effect-free `SELECT`, since
+/// there is then no statement whose `ORDER BY` could decide positional
+/// versus canonical comparison.
+pub fn compare_shadow_results(
+    sql: &str,
+    owned: &ExecResult,
+    reference: &ExecResult,
+) -> Option<String> {
+    let parsed = match pg_query::parse(sql) {
+        Ok(parsed) => parsed,
+        Err(e) => return Some(format!("{sql:?} did not parse: {e}")),
+    };
+    let node = match parsed.protobuf.stmts.as_slice() {
+        [only] => only.stmt.clone(),
+        stmts => {
+            return Some(format!(
+                "expected exactly one statement in {sql:?}, got {}",
+                stmts.len()
+            ))
+        }
+    };
+    let Some(node) = node else {
+        return Some(format!("{sql:?} parsed to an empty statement"));
+    };
+    let Some(select) = shadow_target(&node) else {
+        return Some(format!(
+            "{sql:?} is not a side-effect-free SELECT, so it has no shadow comparison"
+        ));
+    };
+    compare_results(select, owned, reference)
 }
 
 async fn try_execute_inner(
@@ -1336,6 +1959,332 @@ mod tests {
             vec!["t".to_string()],
             "the recursive self-reference `FROM r` inside r's own body must be \
              excluded, not sent to the catalog as a nonexistent table, got {names:?}"
+        );
+    }
+
+    // ── Shadow-compare ──────────────────────────────────────────────────
+    //
+    // The end-to-end behaviour (both flags on, real tables, real DataFusion)
+    // lives in `tests/shadow_compare.rs`. What is here is what that test
+    // cannot reach: the structural DML guard, exercised against parse nodes
+    // the executor's SELECT-only call site never hands this module today,
+    // and the comparison primitives, exercised against hand-built results
+    // whose divergence is known by construction.
+
+    use arrow_array::{ArrayRef, Decimal128Array, Float64Array, Int64Array, StringArray};
+    use arrow_schema::Schema as ArrowSchema;
+    use std::sync::Arc;
+
+    fn stmt_node_of(sql: &str) -> Node {
+        let result = pg_query::parse(sql).expect("parse failed");
+        let raw = result.protobuf.stmts.first().expect("no stmt").clone();
+        *raw.stmt.expect("no stmt node")
+    }
+
+    fn select_of(sql: &str) -> SelectStmt {
+        match stmt_node_of(sql).node {
+            Some(NodeEnum::SelectStmt(select)) => *select,
+            other => panic!("{sql:?} did not parse to a SelectStmt: {other:?}"),
+        }
+    }
+
+    /// A one-batch `ExecResult::Rows` over the given columns.
+    fn result_of(columns: Vec<ArrayRef>) -> ExecResult {
+        let fields: Vec<Field> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Field::new(format!("c{i}"), c.data_type().clone(), true))
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batches = vec![RecordBatch::try_new(schema.clone(), columns).expect("batch")];
+        ExecResult::Rows { schema, batches }
+    }
+
+    fn ints(values: &[i64]) -> ArrayRef {
+        Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    fn floats(values: &[f64]) -> ArrayRef {
+        Arc::new(Float64Array::from(values.to_vec()))
+    }
+
+    fn strings(values: &[&str]) -> ArrayRef {
+        Arc::new(StringArray::from(values.to_vec()))
+    }
+
+    /// `NUMERIC(20, 12)` — twelve fractional digits, so a difference of
+    /// `1e-12` is representable and the "decimals are compared exactly"
+    /// claim can be tested against a difference the float tolerance would
+    /// otherwise swallow.
+    fn numerics(units: &[i128]) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(units.to_vec())
+                .with_precision_and_scale(20, 12)
+                .expect("precision/scale"),
+        )
+    }
+
+    /// Decision 3, structurally. This is the guard that stops a future
+    /// DML-carrying call site from double-writing; it must reject on the
+    /// node kind itself, not on a convention the call site is trusted to
+    /// keep.
+    #[test]
+    fn shadow_target_accepts_only_select_nodes() {
+        assert!(
+            shadow_target(&stmt_node_of("SELECT id FROM t")).is_some(),
+            "a plain SELECT is the one thing shadow-compare may re-run"
+        );
+        assert!(
+            shadow_target(&stmt_node_of(
+                "SELECT id FROM t UNION SELECT tid FROM u ORDER BY 1"
+            ))
+            .is_some(),
+            "a set operation is still a SelectStmt and still side-effect free"
+        );
+        for dml in [
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO t SELECT id FROM u",
+            "UPDATE t SET id = 2",
+            "DELETE FROM t WHERE id = 1",
+            "INSERT INTO t VALUES (1) RETURNING id",
+            "CREATE TABLE z (id BIGINT)",
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x",
+        ] {
+            assert!(
+                shadow_target(&stmt_node_of(dml)).is_none(),
+                "{dml:?} must never be re-executed by shadow-compare — that is a double-write"
+            );
+        }
+    }
+
+    /// The last case above is the one that makes the outer-node-kind check
+    /// insufficient, so pin the fact directly rather than leaving it implicit
+    /// in the loop: `pg_query` roots a data-modifying CTE at a `SelectStmt`.
+    /// A guard that stopped at the outermost node kind would re-run that
+    /// INSERT on every execution.
+    #[test]
+    fn a_data_modifying_cte_still_roots_at_a_select_node() {
+        let node = stmt_node_of("WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x");
+        assert!(
+            matches!(node.node.as_ref(), Some(NodeEnum::SelectStmt(_))),
+            "if this ever stops being a SelectStmt the is_side_effect_free walk \
+             is still correct, but the reason it exists has changed — got {:?}",
+            node.node
+        );
+        assert!(
+            shadow_target(&node).is_none(),
+            "and the guard must reject it anyway"
+        );
+    }
+
+    #[test]
+    fn side_effect_free_accepts_read_only_ctes_and_set_op_arms() {
+        for read_only in [
+            "WITH x AS (SELECT id FROM t) SELECT * FROM x",
+            "WITH a AS (SELECT id FROM t), b AS (SELECT id FROM a) SELECT * FROM b",
+            "WITH a AS (WITH b AS (SELECT id FROM t) SELECT * FROM b) SELECT * FROM a",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT n FROM r",
+            "(WITH a AS (SELECT id FROM t) SELECT * FROM a) UNION (SELECT tid FROM u)",
+        ] {
+            assert!(
+                shadow_target(&stmt_node_of(read_only)).is_some(),
+                "{read_only:?} writes nothing — refusing it would silently \
+                 shrink the oracle's coverage"
+            );
+        }
+        assert!(
+            shadow_target(&stmt_node_of(
+                "(WITH a AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM a) \
+                 UNION (SELECT tid FROM u)"
+            ))
+            .is_none(),
+            "a writable CTE hiding in a set-operation arm must be caught too"
+        );
+    }
+
+    #[test]
+    fn float_eq_admits_absolute_and_relative_slack_and_nothing_more() {
+        // Absolute limb: tiny values, difference under 1e-9.
+        assert!(float_eq(0.0, 5e-10));
+        assert!(!float_eq(0.0, 5e-9), "5e-9 is past both limbs at this scale");
+        // Relative limb: large values, difference far past 1e-9 absolute but
+        // well under 1e-9 relative.
+        assert!(float_eq(1.0e12, 1.0e12 + 1.0e-3));
+        assert!(
+            !float_eq(1.0e12, 1.0e12 + 1.0e4),
+            "1e4 out of 1e12 is 1e-8 relative — past the tolerance"
+        );
+        // The classic accumulation-order artefact this tolerance exists for.
+        assert!(float_eq(0.1 + 0.2, 0.3));
+        // And a difference that is simply wrong.
+        assert!(!float_eq(1.5, 2.5));
+    }
+
+    #[test]
+    fn float_eq_treats_nan_as_agreement_and_keeps_infinity_signed() {
+        assert!(
+            float_eq(f64::NAN, f64::NAN),
+            "both engines answering NaN is agreement, whatever IEEE-754 says"
+        );
+        assert!(!float_eq(f64::NAN, 1.0));
+        assert!(!float_eq(1.0, f64::NAN));
+        assert!(float_eq(f64::INFINITY, f64::INFINITY));
+        assert!(float_eq(f64::NEG_INFINITY, f64::NEG_INFINITY));
+        assert!(
+            !float_eq(f64::INFINITY, f64::NEG_INFINITY),
+            "opposite infinities differ; `inf - inf` is NaN so the subtraction \
+             below must never be the thing deciding this"
+        );
+        assert!(!float_eq(f64::INFINITY, 1.0e308));
+    }
+
+    #[test]
+    fn cell_eq_is_exact_off_the_float_path() {
+        assert!(cell_eq(&Cell::Null, &Cell::Null));
+        assert!(!cell_eq(&Cell::Null, &Cell::Text("".into())));
+        assert!(!cell_eq(&Cell::Null, &Cell::Float(0.0)));
+        assert!(cell_eq(&Cell::Text("a".into()), &Cell::Text("a".into())));
+        assert!(!cell_eq(&Cell::Text("a".into()), &Cell::Text("A".into())));
+        // A float on one side and its text rendering on the other is a type
+        // difference, not a value one.
+        assert!(cell_eq(&Cell::Float(1.5), &Cell::Text("1.5".into())));
+        assert!(!cell_eq(&Cell::Float(1.5), &Cell::Text("beta".into())));
+    }
+
+    /// Decision 1, the false-positive half: a no-`ORDER BY` statement whose
+    /// two engines emit the same rows in different order must NOT be
+    /// reported.
+    #[test]
+    fn without_order_by_row_order_is_not_a_divergence() {
+        let select = select_of("SELECT id, name FROM t");
+        let owned = result_of(vec![ints(&[1, 2, 3]), strings(&["a", "b", "c"])]);
+        let reference = result_of(vec![ints(&[3, 1, 2]), strings(&["c", "a", "b"])]);
+        assert_eq!(compare_results(&select, &owned, &reference), None);
+    }
+
+    /// Decision 1, the true-positive half: the same shuffle under an
+    /// `ORDER BY` IS a divergence, because the statement asked for an order
+    /// and the two engines produced different ones.
+    #[test]
+    fn with_order_by_row_order_is_compared_positionally() {
+        let select = select_of("SELECT id, name FROM t ORDER BY id");
+        let owned = result_of(vec![ints(&[1, 2, 3]), strings(&["a", "b", "c"])]);
+        let reference = result_of(vec![ints(&[3, 1, 2]), strings(&["c", "a", "b"])]);
+        let detail = compare_results(&select, &owned, &reference)
+            .expect("a differing order under ORDER BY must be reported");
+        assert!(
+            detail.contains("row 0 column 0") && detail.contains("positional"),
+            "got {detail:?}"
+        );
+    }
+
+    /// The canonical sort must not paper over a genuine value difference:
+    /// same multiset size, no ORDER BY, but one cell really is different.
+    #[test]
+    fn a_genuine_value_difference_survives_the_canonical_sort() {
+        let select = select_of("SELECT id FROM t");
+        let owned = result_of(vec![ints(&[1, 2, 3])]);
+        let reference = result_of(vec![ints(&[1, 2, 4])]);
+        let detail = compare_results(&select, &owned, &reference)
+            .expect("3 vs 4 is a real divergence, sorted or not");
+        assert!(detail.contains("row 2 column 0"), "got {detail:?}");
+    }
+
+    #[test]
+    fn shape_mismatches_are_reported_before_any_cell_is_read() {
+        let select = select_of("SELECT id FROM t");
+        let two = result_of(vec![ints(&[1, 2])]);
+        let three = result_of(vec![ints(&[1, 2, 3])]);
+        assert!(compare_results(&select, &two, &three)
+            .expect("row counts differ")
+            .contains("row count differs"));
+
+        let wide = result_of(vec![ints(&[1, 2]), strings(&["a", "b"])]);
+        assert!(compare_results(&select, &two, &wide)
+            .expect("column counts differ")
+            .contains("column count differs"));
+
+        let empty = ExecResult::Empty { tag: "SELECT".into() };
+        assert!(compare_results(&select, &two, &empty).is_some());
+        assert!(compare_results(&select, &empty, &two).is_some());
+        assert_eq!(compare_results(&select, &empty, &empty), None);
+    }
+
+    /// Decision 2: floats inside a real result get the tolerance...
+    #[test]
+    fn a_float_difference_within_tolerance_is_not_a_divergence() {
+        let select = select_of("SELECT amt FROM t ORDER BY amt");
+        let owned = result_of(vec![floats(&[0.1 + 0.2, 1.0e12])]);
+        let reference = result_of(vec![floats(&[0.3, 1.0e12 + 1.0e-3])]);
+        assert_eq!(
+            compare_results(&select, &owned, &reference),
+            None,
+            "both cells differ only at the ULP/relative-1e-9 level"
+        );
+    }
+
+    /// ...and a float difference past it is still reported.
+    #[test]
+    fn a_float_difference_outside_tolerance_is_a_divergence() {
+        let select = select_of("SELECT amt FROM t ORDER BY amt");
+        let owned = result_of(vec![floats(&[1.5])]);
+        let reference = result_of(vec![floats(&[1.5000001])]);
+        let detail = compare_results(&select, &owned, &reference)
+            .expect("1e-7 relative is well past the 1e-9 tolerance");
+        assert!(detail.contains("row 0 column 0"), "got {detail:?}");
+    }
+
+    /// Decision 2's other half: NUMERIC gets no tolerance at all. The
+    /// difference here (1e-12 out of 1.0) is far inside the float tolerance,
+    /// so this test fails the moment decimals start being compared as
+    /// floats.
+    #[test]
+    fn numeric_is_compared_exactly_not_within_the_float_tolerance() {
+        let select = select_of("SELECT n FROM e ORDER BY n");
+        let owned = result_of(vec![numerics(&[1_000_000_000_000])]);
+        let reference = result_of(vec![numerics(&[1_000_000_000_001])]);
+        let detail = compare_results(&select, &owned, &reference)
+            .expect("decimal arithmetic has no summation-order slack to forgive");
+        assert!(
+            detail.contains("1.000000000000") && detail.contains("1.000000000001"),
+            "the message must show the exact rendered decimals, got {detail:?}"
+        );
+    }
+
+    #[test]
+    fn nulls_and_empty_strings_do_not_collide_in_the_sort_key() {
+        assert_ne!(
+            row_sort_key(&[Cell::Null]),
+            row_sort_key(&[Cell::Text(String::new())])
+        );
+        assert_ne!(
+            row_sort_key(&[Cell::Text("a".into()), Cell::Text("b".into())]),
+            row_sort_key(&[Cell::Text("ab".into()), Cell::Text(String::new())]),
+            "a separator-free key would make these two rows indistinguishable"
+        );
+    }
+
+    /// The cap bounds the recorded sample, not the count.
+    #[test]
+    fn divergence_recording_is_capped_but_the_counter_is_not() {
+        let counters = ShadowCompareCounters::new();
+        let over = MAX_RECORDED_DIVERGENCES + 17;
+        for i in 0..over {
+            counters.note_compared();
+            counters.note_divergence("SELECT 1", format!("detail {i}"));
+        }
+        assert_eq!(counters.compared(), over as u64);
+        assert_eq!(
+            counters.diverged(),
+            over as u64,
+            "the count must keep rising past the cap — only the sample is bounded"
+        );
+        let recorded = counters.divergences();
+        assert_eq!(recorded.len(), MAX_RECORDED_DIVERGENCES);
+        assert_eq!(
+            recorded[0].detail, "detail 0",
+            "the sample keeps the FIRST divergences, which are the ones with \
+             context; later ones are usually the same bug repeating"
         );
     }
 }
