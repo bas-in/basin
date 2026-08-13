@@ -91,14 +91,30 @@
 //! ordinary `await`ed catalog call. [`CatalogTableResolver`] is then a pure
 //! in-memory lookup for both traits, no blocking-on-async trick required.
 //!
-//! This deliberately does not walk into subqueries embedded in `WHERE` /
-//! `HAVING` / the target list (`SubLink`): those are a much larger node-kind
-//! surface to traverse safely, and the cost of under-prefetching is exactly
-//! a safe fallback (`resolve_table` returns `None` for an unprefetched name,
-//! `lower_select` reports `LowerError::UnknownName`), never a wrong answer.
-//! A query whose only table references live in such a subquery serves
-//! narrower than it structurally could; that is the "fraction of SQL" the
-//! task described, not a bug.
+//! Subqueries embedded in expressions (`SubLink` — `EXISTS`, `NOT EXISTS`,
+//! `IN`, `NOT IN`, `ANY`/`ALL`, and a scalar `(SELECT ...)`) are walked too,
+//! by [`collect_expr`], wherever an expression can appear at a statement
+//! level: the target list, `WHERE`, `HAVING`, `GROUP BY`, `ORDER BY`, and a
+//! `JOIN ... ON` qual. That used to be skipped, on the grounds that the cost
+//! of under-prefetching is only a safe fallback (`resolve_table` returns
+//! `None` for an unprefetched name, `lower_select` reports
+//! `LowerError::UnknownName`) and never a wrong answer. True, but the cost
+//! was being paid constantly: `basin-plan` lowers correlated `SubLink`s
+//! (`SelectSubqueries`) and `opt::decorrelate` rewrites them, so every
+//! `WHERE ... IN (SELECT ... FROM other_table)` was dying in this bridge,
+//! several steps before the machinery built to serve it. Only a subquery
+//! naming a table the enclosing statement does not otherwise mention was
+//! ever affected — which is why the aliased `EXISTS (SELECT 1 FROM t u
+//! WHERE u.id = t.id)` shape served all along.
+//!
+//! Two things that walk is careful about. The enclosing statement's CTE
+//! scope is threaded into the subquery unchanged, so `WHERE id IN (SELECT
+//! ... FROM cte)` still excludes `cte` instead of asking the catalog for a
+//! table by that name — which would turn a servable query into an
+//! `Ineligible` fallback, strictly worse than not walking at all. And a
+//! subquery in `FROM` (`RangeSubselect`, LATERAL included) is still not
+//! walked: `lower/select.rs` rejects that shape as `Unsupported` regardless,
+//! so collecting its tables could only downgrade a clean verdict.
 //!
 //! `basin_plan::TableId` has no catalog-side counterpart (see
 //! `basin-catalog`'s `TableMetadata`, keyed only by `(ProjectId,
@@ -379,8 +395,9 @@ pub(crate) enum FallbackReasonKind {
     Unsupported,
     /// Lowering failed for a reason other than "not supported yet" —
     /// `LowerError::UnknownName` (a name [`build_resolver`] didn't
-    /// prefetch, e.g. one hidden behind a subquery — see the module docs)
-    /// or `LowerError::Malformed` (a parse-tree shape assumption broken).
+    /// prefetch, e.g. one reached only through a `FROM` shape
+    /// [`collect_from_item`] does not walk — see the module docs) or
+    /// `LowerError::Malformed` (a parse-tree shape assumption broken).
     LoweringError,
     /// Building the physical plan failed for a reason other than "not
     /// supported yet" — an unknown `TableId`/`CteId` or a sort/group key
@@ -1183,11 +1200,11 @@ async fn build_resolver(
     Ok(resolver)
 }
 
-/// Collect every table name a `SELECT` statement's `FROM` clause(s)
-/// reference, recursing into `UNION`/`INTERSECT`/`EXCEPT` arms exactly the
-/// way `lower_select_stmt` does, and into any `WITH` clause's CTE bodies. See
-/// the module docs for why subqueries embedded in `WHERE`/`HAVING`/the target
-/// list are deliberately not walked.
+/// Collect every table name a `SELECT` statement references — its `FROM`
+/// clause(s), `UNION`/`INTERSECT`/`EXCEPT` arms (exactly the way
+/// `lower_select_stmt` recurses), any `WITH` clause's CTE bodies, and any
+/// `SubLink` subquery reachable from an expression clause (see
+/// [`collect_expr`]).
 fn collect_tables(node: &Node, out: &mut Vec<Vec<String>>) {
     let empty = HashSet::new();
     match node.node.as_ref() {
@@ -1266,10 +1283,105 @@ fn collect_tables_stmt(stmt: &SelectStmt, cte_scope: &HashSet<String>, out: &mut
         if let Some(r) = stmt.rarg.as_deref() {
             collect_tables_stmt(r, &scope, out);
         }
+        // A set-op node carries no target list or `WHERE` of its own — the
+        // arms do — but `ORDER BY` on the whole result hangs here.
+        collect_exprs(&stmt.sort_clause, &scope, out);
         return;
     }
     for item in &stmt.from_clause {
         collect_from_item(item, &scope, out);
+    }
+    collect_exprs(&stmt.target_list, &scope, out);
+    collect_opt_expr(stmt.where_clause.as_deref(), &scope, out);
+    collect_opt_expr(stmt.having_clause.as_deref(), &scope, out);
+    collect_exprs(&stmt.group_clause, &scope, out);
+    collect_exprs(&stmt.sort_clause, &scope, out);
+}
+
+/// Every expression node kind that can *contain* a [`SubLink`], walked purely
+/// to reach the subquery bodies inside — nothing here inspects a `ColumnRef`,
+/// so no alias, correlated or otherwise, can reach `out`; only
+/// [`collect_range_var`] ever pushes a name.
+///
+/// `cte_scope` is passed down unchanged, including into a `SubLink`'s body: a
+/// subquery sees exactly the CTE names its enclosing statement level sees, so
+/// `WHERE id IN (SELECT ... FROM cte)` keeps excluding `cte` rather than
+/// sending it to the catalog as a table that does not exist.
+///
+/// Anything unlisted falls to `_ => {}` on the same terms as the rest of this
+/// module: under-collecting costs a fallback, never a wrong answer. Note the
+/// absence of `RangeSubselect` — a subquery in `FROM` is reached through
+/// [`collect_from_item`], which deliberately does not walk it (see there).
+fn collect_expr(node: &Node, cte_scope: &HashSet<String>, out: &mut Vec<Vec<String>>) {
+    match node.node.as_ref() {
+        // The whole reason this function exists.
+        Some(NodeEnum::SubLink(sl)) => {
+            collect_opt_expr(sl.testexpr.as_deref(), cte_scope, out);
+            if let Some(NodeEnum::SelectStmt(inner)) =
+                sl.subselect.as_deref().and_then(|n| n.node.as_ref())
+            {
+                collect_tables_stmt(inner, cte_scope, out);
+            }
+        }
+        Some(NodeEnum::BoolExpr(e)) => collect_exprs(&e.args, cte_scope, out),
+        Some(NodeEnum::AExpr(e)) => {
+            collect_opt_expr(e.lexpr.as_deref(), cte_scope, out);
+            collect_opt_expr(e.rexpr.as_deref(), cte_scope, out);
+        }
+        Some(NodeEnum::List(l)) => collect_exprs(&l.items, cte_scope, out),
+        Some(NodeEnum::ResTarget(rt)) => collect_opt_expr(rt.val.as_deref(), cte_scope, out),
+        Some(NodeEnum::SortBy(sb)) => collect_opt_expr(sb.node.as_deref(), cte_scope, out),
+        Some(NodeEnum::FuncCall(fc)) => {
+            collect_exprs(&fc.args, cte_scope, out);
+            collect_exprs(&fc.agg_order, cte_scope, out);
+            collect_opt_expr(fc.agg_filter.as_deref(), cte_scope, out);
+            if let Some(w) = fc.over.as_deref() {
+                collect_exprs(&w.partition_clause, cte_scope, out);
+                collect_exprs(&w.order_clause, cte_scope, out);
+                collect_opt_expr(w.start_offset.as_deref(), cte_scope, out);
+                collect_opt_expr(w.end_offset.as_deref(), cte_scope, out);
+            }
+        }
+        Some(NodeEnum::CaseExpr(c)) => {
+            collect_opt_expr(c.arg.as_deref(), cte_scope, out);
+            collect_exprs(&c.args, cte_scope, out);
+            collect_opt_expr(c.defresult.as_deref(), cte_scope, out);
+        }
+        Some(NodeEnum::CaseWhen(c)) => {
+            collect_opt_expr(c.expr.as_deref(), cte_scope, out);
+            collect_opt_expr(c.result.as_deref(), cte_scope, out);
+        }
+        Some(NodeEnum::CoalesceExpr(c)) => collect_exprs(&c.args, cte_scope, out),
+        Some(NodeEnum::MinMaxExpr(m)) => collect_exprs(&m.args, cte_scope, out),
+        Some(NodeEnum::RowExpr(r)) => collect_exprs(&r.args, cte_scope, out),
+        Some(NodeEnum::AArrayExpr(a)) => collect_exprs(&a.elements, cte_scope, out),
+        Some(NodeEnum::TypeCast(tc)) => collect_opt_expr(tc.arg.as_deref(), cte_scope, out),
+        Some(NodeEnum::CollateClause(cc)) => collect_opt_expr(cc.arg.as_deref(), cte_scope, out),
+        Some(NodeEnum::NullTest(nt)) => collect_opt_expr(nt.arg.as_deref(), cte_scope, out),
+        Some(NodeEnum::BooleanTest(bt)) => collect_opt_expr(bt.arg.as_deref(), cte_scope, out),
+        Some(NodeEnum::NamedArgExpr(na)) => collect_opt_expr(na.arg.as_deref(), cte_scope, out),
+        Some(NodeEnum::AIndirection(ai)) => {
+            collect_opt_expr(ai.arg.as_deref(), cte_scope, out);
+            collect_exprs(&ai.indirection, cte_scope, out);
+        }
+        Some(NodeEnum::AIndices(ai)) => {
+            collect_opt_expr(ai.lidx.as_deref(), cte_scope, out);
+            collect_opt_expr(ai.uidx.as_deref(), cte_scope, out);
+        }
+        Some(NodeEnum::GroupingSet(gs)) => collect_exprs(&gs.content, cte_scope, out),
+        _ => {}
+    }
+}
+
+fn collect_exprs(nodes: &[Node], cte_scope: &HashSet<String>, out: &mut Vec<Vec<String>>) {
+    for n in nodes {
+        collect_expr(n, cte_scope, out);
+    }
+}
+
+fn collect_opt_expr(node: Option<&Node>, cte_scope: &HashSet<String>, out: &mut Vec<Vec<String>>) {
+    if let Some(n) = node {
+        collect_expr(n, cte_scope, out);
     }
 }
 
@@ -1319,7 +1431,8 @@ fn collect_with_clause(with: &WithClause, scope: &mut HashSet<String>, out: &mut
 }
 
 /// Mirrors `lower/select.rs`'s `build_from_item`/`build_join_expr` shape
-/// (`RangeVar`, and `JoinExpr` recursing into both sides). Anything else
+/// (`RangeVar`, and `JoinExpr` recursing into both sides plus its `ON`
+/// qual, which is an expression like any other). Anything else
 /// (a subquery or set-returning function in `FROM`) is already
 /// `LowerError::Unsupported` at lowering time regardless of what this
 /// collects, so there is nothing to gain by recognising it here too.
@@ -1356,6 +1469,8 @@ fn collect_from_item(item: &Node, cte_scope: &HashSet<String>, out: &mut Vec<Vec
             if let Some(r) = je.rarg.as_deref() {
                 collect_from_item(r, cte_scope, out);
             }
+            // `ON` is an ordinary expression, and can hold a `SubLink`.
+            collect_opt_expr(je.quals.as_deref(), cte_scope, out);
         }
         _ => {}
     }
@@ -1959,6 +2074,70 @@ mod tests {
             vec!["t".to_string()],
             "the recursive self-reference `FROM r` inside r's own body must be \
              excluded, not sent to the catalog as a nonexistent table, got {names:?}"
+        );
+    }
+
+    // ── collect_tables / SubLink subqueries ──────────────────────────────
+
+    /// The shapes that used to die at `LowerError::UnknownName` in this
+    /// bridge: each names `u` only inside a subquery, so before `collect_expr`
+    /// existed the resolver was never told to load it. `EXISTS (SELECT 1 FROM
+    /// t u ...)` served all along because aliasing `t` as `u` names no new
+    /// table — which is exactly why that one shape hid the gap.
+    #[test]
+    fn a_table_named_only_inside_a_sublink_is_collected() {
+        for sql in [
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id AND u.n > 7)",
+            "SELECT id FROM t WHERE id IN (SELECT tid FROM u)",
+            "SELECT id FROM t WHERE id NOT IN (SELECT tid FROM u WHERE tid IS NOT NULL)",
+            "SELECT id, (SELECT count(*) FROM u WHERE u.tid = t.id) FROM t",
+            "SELECT id FROM t WHERE id = ANY (SELECT tid FROM u)",
+            "SELECT a.id FROM t a JOIN t b ON a.id = b.id AND a.id IN (SELECT tid FROM u)",
+            "SELECT count(*) FROM t GROUP BY name HAVING count(*) > (SELECT count(*) FROM u)",
+            "SELECT id FROM t ORDER BY (SELECT count(*) FROM u WHERE u.tid = t.id)",
+        ] {
+            let names = collected(sql);
+            assert!(
+                names.iter().any(|n| n == "u"),
+                "`u` is named only inside the subquery of `{sql}`, and must still be \
+                 prefetched, got {names:?}"
+            );
+        }
+    }
+
+    /// The trap this walk had to avoid: threading the enclosing statement's
+    /// CTE scope into the subquery. A `SubLink` body reading a CTE must not
+    /// send that name to the catalog — doing so would turn a query lowering
+    /// can serve into `Ineligible("table not found in the catalog")`, strictly
+    /// worse than never walking the subquery at all.
+    #[test]
+    fn a_sublink_reading_a_cte_does_not_collect_the_cte_name() {
+        let names = collected(
+            "WITH c AS (SELECT tid FROM u) SELECT id FROM t WHERE id IN (SELECT tid FROM c)",
+        );
+        assert_eq!(
+            names,
+            vec!["u".to_string(), "t".to_string()],
+            "`c` inside the IN-subquery is the CTE, not a catalog table, got {names:?}"
+        );
+    }
+
+    /// A subquery in `FROM` stays unwalked on purpose — `lower/select.rs`
+    /// rejects that shape as `Unsupported` whatever this collects, and
+    /// collecting its tables could only turn that clean verdict into an
+    /// `Ineligible` one. Pinned so the omission reads as a decision.
+    #[test]
+    fn a_subquery_in_from_is_still_not_walked() {
+        assert!(
+            collected("SELECT s.tid FROM (SELECT tid FROM u) s").is_empty(),
+            "RangeSubselect must stay outside this walk"
+        );
+        assert!(
+            collected("SELECT t.id FROM t, LATERAL (SELECT tid FROM u WHERE u.tid = t.id) s")
+                .iter()
+                .all(|n| n != "u"),
+            "LATERAL is the same RangeSubselect shape and stays outside it too"
         );
     }
 

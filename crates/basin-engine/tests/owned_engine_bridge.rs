@@ -613,3 +613,221 @@ async fn optimize_default_leaves_the_answer_correct_with_an_unreferenced_column(
 
     std::env::remove_var("BASIN_OWNED_ENGINE");
 }
+
+/// Property 10: a `SELECT` whose only reference to a table is inside a
+/// `SubLink` subquery is served, and returns PostgreSQL's rows.
+///
+/// The bridge's table walk used to visit `FROM` clauses (and set-op arms, and
+/// CTE bodies) only, so a `SubLink` naming a relation nothing else in the
+/// statement mentions left that relation unprefetched and the whole statement
+/// died at `LowerError::UnknownName` — several steps before `basin-plan`'s
+/// `SelectSubqueries`/`opt::decorrelate`, which handle exactly these shapes.
+/// The one subquery shape that did serve, `EXISTS (SELECT 1 FROM t u WHERE
+/// u.id = t.id)`, only did so because aliasing `t` as `u` names no new table;
+/// that coincidence is why the gap went unnoticed.
+///
+/// Every `expected` below is the row set PostgreSQL 18.2 returns for exactly
+/// this data, checked against a live server — not derived from what Basin
+/// happens to produce. A query that starts serving a *wrong* answer is worse
+/// than one that falls back, so agreeing with DataFusion is not the bar.
+///
+/// The `u.n > 7` conjunct is deliberate. `u.n` is `INTEGER`, and this walk was
+/// once held back because a pushed-down predicate on an `int4` column named
+/// the wrong column and answered `[]` here where Postgres answers `1, 2`.
+/// That defect is fixed, and this case is the shape that would catch it
+/// coming back — so it stays as `u.n > 7` rather than the `text` comparison
+/// that was used to route around it.
+///
+/// The last case has no `FROM` clause at all: its only table reference is the
+/// subquery in the target list, so before this walk it could not be served
+/// either.
+#[tokio::test]
+async fn a_table_named_only_inside_a_subquery_is_served_and_matches_postgres() {
+    let _guard = env_lock();
+    std::env::remove_var("BASIN_OWNED_ENGINE");
+
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+    exec(
+        &sess,
+        "CREATE TABLE t (id BIGINT NOT NULL, name TEXT, amt DOUBLE PRECISION)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.5),(3,'c',3.5)",
+    )
+    .await;
+    exec(
+        &sess,
+        "CREATE TABLE u (uid BIGINT NOT NULL, tid BIGINT, tag TEXT, n INTEGER)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO u VALUES (10,1,'x',7),(11,1,'y',8),(12,2,'z',9)",
+    )
+    .await;
+
+    // Every column selected below is `BIGINT` or a `count(*)`, so one
+    // `Int64Array` downcast covers the whole grid.
+    fn flatten_i64(batches: &[RecordBatch]) -> Vec<Vec<Option<i64>>> {
+        let mut out = Vec::new();
+        for b in batches {
+            for r in 0..b.num_rows() {
+                out.push(
+                    (0..b.num_columns())
+                        .map(|c| {
+                            let a = b
+                                .column(c)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .expect("every column in these probes is int8");
+                            (!a.is_null(r)).then(|| a.value(r))
+                        })
+                        .collect(),
+                );
+            }
+        }
+        out
+    }
+
+    let cases: &[(&str, &[&[i64]])] = &[
+        (
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id) ORDER BY id",
+            &[&[3]],
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id AND u.n > 7) \
+             ORDER BY id",
+            &[&[1], &[2]],
+        ),
+        ("SELECT (SELECT count(*) FROM t) AS total", &[&[3]]),
+    ];
+
+    for (sql, expected) in cases {
+        let expected: Vec<Vec<Option<i64>>> = expected
+            .iter()
+            .map(|row| row.iter().map(|v| Some(*v)).collect())
+            .collect();
+
+        let before = eng.owned_engine_served_count();
+        std::env::set_var("BASIN_OWNED_ENGINE", "1");
+        let owned = flatten_i64(&rows(&sess, sql).await);
+        std::env::remove_var("BASIN_OWNED_ENGINE");
+        assert_eq!(
+            eng.owned_engine_served_count(),
+            before + 1,
+            "the owned engine must SERVE {sql:?}, not swap one fallback reason for another"
+        );
+
+        let df = flatten_i64(&rows(&sess, sql).await);
+
+        assert_eq!(
+            owned, expected,
+            "the owned engine disagrees with PostgreSQL on {sql:?}"
+        );
+        assert_eq!(
+            df, expected,
+            "DataFusion disagrees with PostgreSQL on {sql:?}"
+        );
+    }
+
+    std::env::remove_var("BASIN_OWNED_ENGINE");
+}
+
+/// Property 11: the three subquery shapes this walk now prefetches correctly
+/// but that still are not *executable* by the owned pipeline fall back
+/// **safely** — the client gets PostgreSQL's answer via DataFusion — rather
+/// than erroring or, worse, serving a wrong one. That is the property the
+/// flag's whole safety argument rests on, and it is the reason widening the
+/// walk is not the same as widening the blast radius.
+///
+/// Why each is not servable, all downstream of this bridge:
+///
+/// * `opt::decorrelate` refuses an *uncorrelated* `IN` on purpose (its trap 2:
+///   there is no correlation predicate to join on, and evaluating it once
+///   beats joining), and refuses every `NotIn` unconditionally (its trap 1:
+///   without nullability tracking an anti-join is a wrong-answer bug under
+///   three-valued logic). Neither survives to a form `basin-exec` can run, so
+///   an `Expr::Subquery { kind: In | NotIn }` reaches `eval.rs`, which reports
+///   `ExecError::Internal("subqueries must be decorrelated into a join ...")`.
+/// * A *correlated* scalar subquery in a target list is refused rather than
+///   folded. It used to be folded once with an unbound outer row and answer
+///   `0, 0, 0` where Postgres answers `2, 1, 0`; that silent wrong answer is
+///   fixed, and the shape now declines. Declining is the correct outcome
+///   here, so this test pins the decline together with the answer, not the
+///   serve.
+#[tokio::test]
+async fn subquery_shapes_that_are_not_servable_yet_fall_back_with_postgres_answers() {
+    let _guard = env_lock();
+    std::env::remove_var("BASIN_OWNED_ENGINE");
+
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+    exec(&sess, "CREATE TABLE t (id BIGINT NOT NULL, name TEXT)").await;
+    exec(&sess, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").await;
+    exec(&sess, "CREATE TABLE u (uid BIGINT NOT NULL, tid BIGINT)").await;
+    exec(&sess, "INSERT INTO u VALUES (10,1),(11,1),(12,2)").await;
+
+    // (sql, the rows PostgreSQL 18.2 returns for this data)
+    let cases: &[(&str, &[&[i64]])] = &[
+        (
+            "SELECT id FROM t WHERE id IN (SELECT tid FROM u) ORDER BY id",
+            &[&[1], &[2]],
+        ),
+        (
+            "SELECT id FROM t WHERE id NOT IN (SELECT tid FROM u WHERE tid IS NOT NULL) \
+             ORDER BY id",
+            &[&[3]],
+        ),
+        (
+            "SELECT id, (SELECT count(*) FROM u WHERE u.tid = t.id) FROM t ORDER BY id",
+            &[&[1, 2], &[2, 1], &[3, 0]],
+        ),
+    ];
+
+    std::env::set_var("BASIN_OWNED_ENGINE", "1");
+    for (sql, expected) in cases {
+        let before_served = eng.owned_engine_served_count();
+        let before_fell = eng.owned_engine_fallback_count();
+
+        let batches = rows(&sess, sql).await;
+        let mut got: Vec<Vec<i64>> = Vec::new();
+        for b in &batches {
+            for r in 0..b.num_rows() {
+                got.push(
+                    (0..b.num_columns())
+                        .map(|c| {
+                            b.column(c)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .expect("every column in these probes is int8")
+                                .value(r)
+                        })
+                        .collect(),
+                );
+            }
+        }
+
+        assert_eq!(
+            eng.owned_engine_served_count(),
+            before_served,
+            "{sql:?} is not servable yet — see this test's doc comment"
+        );
+        assert_eq!(
+            eng.owned_engine_fallback_count(),
+            before_fell + 1,
+            "{sql:?} must fall back, not error"
+        );
+        assert_eq!(
+            got,
+            expected.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+            "a fallback must still return PostgreSQL's answer for {sql:?}"
+        );
+    }
+
+    std::env::remove_var("BASIN_OWNED_ENGINE");
+}
