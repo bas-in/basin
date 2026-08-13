@@ -17,16 +17,92 @@
 //!   (`@>`, `<@`, `&&`, `<<`, `>>`, `-|-`) to the matching UDF calls.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
+
+// ---------------------------------------------------------------------------
+// Range-ness of a value, carried as `Field` metadata
+// ---------------------------------------------------------------------------
+//
+// Range values are physically `Utf8` (see the module docs), so `DataType`
+// alone cannot tell a range apart from ordinary text. PostgreSQL dispatches
+// `lower(anyrange)` vs `lower(text)` on the ARGUMENT TYPE, and Basin already
+// records the PG type of a `Utf8` column in the Arrow `Field` metadata under
+// `BASIN_TYPE` (stamped by DDL, see `types::field_is_range`). DataFusion 53
+// hands every scalar UDF the `Field` of each argument (`ScalarFunctionArgs::
+// arg_fields`), so the same marker is what `lower`/`upper` dispatch on.
+//
+// Declared range COLUMNS carry the marker from DDL. Range values produced by
+// an EXPRESSION (a constructor call, a set operation) carry it because the
+// producing UDF stamps its own output field below, via
+// `ScalarUDFImpl::return_field_from_args`.
+
+/// `BASIN_TYPE` marker for "a range whose subtype is not known at this point".
+/// Used for the outputs of the range set operations, whose result subtype is
+/// whatever the inputs were; when an input carries a concrete range marker it
+/// is propagated instead. Only ever appears on expression output fields, never
+/// on a stored column (DDL always knows the concrete subtype).
+const BASIN_TYPE_RANGE_ANY: &str = "RANGE";
+
+/// True when `field` describes a range value: either a declared range column
+/// (`BASIN_TYPE=INT4RANGE`, …) or the output of a range-producing UDF.
+fn field_carries_range(field: &Field) -> bool {
+    crate::types::field_is_range(field)
+        || field
+            .metadata()
+            .get(crate::types::BASIN_TYPE_KEY)
+            .map(|s| s.as_str())
+            == Some(BASIN_TYPE_RANGE_ANY)
+}
+
+/// Build a `Utf8` output `Field` stamped with the given `BASIN_TYPE` range
+/// marker, so downstream `lower`/`upper` calls can dispatch on type.
+fn range_marked_field(name: &str, marker: &str) -> FieldRef {
+    let mut meta = HashMap::new();
+    meta.insert(crate::types::BASIN_TYPE_KEY.to_string(), marker.to_string());
+    Arc::new(Field::new(name, DataType::Utf8, true).with_metadata(meta))
+}
+
+/// The concrete `BASIN_TYPE` marker for a range constructor's name.
+fn ctor_range_marker(ctor_name: &str) -> &'static str {
+    match ctor_name {
+        "int4range" => crate::types::BASIN_TYPE_INT4RANGE,
+        "int8range" => crate::types::BASIN_TYPE_INT8RANGE,
+        "numrange" => crate::types::BASIN_TYPE_NUMRANGE,
+        "daterange" => crate::types::BASIN_TYPE_DATERANGE,
+        "tsrange" => crate::types::BASIN_TYPE_TSRANGE,
+        "tstzrange" => crate::types::BASIN_TYPE_TSTZRANGE,
+        // Unreachable for the six registered constructors; degrade to the
+        // subtype-less marker rather than losing range-ness entirely.
+        _ => BASIN_TYPE_RANGE_ANY,
+    }
+}
+
+/// Output field for a range set operation: propagate the first concrete range
+/// marker found on the inputs, else fall back to the subtype-less marker. The
+/// result is a range either way, which is what `lower`/`upper` need to know.
+fn propagated_range_field(name: &str, args: &ReturnFieldArgs) -> FieldRef {
+    let marker = args
+        .arg_fields
+        .iter()
+        .find_map(|f| {
+            f.metadata()
+                .get(crate::types::BASIN_TYPE_KEY)
+                .filter(|_| crate::types::field_is_range(f))
+                .cloned()
+        })
+        .unwrap_or_else(|| BASIN_TYPE_RANGE_ANY.to_string());
+    range_marked_field(name, &marker)
+}
 
 fn make_range_ctor_sig(arg_type: DataType) -> Signature {
     Signature::one_of(
@@ -374,6 +450,11 @@ impl ScalarUDFImpl for RangeConstructorUdf {
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
+    /// Stamp the output with this constructor's range marker so that
+    /// `lower(int4range(1, 5))` dispatches as a RANGE and not as text.
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(range_marked_field(self.name, ctor_range_marker(self.name)))
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let batch_size = args.number_rows;
         let _ = batch_size;
@@ -529,30 +610,37 @@ impl ScalarUDFImpl for RangeAccessorUdf {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let batch_size = args.number_rows;
-        let _ = batch_size;
-        let args = &args.args;
+        // Dispatch on the ARGUMENT TYPE, exactly as PostgreSQL picks
+        // `lower(anyrange)` over `lower(text)`. The argument is a range only
+        // when its `Field` carries a Basin range marker — a declared range
+        // column, or the output of a range-producing UDF. Anything else is
+        // text, INCLUDING text that happens to start with `{` (a JSON
+        // document, a brace-quoted string, an array literal).
+        let arg_is_range = args
+            .arg_fields
+            .first()
+            .map(|f| field_carries_range(f))
+            .unwrap_or(false);
         let field_key = match self.field {
             RangeField::Lower => "l",
             RangeField::Upper => "u",
         };
-        let range_strs = columnar_to_strings(&args[0], batch_size)?;
+        let range_strs = columnar_to_strings(&args.args[0], batch_size)?;
         let mut out: Vec<Option<String>> = Vec::with_capacity(batch_size);
         for rs in &range_strs {
             let val = rs.as_deref().and_then(|s| {
-                // If the value starts with `{` and parses as our range JSON,
-                // extract the bound. Otherwise fall back to string case
-                // conversion (matching DataFusion's built-in lower/upper
-                // semantics so we don't break `lower('Hello')` call sites).
-                if s.trim_start().starts_with('{') {
-                    if let Some(v) = parse_range(s) {
-                        let fv = v.get(field_key)?;
-                        if fv.is_null() {
-                            return None;
-                        }
-                        return Some(fv.to_string().trim_matches('"').to_string());
+                if arg_is_range {
+                    // Range bound accessor. An unparseable or unbounded
+                    // bound is SQL NULL, as it is in PG for an empty or
+                    // infinite range.
+                    let v = parse_range(s)?;
+                    let fv = v.get(field_key)?;
+                    if fv.is_null() {
+                        return None;
                     }
+                    return Some(fv.to_string().trim_matches('"').to_string());
                 }
-                // Fallback: string case conversion.
+                // Text: PG's `lower(text)` / `upper(text)` case conversion.
                 Some(match self.field {
                     RangeField::Lower => s.to_lowercase(),
                     RangeField::Upper => s.to_uppercase(),
@@ -1249,6 +1337,9 @@ impl ScalarUDFImpl for RangeMergeUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(propagated_range_field("range_merge", &args))
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let batch_size = args.number_rows;
         let _ = batch_size;
@@ -1666,6 +1757,9 @@ impl ScalarUDFImpl for RangeUnionUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(propagated_range_field("range_union", &args))
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let n = args.number_rows;
         let a_strs = columnar_to_strings(&args.args[0], n)?;
@@ -1730,6 +1824,9 @@ impl ScalarUDFImpl for RangeIntersectionUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
     }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(propagated_range_field("range_intersection", &args))
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let n = args.number_rows;
         let a_strs = columnar_to_strings(&args.args[0], n)?;
@@ -1777,6 +1874,9 @@ impl ScalarUDFImpl for RangeDiffUdf {
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(DataType::Utf8)
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(propagated_range_field("range_diff", &args))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let n = args.number_rows;
@@ -2647,6 +2747,41 @@ mod tests {
         }
     }
 
+    /// Like [`InvokeBatchCompat::invoke_batch`], but stamps every argument
+    /// field with the `INT4RANGE` marker — i.e. calls the UDF the way the
+    /// planner does when the argument really is a range. `lower`/`upper`
+    /// dispatch on this marker (see [`field_carries_range`]), so a range
+    /// accessor test must go through here; the plain `invoke_batch` shim
+    /// above describes an argument of type TEXT.
+    fn invoke_batch_as_range<T: ScalarUDFImpl>(
+        udf: &T,
+        args: &[ColumnarValue],
+        n: usize,
+    ) -> DFResult<ColumnarValue> {
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type()).collect();
+        let return_type = udf.return_type(&arg_types)?;
+        let meta = HashMap::from([(
+            crate::types::BASIN_TYPE_KEY.to_string(),
+            crate::types::BASIN_TYPE_INT4RANGE.to_string(),
+        )]);
+        let arg_fields = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                Arc::new(
+                    Field::new(format!("a{i}"), a.data_type(), true).with_metadata(meta.clone()),
+                )
+            })
+            .collect();
+        udf.invoke_with_args(ScalarFunctionArgs {
+            args: args.to_vec(),
+            arg_fields,
+            number_rows: n,
+            return_field: Arc::new(Field::new("out", return_type, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        })
+    }
+
     fn make_range(lo: i64, hi: i64) -> ColumnarValue {
         let json = format!(r#"{{"l":{},"u":{},"li":true,"ui":false}}"#, lo, hi);
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(json)))
@@ -2688,13 +2823,35 @@ mod tests {
             field: RangeField::Upper,
             sig: utf8_sig(),
         };
-        let lo = lower_udf.invoke_batch(&[range.clone()], 1).unwrap();
-        let hi = upper_udf.invoke_batch(&[range], 1).unwrap();
+        let lo = invoke_batch_as_range(&lower_udf, &[range.clone()], 1).unwrap();
+        let hi = invoke_batch_as_range(&upper_udf, &[range.clone()], 1).unwrap();
         if let (ColumnarValue::Array(la), ColumnarValue::Array(ua)) = (lo, hi) {
             let ls = la.as_any().downcast_ref::<StringArray>().unwrap();
             let us = ua.as_any().downcast_ref::<StringArray>().unwrap();
             assert_eq!(ls.value(0), "5");
             assert_eq!(us.value(0), "15");
+        } else {
+            panic!("expected arrays");
+        }
+
+        // The same bytes, presented as TEXT rather than as a range, are
+        // case-converted — PG dispatches `lower(anyrange)` vs `lower(text)`
+        // on the argument's type, never on what the value looks like.
+        let lo_text = lower_udf.invoke_batch(&[range.clone()], 1).unwrap();
+        let hi_text = upper_udf.invoke_batch(&[range], 1).unwrap();
+        if let (ColumnarValue::Array(la), ColumnarValue::Array(ua)) = (lo_text, hi_text) {
+            let ls = la.as_any().downcast_ref::<StringArray>().unwrap();
+            let us = ua.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(
+                ls.value(0),
+                r#"{"l":5,"u":15,"li":true,"ui":false}"#,
+                "lower(text) lowercases; this input is already lowercase"
+            );
+            assert_eq!(
+                us.value(0),
+                r#"{"L":5,"U":15,"LI":TRUE,"UI":FALSE}"#,
+                "upper(text) uppercases the whole string, keys and all"
+            );
         } else {
             panic!("expected arrays");
         }
