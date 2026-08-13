@@ -26,7 +26,6 @@
 # and diff_error_not_null_violation closed independently. diff_txn_rollback
 # (also C1a per the cluster doc) is still failing -- not the same shape;
 # undiagnosed, left in the baseline.
-diff_array_containment_operators
 diff_cast_int8_to_int4_overflow
 diff_cast_matrix_basic
 diff_cross_schema_qualified_insert
