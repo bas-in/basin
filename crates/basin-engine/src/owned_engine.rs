@@ -1300,6 +1300,7 @@ fn collect_tables(node: &Node, out: &mut Vec<Vec<String>>) {
             {
                 collect_tables_stmt(sel, &scope, out);
             }
+            collect_exprs(&stmt.returning_list, &scope, out);
         }
         Some(NodeEnum::UpdateStmt(stmt)) => {
             let mut scope = HashSet::new();
@@ -1312,6 +1313,16 @@ fn collect_tables(node: &Node, out: &mut Vec<Vec<String>>) {
             for item in &stmt.from_clause {
                 collect_from_item(item, &scope, out);
             }
+            // A DML statement's own clauses hold subqueries exactly the way a
+            // `SELECT`'s do — `WHERE id IN (SELECT ... FROM u)`, `SET c =
+            // (SELECT ... FROM u)`, `RETURNING (SELECT ... FROM u)`. Walking
+            // only `WITH`/target/`FROM` left `u` unprefetched, so lowering
+            // died on `UnknownName("u")` for a shape it can otherwise handle.
+            // `target_list` here is the `SET` list (`ResTarget`s), which
+            // `collect_expr` already unwraps to its value expression.
+            collect_exprs(&stmt.target_list, &scope, out);
+            collect_opt_expr(stmt.where_clause.as_deref(), &scope, out);
+            collect_exprs(&stmt.returning_list, &scope, out);
         }
         Some(NodeEnum::DeleteStmt(stmt)) => {
             let mut scope = HashSet::new();
@@ -1324,6 +1335,8 @@ fn collect_tables(node: &Node, out: &mut Vec<Vec<String>>) {
             for item in &stmt.using_clause {
                 collect_from_item(item, &scope, out);
             }
+            collect_opt_expr(stmt.where_clause.as_deref(), &scope, out);
+            collect_exprs(&stmt.returning_list, &scope, out);
         }
         _ => {}
     }
@@ -2194,6 +2207,57 @@ mod tests {
                  prefetched, got {names:?}"
             );
         }
+    }
+
+    /// The same `SubLink` walk, in a DML statement's own clauses. `UPDATE t
+    /// SET name = upper(name) WHERE id IN (SELECT tid FROM u)` is the shape
+    /// the fallback histogram's DML section found: the `UpdateStmt` arm
+    /// walked `WITH`, the target relation and `FROM`, but never the `WHERE`,
+    /// so `u` was never prefetched and lowering died on `UnknownName("u")` —
+    /// a genuine gap, not the executor's write gate, and the only one of the
+    /// 15 DML shapes that failed before reaching `build`.
+    #[test]
+    fn a_table_named_only_inside_a_dml_clause_subquery_is_collected() {
+        for sql in [
+            "UPDATE t SET name = upper(name) WHERE id IN (SELECT tid FROM u)",
+            "UPDATE t SET name = (SELECT tag FROM u WHERE u.tid = t.id) WHERE id = 1",
+            "UPDATE t SET name = 'x' WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
+            "UPDATE t SET name = 'x' RETURNING (SELECT count(*) FROM u)",
+            "DELETE FROM t WHERE id IN (SELECT tid FROM u)",
+            "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)",
+            "DELETE FROM t WHERE id = 1 RETURNING (SELECT count(*) FROM u)",
+            "INSERT INTO t VALUES (1) RETURNING (SELECT count(*) FROM u)",
+        ] {
+            let names = collected(sql);
+            assert!(
+                names.iter().any(|n| n == "u"),
+                "`u` is named only inside a subquery of `{sql}`, and must still be \
+                 prefetched, got {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "t"),
+                "the DML target `t` must still be collected for `{sql}`, got {names:?}"
+            );
+        }
+    }
+
+    /// The CTE-scope trap, in the DML clauses this walk just learned to
+    /// enter. A `WITH` name referenced from an `UPDATE`'s `WHERE` subquery
+    /// must not be sent to the catalog — same rule the `SELECT` arm already
+    /// obeys, and the reason `scope` is threaded rather than a fresh set.
+    #[test]
+    fn a_dml_clause_subquery_reading_a_cte_does_not_collect_the_cte_name() {
+        let names = collected(
+            "WITH c AS (SELECT tid FROM u) UPDATE t SET a = 1 WHERE id IN (SELECT tid FROM c)",
+        );
+        assert!(
+            names.iter().all(|n| n != "c"),
+            "`c` is the CTE, not a catalog table, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "u") && names.iter().any(|n| n == "t"),
+            "the CTE body's `u` and the target `t` are both real tables, got {names:?}"
+        );
     }
 
     /// The trap this walk had to avoid: threading the enclosing statement's
