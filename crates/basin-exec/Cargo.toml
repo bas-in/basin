@@ -50,3 +50,18 @@ tokio-postgres = { workspace = true }
 name = "function_equivalence"
 path = "tests/function_equivalence.rs"
 harness = false
+
+# `tests/orphan_functions.rs` is `function_equivalence`'s complement: it diffs
+# the pg_catalog functions Basin answers today ONLY because DataFusion's
+# builtin registry answers them — no Basin code on either side, so nothing a
+# grep of "what Basin registers" can find, and they vanish the moment
+# `datafusion = "53"` is deleted (Cargo.toml:149). See that file's module docs
+# for the census and its limits. It is EXPECTED TO FAIL until the re-hosting
+# tranche lands; the failure output is the work queue.
+#
+# `harness = false` for the same reason as above: the no-DSN skip must print a
+# banner every run rather than look like a pass.
+[[test]]
+name = "orphan_functions"
+path = "tests/orphan_functions.rs"
+harness = false
