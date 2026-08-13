@@ -47,6 +47,27 @@
 //! operator this mirrors. As with [`crate::sort::Sort`], there is no disk
 //! spill; exceeding budget fails clean with [`ExecError::OutOfMemory`].
 //!
+//! # No equijoin key at all
+//!
+//! `on` can be *empty* while `filter` is not: `t JOIN u ON t.id < u.n`,
+//! `ON a.id <> b.id`, `ON t.id IS NOT DISTINCT FROM u.tid`, and a
+//! decorrelated `EXISTS` whose only correlation is an inequality all reach
+//! this operator with zero key pairs. There is nothing to hash, but the join
+//! is still ordinary SQL and Postgres executes all of them, so the equality
+//! test is treated as vacuously true: every build-side row is a candidate
+//! for every probe row (`all_right_rows`), and the residual alone decides.
+//! That makes the keyless case a nested-loop join — O(left x right)
+//! candidate pairs — sharing this operator's build/probe skeleton rather
+//! than a separate one. `Cross` keeps its own dedicated path because it has
+//! no residual to evaluate per pair.
+//!
+//! The unified `filter` handling below still applies unchanged: `Inner`
+//! post-filters the cartesian batch, `LeftSemi`/`LeftAnti` run the residual
+//! as the match test per candidate. `Left`/`Right`/`Full` with a residual
+//! are refused by the constructor either way, so a keyless outer join is
+//! only ever reached without one (where it is a plain cross product with the
+//! preserved side's empty-build-table case still NULL-extending correctly).
+//!
 //! # Residual filter
 //!
 //! `on` is only ever equality — a hash table cannot test anything else — so
@@ -443,13 +464,20 @@ pub struct HashJoin {
     /// probing. Only consulted for `Right`/`Full`, but harmless (and cheap)
     /// to maintain for every kind.
     right_matched: Vec<bool>,
+    /// `0..right_table.num_rows()`, materialized once, and used as *the*
+    /// candidate list for every probe row when the join has no equijoin key
+    /// at all — see [`Self::probe_matches`]. Empty (and never read) for a
+    /// keyed join or for `Cross`.
+    all_right_rows: Vec<u32>,
 }
 
 impl HashJoin {
     /// `left_keys`/`right_keys` are column positions into each side's own
     /// schema, one per equijoin conjunct, in matching order — `left_keys[i]`
     /// is compared against `right_keys[i]`. Empty for `Cross`, which ignores
-    /// them entirely.
+    /// them entirely, and empty for a join whose `ON` has no equality
+    /// conjunct at all (see the module docs' "No equijoin key at all"),
+    /// which pairs every row with every row and lets the residual decide.
     ///
     /// # Panics
     ///
@@ -506,6 +534,22 @@ impl HashJoin {
         let left_schema = left.schema();
         let right_schema = right.schema();
         let schema = join_output_schema(&left_schema, &right_schema, kind);
+
+        // `left_keys[i]` is compared against `right_keys[i]`, so a length
+        // mismatch means one side's key list lost an entry the other still
+        // has. That is not caught by the bounds check below — both lists can
+        // be individually in range — and the probe path would then encode a
+        // different number of key columns on each side, which `RowConverter`
+        // answers with encodings that never compare equal rather than with an
+        // error: silently zero matched rows, not a failure.
+        if left_keys.len() != right_keys.len() {
+            return Err(ExecError::Internal(format!(
+                "join has {} left key column(s) but {} right — equijoin keys are pairs and \
+                 must come in matching counts; a planner bug",
+                left_keys.len(),
+                right_keys.len()
+            )));
+        }
 
         // Bounds-check before indexing. `right_schema.field(i)` panics on an
         // out-of-range index, and a panic here aborts the session rather than
@@ -573,6 +617,7 @@ impl HashJoin {
             right_table: None,
             hash_table: HashMap::new(),
             right_matched: Vec::new(),
+            all_right_rows: Vec::new(),
         })
     }
 
@@ -625,6 +670,19 @@ impl HashJoin {
             }
         }
 
+        // No equijoin key at all — an `ON` whose every conjunct is a
+        // non-equality (`t.id < u.n`, `a.id <> b.id`, `IS NOT DISTINCT
+        // FROM`), or a decorrelated `EXISTS` whose only correlation is one.
+        // The equality test is then vacuously true for every pair, so every
+        // build-side row is a candidate for every probe row and the residual
+        // alone decides. A hash table cannot express "matches everything",
+        // so the candidate list is materialized once here — this is a
+        // nested-loop join wearing the hash join's clothes, and it is
+        // deliberately not a hash lookup.
+        if self.kind != JoinKind::Cross && self.right_keys.is_empty() {
+            self.all_right_rows = (0..table.num_rows() as u32).collect();
+        }
+
         self.right_table = Some(table);
         self.phase = Phase::Probing;
         Ok(())
@@ -638,7 +696,17 @@ impl HashJoin {
 
     /// Look up one probe row's matches. Empty means either a NULL key
     /// (never matches anything) or a real key with no build-side rows.
-    fn probe_matches(&self, rows_null: bool, key: &OwnedRow) -> &[u32] {
+    ///
+    /// `key` is `None` for a join with no equijoin key at all, where the
+    /// equality test is vacuously true and *every* build-side row is a
+    /// candidate — see `build`'s `all_right_rows` comment. The NULL-key rule
+    /// does not apply in that case: there is no key to be NULL in, so
+    /// `rows_null` (which `null_key_mask` reports as `false` for an empty
+    /// key list anyway) is not consulted.
+    fn probe_matches(&self, rows_null: bool, key: Option<&OwnedRow>) -> &[u32] {
+        let Some(key) = key else {
+            return &self.all_right_rows;
+        };
         if rows_null {
             return &[];
         }
@@ -720,18 +788,31 @@ impl HashJoin {
         let n = left_batch.num_rows();
         let key_cols = project_columns(left_batch, &self.left_keys);
         let mask = null_key_mask(&key_cols, n);
-        let rows = self
-            .row_converter
-            .convert_columns(&key_cols)
-            .map_err(arrow_err)?;
+        // A keyless join encodes nothing: `convert_columns(&[])` yields a
+        // `Rows` with ZERO rows regardless of `n`, and asking it for row `j`
+        // panics inside arrow with "row index out of bounds" — which is not
+        // an error the bridge can fall back from, it takes the session down.
+        // That fired on ordinary SQL: `t JOIN u ON t.id < u.n`,
+        // `ON a.id <> b.id`, `ON t.id IS NOT DISTINCT FROM u.tid`, and a
+        // decorrelated `EXISTS (... WHERE t2.amt > t1.amt)`. `None` here is
+        // what routes every probe row to `all_right_rows` instead.
+        let rows = if self.left_keys.is_empty() {
+            None
+        } else {
+            Some(
+                self.row_converter
+                    .convert_columns(&key_cols)
+                    .map_err(arrow_err)?,
+            )
+        };
 
         // LeftSemi/LeftAnti: left indices only, at most one per left row,
         // right side never appears in the output at all.
         if matches!(self.kind, JoinKind::LeftSemi | JoinKind::LeftAnti) {
             let mut left_idx: Vec<u32> = Vec::new();
             for (j, &key_is_null) in mask.iter().enumerate() {
-                let key = rows.row(j).owned();
-                let key_matches = self.probe_matches(key_is_null, &key);
+                let key = rows.as_ref().map(|r| r.row(j).owned());
+                let key_matches = self.probe_matches(key_is_null, key.as_ref());
                 // A residual, when present, is part of the MATCH TEST, not
                 // an output filter — a left row is semi-matched only if
                 // some key-matching right row also passes it (see the
@@ -764,11 +845,11 @@ impl HashJoin {
         let mut left_idx: Vec<Option<u32>> = Vec::new();
         let mut right_idx: Vec<Option<u32>> = Vec::new();
         for (j, &key_is_null) in mask.iter().enumerate() {
-            let key = rows.row(j).owned();
+            let key = rows.as_ref().map(|r| r.row(j).owned());
             // Owned copy: `probe_matches` borrows `self.hash_table`
             // immutably, and the loop below needs to mutate
             // `self.right_matched` while iterating the matches.
-            let matches: Vec<u32> = self.probe_matches(key_is_null, &key).to_vec();
+            let matches: Vec<u32> = self.probe_matches(key_is_null, key.as_ref()).to_vec();
             if matches.is_empty() {
                 match self.kind {
                     // Right preserves only the build side's unmatched rows,
@@ -1959,5 +2040,284 @@ mod tests {
                 "{kind:?} with a residual must be refused, got {err:?}"
             );
         }
+    }
+
+    // ─── No equijoin key at all ─────────────────────────────────────────
+    //
+    // REGRESSION. Every test in this section used to PANIC, not fail: with
+    // an empty key list `RowConverter::convert_columns(&[])` yields a `Rows`
+    // holding zero rows whatever the batch width, and `probe_batch` asked it
+    // for row `j` of `n` anyway — arrow answers that with
+    // `panic!("row index out of bounds")` from inside `Rows::row`, which
+    // unwinds past the engine's fallback-on-error path and takes the session
+    // down. Four queries in the owned-engine probe hit it on plain SQL:
+    //
+    //   SELECT t.id, u.n   FROM t JOIN u ON t.id < u.n
+    //   SELECT t.id, u.tag FROM t JOIN u ON t.id IS NOT DISTINCT FROM u.tid
+    //   SELECT a.id, b.id  FROM t a JOIN t b ON a.id <> b.id AND a.id < b.id
+    //   SELECT id FROM t t1 WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.amt > t1.amt)
+    //
+    // Every expected row below was read off a live PostgreSQL 18.2 with the
+    // same data, not derived from what this implementation happens to do.
+    // Fixture (same `l`/`r` as the residual section above):
+    //   l(lk,lv) = (1,10),(2,20),(3,30)
+    //   r(rk,rv) = (1,100),(1,200),(2,5),(2,999)
+    //
+    //   SELECT lk,lv,rk,rv FROM l JOIN r ON r.rv < l.lv  ->  3 rows, all rv=5
+    //   SELECT lk FROM l WHERE EXISTS     (SELECT 1 FROM r WHERE r.rv<l.lv) -> 1,2,3
+    //   SELECT lk FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.rv<l.lv) -> none
+
+    /// `r.rv > l.lv`, same relation-tagging convention as [`rv_lt_lv`].
+    fn rv_gt_lv() -> Expr {
+        Expr::Binary {
+            op: op(521), // int4 >
+            lhs: Box::new(rel_col(1, 0, "rk")),
+            rhs: Box::new(rel_col(0, 0, "lk")),
+        }
+    }
+
+    #[test]
+    fn keyless_inner_join_pairs_every_row_and_lets_the_residual_decide() {
+        let (left, right) = residual_fixture();
+        let mut join = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::Inner,
+            Vec::new(),
+            Vec::new(),
+            Some(rv_lt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        let out = collect_all(&mut join);
+        // psql: `l JOIN r ON r.rv < l.lv` — rv=5 is the only right row below
+        // ANY left lv, and it pairs with all three left rows. An equijoin
+        // that (wrongly) required a shared key would emit only (2,5).
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(
+            sorted_pairs(&out, 0, 3),
+            vec![(Some(1), Some(5)), (Some(2), Some(5)), (Some(3), Some(5))]
+        );
+    }
+
+    #[test]
+    fn keyless_left_semi_and_anti_use_every_right_row_as_a_candidate() {
+        let (left, right) = residual_fixture();
+        let mut semi = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::LeftSemi,
+            Vec::new(),
+            Vec::new(),
+            Some(rv_lt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        assert_eq!(
+            col_i32(&collect_all(&mut semi), 0),
+            vec![Some(1), Some(2), Some(3)],
+            "psql: EXISTS (SELECT 1 FROM r WHERE r.rv < l.lv) is true for every left row, \
+             because rv=5 is below all three lv values"
+        );
+
+        let (left, right) = residual_fixture();
+        let mut anti = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::LeftAnti,
+            Vec::new(),
+            Vec::new(),
+            Some(rv_lt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        assert_eq!(
+            collect_all(&mut anti).num_rows(),
+            0,
+            "psql: NOT EXISTS is false for every left row — the exact negation of the SEMI \
+             result above"
+        );
+    }
+
+    /// The one shape where the keyless path must do the OPPOSITE of the
+    /// keyed path's NULL rule. `IS NOT DISTINCT FROM` reaches this operator
+    /// with no equijoin key and a `DistinctFrom` residual, and NULL there
+    /// *does* match NULL — whereas a keyed `=` join must never pair two NULL
+    /// keys (`null_keys_never_match_each_other`). Routing a keyless join
+    /// through the hash table's NULL-exclusion rule would silently drop the
+    /// NULL/NULL row.
+    ///
+    /// psql, with `ln(lk)` = 1, NULL, 3 and `rn(rk)` = 1, NULL, 4:
+    ///   SELECT lk,rk FROM ln JOIN rn ON ln.lk IS NOT DISTINCT FROM rn.rk
+    ///     -> (1,1) and (NULL,NULL)
+    ///   SELECT lk,rk FROM ln JOIN rn ON ln.lk = rn.rk   -> (1,1) alone
+    #[test]
+    fn keyless_join_on_is_not_distinct_from_matches_null_to_null() {
+        let left_schema = int_schema(&["lk"]);
+        let right_schema = int_schema(&["rk"]);
+        let left = feed_one(
+            left_schema.clone(),
+            int_batch(&left_schema, vec![vec![Some(1), None, Some(3)]]),
+        );
+        let right = feed_one(
+            right_schema.clone(),
+            int_batch(&right_schema, vec![vec![Some(1), None, Some(4)]]),
+        );
+        let filter = Expr::DistinctFrom {
+            lhs: Box::new(rel_col(0, 0, "lk")),
+            rhs: Box::new(rel_col(1, 0, "rk")),
+            negated: true,
+        };
+        let mut join = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::Inner,
+            Vec::new(),
+            Vec::new(),
+            Some(filter),
+            1 << 30,
+        )
+        .unwrap();
+        let out = collect_all(&mut join);
+        assert_eq!(
+            sorted_pairs(&out, 0, 1),
+            vec![(None, None), (Some(1), Some(1))],
+            "psql: IS NOT DISTINCT FROM pairs NULL with NULL — 3 is distinct from every rk, \
+             and 4 from every lk"
+        );
+    }
+
+    /// A NULL residual still excludes the candidate on the keyless path,
+    /// exactly as it does on the keyed one — so a left row whose every
+    /// candidate evaluates to NULL is absent from SEMI and present in ANTI.
+    ///
+    /// psql, with `ln(lk)` = 1, NULL, 3 and `rn(rk)` = 1, NULL, 4:
+    ///   SELECT lk FROM ln WHERE EXISTS     (SELECT 1 FROM rn WHERE rn.rk > ln.lk) -> 1, 3
+    ///   SELECT lk FROM ln WHERE NOT EXISTS (SELECT 1 FROM rn WHERE rn.rk > ln.lk) -> NULL
+    #[test]
+    fn keyless_semi_anti_treat_a_null_residual_as_not_passing() {
+        let left_schema = int_schema(&["lk"]);
+        let right_schema = int_schema(&["rk"]);
+        let fixture = || {
+            (
+                feed_one(
+                    left_schema.clone(),
+                    int_batch(&left_schema, vec![vec![Some(1), None, Some(3)]]),
+                ),
+                feed_one(
+                    right_schema.clone(),
+                    int_batch(&right_schema, vec![vec![Some(1), None, Some(4)]]),
+                ),
+            )
+        };
+
+        let (left, right) = fixture();
+        let mut semi = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::LeftSemi,
+            Vec::new(),
+            Vec::new(),
+            Some(rv_gt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        assert_eq!(
+            col_i32(&collect_all(&mut semi), 0),
+            vec![Some(1), Some(3)],
+            "psql: lk=NULL has no candidate that is definitely TRUE, so EXISTS is false"
+        );
+
+        let (left, right) = fixture();
+        let mut anti = HashJoin::with_filter(
+            left,
+            right,
+            JoinKind::LeftAnti,
+            Vec::new(),
+            Vec::new(),
+            Some(rv_gt_lv()),
+            1 << 30,
+        )
+        .unwrap();
+        assert_eq!(
+            col_i32(&collect_all(&mut anti), 0),
+            vec![None],
+            "psql: NOT EXISTS keeps exactly the lk=NULL row"
+        );
+    }
+
+    /// A keyless join with no residual at all is a cross product, and a
+    /// keyless LEFT join over an EMPTY build side must still NULL-extend
+    /// every preserved row rather than emit nothing — the same
+    /// `matches.is_empty()` branch a keyed outer join takes, reached here
+    /// because `all_right_rows` is itself empty.
+    ///
+    /// psql, `l(lk,lv)` = (1,10),(2,20),(3,30):
+    ///   SELECT lk,rk FROM l LEFT JOIN r ON true                 -> 12 rows (3 x 4)
+    ///   SELECT lk,rk FROM l LEFT JOIN (empty) z ON true         -> (1,NULL),(2,NULL),(3,NULL)
+    #[test]
+    fn keyless_outer_join_without_a_residual_is_a_cross_product() {
+        let left_schema = int_schema(&["lk", "lv"]);
+        let right_schema = int_schema(&["rk", "rv"]);
+
+        let (left, right) = residual_fixture();
+        let mut join = HashJoin::new(
+            left,
+            right,
+            JoinKind::Left,
+            Vec::new(),
+            Vec::new(),
+            1 << 30,
+        )
+        .unwrap();
+        assert_eq!(
+            collect_all(&mut join).num_rows(),
+            12,
+            "psql: 3 left rows x 4 right rows"
+        );
+
+        let left = feed_one(
+            left_schema.clone(),
+            int_batch(
+                &left_schema,
+                vec![
+                    vec![Some(1), Some(2), Some(3)],
+                    vec![Some(10), Some(20), Some(30)],
+                ],
+            ),
+        );
+        let mut empty_right = HashJoin::new(
+            left,
+            empty_feed(right_schema),
+            JoinKind::Left,
+            Vec::new(),
+            Vec::new(),
+            1 << 30,
+        )
+        .unwrap();
+        let out = collect_all(&mut empty_right);
+        assert_eq!(
+            sorted_pairs(&out, 0, 2),
+            vec![(Some(1), None), (Some(2), None), (Some(3), None)],
+            "psql: every preserved left row survives NULL-extended when the build side is empty"
+        );
+    }
+
+    /// Equijoin keys are pairs. A length mismatch would encode a different
+    /// number of key columns on each side and silently compare mismatched
+    /// row encodings, so the constructor refuses it rather than run it.
+    #[test]
+    fn constructor_refuses_mismatched_key_counts() {
+        let err = HashJoin::new(
+            empty_feed(int_schema(&["lk", "lv"])),
+            empty_feed(int_schema(&["rk", "rv"])),
+            JoinKind::Inner,
+            vec![0, 1],
+            vec![0],
+            1 << 30,
+        )
+        .err()
+        .expect("mismatched key counts must be refused");
+        assert!(matches!(err, ExecError::Internal(_)), "got {err:?}");
     }
 }
