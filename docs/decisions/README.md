@@ -84,8 +84,8 @@ table.
 | 0011 | Cross-shard 2PC | Accepted | Deferred; locked architecturally; gated on customer demand |
 | 0012 | Change event primitive | Accepted | ChangeEventSink trait; declarative lifecycle + reactors replace PL/pgSQL triggers |
 | 0013 | Auth per-project schema | Accepted | Removes loopback pgwire; auth data in per-project storage; auth.uid/role/jwt |
-| 0014 | pg_query as canonical parser | Accepted, in progress | libpg_query frontend; sqlparser-rs demoted to transitional fallback; DataFusion-sql to executor-only |
-| 0015 | Vortex storage format | Accepted | Vortex default since 2026-05-18; Parquet first-class selectable; ~1.95× smaller, on-par-to-better scan |
+| 0014 | pg_query as canonical parser | Accepted, in progress | libpg_query frontend; sqlparser-rs demoted to transitional fallback; now more central under ADR 0030 — Phase 2 lowers the pg_query parse tree directly to Basin's own IR, not a DataFusion LogicalPlan |
+| 0015 | Vortex storage format | Accepted | Vortex default since 2026-05-18; Parquet first-class selectable; ~1.95× smaller, on-par-to-better scan. The arrow/DataFusion/vortex version lockstep this ADR records loses its DataFusion leg under ADR 0030; the `vortex-datafusion` read path is being superseded (storage-format decision itself unaffected — see ADR 0030 Consequences) |
 | 0016 | HTAP hot tier architecture | Accepted 2026-05-19 | Row-format LSM memtable (`basin-hottier` crate) per (project, table); closes OLTP point_eq + single-row UPDATE gap; 6 sub-items C1-C6 in TASK.md Phase 5.14.C; schema-evolution policy addendum 2026-05-19 |
 | 0017 | Query-shape stats privacy + stability | Accepted 2026-05-19 | xxhash3 64-bit seeded; literal-stripping at LogicalPlan; per-customer template uses real names; cross-project template anonymised (`t1.c0` form); k-anonymity ≥ 5; ADR for Phase 5.16 |
 | 0018 | Subsystem feature flags + minimal-build target | Proposed 2026-05-19 | Gate optional subsystems (auth, rest, webhooks, future realtime/wasm-udf) behind Cargo features; OSS users get a minimal pgwire-only binary; managed deployments and the default OSS build keep the kitchen sink |
@@ -113,4 +113,4 @@ than renumbered: an ADR number appears in inbound links, commit messages and
 other ADRs' cross-reference lists, so renumbering trades a cosmetic
 inconsistency for a set of broken references — the same trade as renaming an
 applied migration. **New ADRs must continue from the highest number in use
-(next: 0030)**, and this table is the place to check what that is.
+(next: 0031)**, and this table is the place to check what that is.

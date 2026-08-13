@@ -531,22 +531,21 @@ Contributions welcome. The project is opinionated about scope ([`docs/decisions/
 
 ---
 
-## Part of VulOS
+## Standalone by design
 
-Basin is the **database layer** of [VulOS](https://vulos.org) — the open,
-self-hostable web OS and app suite. Apps running on the Vulos OS get a
-Postgres-compatible store whose per-project cost is O(bytes active) rather
-than O(projects provisioned), which is what makes hosting many small
-self-hosted apps on one box affordable.
+Basin is an independent project, developed on its own — not a component of
+any larger platform. It is a single binary speaking pgwire against any
+S3-compatible bucket, and it requires nothing else to run: no control plane,
+no account, no other service. Everything in this README's Quickstart works on
+a bare machine with a bucket and nothing more.
 
-**Basin runs standalone.** It is a single binary speaking pgwire against any
-S3-compatible bucket, and it requires nothing else in the suite — no Vulos
-OS, no control plane, no account. Everything in this README's Quickstart
-works on a bare machine with no VulOS component installed. Being an app the
-OS can host is an option, never a dependency.
-
-For the rest of the suite and how the pieces fit, see
-[vulos.org](https://vulos.org).
+Because a project here is an S3 prefix rather than a provisioned instance,
+per-project cost is O(bytes active) rather than O(projects provisioned) —
+useful anywhere many small Postgres-shaped workloads need to share a box
+affordably, which is one of the reasons the same team also builds
+[VulOS](https://vulos.org), a self-hostable web OS. VulOS can run Basin as
+one of the databases available to its apps, the same way any other operator
+can — that's a consumer choosing Basin, not Basin depending on VulOS.
 
 ---
 

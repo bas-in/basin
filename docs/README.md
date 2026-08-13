@@ -98,6 +98,7 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 - [ADR 0027 — Binary / columnar JSONB representation (faster scalar extraction)](decisions/0027-binary-jsonb-encoding.md) — JSONB extraction is 100-2200x slower than PostgreSQL at 1M rows: JSONB is stored as JSON text and re-walked per row. Decides the hybrid binary-blob + promoted-columns fix and its first increment.
 - [ADR 0028 — CDC bridge: commit-path capture, WAL-resumable streams, phased sinks](decisions/0028-cdc-bridge.md) — Picks the CDC capture seam (post-commit ChangeEventSink, not WAL tail), locks the LSN-cursor resumability model, and sequences five shippable phases from webhook-stream to pgoutput wire compat.
 - [ADR 0029 — Distributed-systems primitives Basin deliberately does not carry](decisions/0029-substrate-and-suite-convergence.md) — Basin adopts verifiable release distribution and nothing else. No HLC, no CRDT, no cryptographic node identity, no capability tokens — each absence a design consequence, not a gap.
+- [ADR 0030 — Remove DataFusion; build Basin's own query engine (accepted, in progress)](decisions/0030-own-query-engine-remove-datafusion.md) — DataFusion leaves the dependency tree entirely: no fallback, no trait boundary, no fork. Basin builds its own logical IR, optimizer and physical executor on arrow-rs, closing a Postgres-fidelity ceiling (string-rewritten SQL, simulated pg_catalog, no true SRFs, bypassable RLS) that DataFusion cannot lift. Delete is sequenced last so the branch stays green throughout.
 
 ## Reference
 
