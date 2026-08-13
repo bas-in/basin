@@ -108,6 +108,13 @@
 //!    -- (0 rows)
 //!    ```
 //!    See [`empty_anchor_yields_zero_rows_and_never_invokes_the_recursive_term`].
+//! 6. **The recursive term's own output column names (and nullability) need
+//!    not match the anchor's.** The CTE's exposed column names come from the
+//!    anchor term (or an explicit `WITH x(a, b) AS (...)` column list),
+//!    never from the recursive term — whose `SELECT` list is routinely left
+//!    unaliased. Only the column TYPES, in position, must line up. See
+//!    [`SchemaRebind`] and
+//!    [`a_recursive_terms_unaliased_column_need_not_match_the_anchors_name`].
 //!
 //! # The classic shapes, verified live against PostgreSQL 18.2
 //!
@@ -180,7 +187,7 @@ use std::sync::Arc;
 
 use arrow::compute::take;
 use arrow::row::{OwnedRow, RowConverter, SortField};
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{ArrowError, SchemaRef};
 
 use crate::operator::{ExecError, Operator};
@@ -200,6 +207,95 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch,
         .map(|c| take(c.as_ref(), indices, None).map_err(arrow_err))
         .collect::<Result<_, _>>()?;
     RecordBatch::try_new(batch.schema(), columns).map_err(arrow_err)
+}
+
+/// Whether two schemas have the same column TYPES in the same positions —
+/// deliberately ignoring field names, nullability and metadata, all three of
+/// which a `WITH RECURSIVE` recursive term is free to disagree with the
+/// anchor on (see [`SchemaRebind`]'s doc comment). A real mismatch — wrong
+/// arity, or a type that doesn't line up positionally — is still rejected by
+/// the caller; this only widens what counts as compatible, never narrows it.
+fn schema_types_match(a: &SchemaRef, b: &SchemaRef) -> bool {
+    a.fields().len() == b.fields().len()
+        && a.fields()
+            .iter()
+            .zip(b.fields().iter())
+            .all(|(x, y)| x.data_type() == y.data_type())
+}
+
+/// Wraps an operator whose column TYPES match `target` positionally but
+/// whose field names/nullability/metadata may not, and rebinds every batch
+/// it yields to `target` verbatim — the underlying column data is untouched,
+/// only the reported schema changes.
+///
+/// # Why this exists
+///
+/// Postgres does not require a `WITH RECURSIVE` recursive term's own output
+/// column names to match the anchor term's. The CTE's exposed column names
+/// come from the anchor (or an explicit `WITH x(a, b) AS (...)` column
+/// list), never from the recursive term — and the recursive term's `SELECT`
+/// list is routinely left unaliased, which gets Postgres's own synthetic
+/// `?column?` name. Verified live against PostgreSQL 18.2:
+/// ```sql
+/// WITH RECURSIVE r AS (
+///   SELECT 1 AS n
+///   UNION ALL
+///   SELECT n+1 FROM r WHERE n < 5   -- no `AS n` here
+/// )
+/// SELECT n FROM r;
+/// --  n
+/// -- ---
+/// --  1
+/// --  2
+/// --  3
+/// --  4
+/// --  5
+/// -- (5 rows) -- succeeds; the recursive term's own column is unnamed.
+/// ```
+/// Before this wrapper existed, `RecursiveCte::next_batch`'s schema check
+/// compared the recursive term's `Schema` to the anchor's with plain `!=` —
+/// full `arrow_schema::Schema` equality, which includes field names — so
+/// this exact live-legal query was rejected as `ExecError::TypeMismatch`,
+/// which the caller (`basin-engine`'s owned-engine bridge) turns into a
+/// silent fallback to DataFusion rather than a served query. Renaming the
+/// batch's schema here (rather than merely relaxing the equality check to
+/// let mismatched names through unrenamed) keeps this operator's own
+/// contract intact: [`Operator::schema`] documents "the Arrow schema of the
+/// batches this operator yields", so every batch `RecursiveCte` actually
+/// yields — anchor or any iteration — must carry exactly `self.schema`, not
+/// merely something type-compatible with it.
+struct SchemaRebind {
+    inner: Box<dyn Operator>,
+    target: SchemaRef,
+}
+
+impl SchemaRebind {
+    fn new(inner: Box<dyn Operator>, target: SchemaRef) -> Self {
+        Self { inner, target }
+    }
+}
+
+impl Operator for SchemaRebind {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.target)
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
+        match self.inner.next_batch()? {
+            // Column data is reused as-is (`schema_types_match` already
+            // proved the data types line up positionally) — only the
+            // `Schema` attached to the batch changes.
+            Some(batch) => Ok(Some(
+                RecordBatch::try_new(Arc::clone(&self.target), batch.columns().to_vec())
+                    .map_err(arrow_err)?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn memory_used(&self) -> usize {
+        self.inner.memory_used()
+    }
 }
 
 /// The recursive term, re-instantiated once per iteration against that
@@ -447,15 +543,31 @@ impl Operator for RecursiveCte {
                     self.working_set_bytes = 0;
 
                     let next_op = (self.recursive_term)(working_table)?;
-                    if next_op.schema() != self.schema {
+                    let next_schema = next_op.schema();
+                    self.stage = if next_schema == self.schema {
+                        Stage::Iteration(next_op)
+                    } else if schema_types_match(&next_schema, &self.schema) {
+                        // Field names (and nullability/metadata) differ but
+                        // the column TYPES line up positionally — legal in
+                        // Postgres, which takes the CTE's exposed column
+                        // names from the anchor term (or an explicit `WITH
+                        // x(a, b) AS` list), never from the recursive term.
+                        // A recursive term's `SELECT` list is routinely
+                        // unaliased (`SELECT n+1 FROM r ...`, no `AS n`),
+                        // which basin-plan names `?column?` — see
+                        // `SchemaRebind`'s doc comment for the live-verified
+                        // query this exact shape rejected before this fix.
+                        Stage::Iteration(Box::new(SchemaRebind::new(
+                            next_op,
+                            Arc::clone(&self.schema),
+                        )))
+                    } else {
                         return Err(ExecError::TypeMismatch(format!(
-                            "WITH RECURSIVE's recursive term must return the same schema as \
-                             the anchor term: expected {:?}, got {:?}",
-                            self.schema,
-                            next_op.schema()
+                            "WITH RECURSIVE's recursive term must return the same column types \
+                             as the anchor term: expected {:?}, got {:?}",
+                            self.schema, next_schema
                         )));
-                    }
-                    self.stage = Stage::Iteration(next_op);
+                    };
                     // Bounded continuation: at most one more factory call
                     // and one more pull happen before this call returns —
                     // see the doc comment above for why this can never
@@ -1135,5 +1247,82 @@ mod tests {
         op.next_batch().unwrap(); // the anchor's own row, fine
         let err = op.next_batch().unwrap_err();
         assert!(matches!(err, ExecError::TypeMismatch(_)), "{err:?}");
+    }
+
+    // `WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM r WHERE
+    // n < 5) SELECT n FROM r;` — the recursive term's own output column has
+    // NO alias (`n+1`, not `n+1 AS n`), which basin-plan (like Postgres
+    // itself) names `?column?`, not `n`. Verified live against PostgreSQL
+    // 18.2 to still succeed, 1..=5 (5 rows): Postgres takes the CTE's
+    // exposed column names from the ANCHOR, never from the recursive term.
+    //
+    // Before `SchemaRebind` existed, the plain `Schema` `!=` check in
+    // `next_batch` treated this as `ExecError::TypeMismatch` — which
+    // `basin-engine`'s owned-engine bridge turns into a silent fallback to
+    // DataFusion — even though the column TYPES agree and only the NAME
+    // differs. This is exactly the shape that made
+    // `WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM r WHERE
+    // n < 5) SELECT n FROM r` fall back before this fix (confirmed via
+    // `RUST_LOG=basin_engine::owned_engine=debug` against a live `Engine`:
+    // `reason=execution failed: type mismatch: ... expected Schema { ...,
+    // name: "n", ... }, got Schema { ..., name: "?column?", ... }`).
+    #[test]
+    fn a_recursive_terms_unaliased_column_need_not_match_the_anchors_name() {
+        let anchor_schema = schema_1i32("n");
+        let anchor = Feed::boxed(
+            anchor_schema.clone(),
+            vec![batch_i32(&anchor_schema, vec![Some(1)])],
+        );
+        // The recursive term's own schema names its column `?column?`
+        // (basin-plan's synthetic name for an unaliased expression, the
+        // same convention Postgres uses) — deliberately NOT `n`.
+        let recursive_schema = schema_1i32("?column?");
+        let recursive_term: RecursiveTermFactory = Box::new(move |working_table| {
+            let mut next: Vec<Option<i32>> = Vec::new();
+            for batch in &working_table {
+                for n in col_i32(batch, 0).into_iter().flatten() {
+                    if n < 5 {
+                        next.push(Some(n + 1));
+                    }
+                }
+            }
+            Ok(Feed::boxed(
+                recursive_schema.clone(),
+                vec![batch_i32(&recursive_schema, next)],
+            ))
+        });
+        let mut op = RecursiveCte::new(anchor, recursive_term, true, 1 << 30, 100);
+        let mut out = Vec::new();
+        loop {
+            match op.next_batch().unwrap() {
+                Some(b) => {
+                    // The Operator contract (`operator.rs`: "the Arrow
+                    // schema of the batches this operator yields") must
+                    // hold for EVERY batch, anchor or iteration — not just
+                    // ones that happened to already agree with the anchor's
+                    // naming.
+                    assert_eq!(
+                        b.schema(),
+                        anchor_schema,
+                        "every yielded batch must carry the CTE's own (anchor) schema, \
+                         never the recursive term's own field name"
+                    );
+                    out.extend(col_i32(&b, 0).into_iter().flatten());
+                }
+                None => break,
+            }
+        }
+        out.sort();
+        assert_eq!(
+            out,
+            vec![1, 2, 3, 4, 5],
+            "must match live Postgres exactly, despite the recursive term's unaliased column"
+        );
+        assert_eq!(
+            op.schema(),
+            anchor_schema,
+            "the operator's advertised schema is always the anchor's, unaffected by any \
+             iteration's own (possibly differently-named) recursive term"
+        );
     }
 }
