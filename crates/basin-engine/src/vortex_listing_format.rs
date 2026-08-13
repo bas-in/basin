@@ -56,7 +56,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::{Array, ArrayRef, Decimal256Array, FixedSizeBinaryArray, RecordBatch};
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
@@ -270,13 +270,27 @@ impl FileFormat for BasinVortexFormat {
         // to the catalog's FSB types on output.
         let needs_uuid = schema_has_uuid_fsb16(file_schema.as_ref());
         let needs_point = schema_has_point_fsb(file_schema.as_ref());
-        let inner_source = if needs_uuid || needs_point {
+        // INTERVAL(MonthDayNano) → BinaryView. Same reason, different cause:
+        // Vortex cannot encode OR decode the Arrow interval type at all, so
+        // basin-storage stores interval columns as a 16-byte LargeBinary
+        // blob (months|days|nanos) on both formats.
+        let needs_interval =
+            crate::interval_storage::schema_has_interval_native(file_schema.as_ref());
+        let inner_source = if needs_uuid || needs_point || needs_interval {
             let mut physical = (*file_schema).clone();
             if needs_uuid {
                 physical = swap_uuid_fsb16_to_decimal256(&physical);
             }
             if needs_point {
                 physical = swap_point_fsb_to_binary_view(&physical);
+            }
+            if needs_interval {
+                // Vortex's scan layer surfaces the stored LargeBinary as
+                // BinaryView, so that is the type the file schema must claim.
+                physical = crate::interval_storage::swap_interval_to_physical(
+                    &physical,
+                    DataType::BinaryView,
+                );
             }
             let physical_table_schema = TableSchema::new(
                 Arc::new(physical),
@@ -344,6 +358,10 @@ impl FileFormat for BasinVortexFormat {
         }
         if schema_has_point_binary(plan.schema().as_ref()) {
             plan = Arc::new(PointFsbRestoreExec::new(plan));
+        }
+        // INTERVAL: binary-family → Interval(MonthDayNano).
+        if crate::interval_storage::schema_has_interval_binary(plan.schema().as_ref()) {
+            plan = Arc::new(crate::interval_storage::IntervalRestoreExec::new(plan));
         }
         Ok(plan)
     }

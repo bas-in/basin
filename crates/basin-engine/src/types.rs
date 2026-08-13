@@ -92,6 +92,31 @@ pub const BASIN_TYPE_POINT: &str = "POINT";
 /// the Rust level, "unknown SRID = 0" at the SQL level).
 pub const BASIN_SRID: &str = "BASIN_SRID";
 
+/// `INTERVAL` — PG's interval type. The LOGICAL Arrow type is
+/// `Interval(MonthDayNano)` (see `arrow_data_type`), which is what every
+/// layer above storage sees; the marker exists because NEITHER storage
+/// format can encode that Arrow type:
+///
+/// - vortex 0.71: "Array encoding not implemented for Arrow data type
+///   Interval(MonthDayNano)"
+/// - parquet 58.4.0: "Attempting to write an Arrow interval type
+///   MonthDayNano to parquet" (and NYI on read)
+///
+/// So basin-storage stores interval columns as `LargeBinary`, 16 bytes per
+/// row — `months(i32) | days(i32) | nanos(i64)`, little-endian — and this
+/// marker is what lets the read path tell a stored interval apart from a
+/// genuine BYTEA column. Unlike UUID (Decimal256) and POINT (LargeBinary),
+/// the disguise applies to BOTH formats, not just Vortex.
+///
+/// The three fields are stored SEPARATELY on purpose: PG's interval is not
+/// normalisable. `INTERVAL '1 mon'` and `INTERVAL '30 days'` are distinct
+/// values — they print differently and `INTERVAL '1 mon' - INTERVAL '30
+/// days'` is `1 mon -30 days`, not `00:00:00` (verified live on PG 18.2) —
+/// even though PG's `=` operator happens to call them equal by valuing a
+/// month at 30 days. Collapsing them into a single scalar would be data
+/// loss.
+pub const BASIN_TYPE_INTERVAL: &str = "INTERVAL";
+
 /// `CITEXT` — case-insensitive text. Stored as plain `Utf8` in Arrow; the
 /// marker tells comparison operators, UNIQUE enforcement, and ORDER BY to
 /// apply case-folding (lower()) before comparing values. PG OID 25 (same as
@@ -1040,6 +1065,15 @@ pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
                 Some(n) => Some(format!("VARBIT({n})")),
                 None => Some("VARBIT".to_string()),
             };
+        }
+        // INTERVAL is a NATIVE sqlparser variant, not a `Custom` type, so it
+        // has to be handled here rather than in the keyword match below.
+        // The logical Arrow type stays `Interval(MonthDayNano)`; the marker
+        // is what basin-storage keys off to encode/decode the 16-byte
+        // months|days|nanos LargeBinary disguise (neither Vortex nor Parquet
+        // can encode the Arrow interval type). See `BASIN_TYPE_INTERVAL`.
+        SqlDataType::Interval { .. } => {
+            return Some(BASIN_TYPE_INTERVAL.to_string());
         }
         _ => {}
     }

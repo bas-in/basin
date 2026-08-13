@@ -2395,6 +2395,7 @@ pub(crate) mod index_probe;
 mod inet_udf;
 pub mod inflight_metrics;
 mod info_schema_provider;
+mod interval_storage;
 mod interval_tz_udf;
 mod is_distinct_rewrite;
 mod json_build_udf;
@@ -2426,6 +2427,7 @@ mod partition_forward_integration_test;
 /// Multi-region v0.2 (ADR 0009): concrete `WriteForwarder` impls (fly-replay /
 /// http-forward) compiled into the engine binary and registered at startup.
 pub mod partition_router;
+mod parquet_listing_format;
 mod pg_agg_udf;
 pub mod pg_ast;
 mod pg_catalog_udf;

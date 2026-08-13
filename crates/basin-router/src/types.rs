@@ -1582,6 +1582,28 @@ mod tests {
         );
     }
 
+    /// The six `(months, days, nanos)` triples that
+    /// `basin-engine/tests/interval_common` writes to disk and reads back,
+    /// rendered to the text a pgwire client sees.
+    ///
+    /// Storage stores intervals as 16 bytes — months(i32)|days(i32)|nanos(i64)
+    /// — so the fields survive independently; this asserts the DISPLAYED
+    /// result of that. Every string below was read off a live PostgreSQL 18.2
+    /// server (`SELECT INTERVAL '…'`) before being written down.
+    ///
+    /// `1 mon` and `30 days` printing differently is the load-bearing pair:
+    /// the rejected "Int64 microseconds" storage encoding would have made
+    /// both print `30 days`.
+    #[test]
+    fn renders_interval_text_matching_live_pg_for_the_stored_round_trip() {
+        assert_eq!(render_interval(1, 0, 0), "1 mon");
+        assert_eq!(render_interval(0, 30, 0), "30 days");
+        assert_ne!(render_interval(1, 0, 0), render_interval(0, 30, 0));
+        assert_eq!(render_interval(0, -3, 0), "-3 days");
+        assert_eq!(render_interval(0, 0, 0), "00:00:00");
+        assert_eq!(render_interval(0, 1, 7_200_000_000_000), "1 day 02:00:00");
+    }
+
     #[test]
     fn encodes_three_rows() {
         let schema = Arc::new(ArrowSchema::new(vec![

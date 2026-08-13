@@ -55,6 +55,7 @@ use tracing::instrument;
 use url::Url;
 
 use crate::convert::schema_ws_to_df;
+use crate::parquet_listing_format::BasinParquetFormat;
 use crate::vortex_listing_format::BasinVortexFormat;
 use crate::{Engine, ProjectSession, StatelessUdfCache};
 // `VortexSession::default()` is provided by the `VortexSessionDefault` trait;
@@ -3090,8 +3091,18 @@ pub(crate) async fn open(
 /// expression so existing tables see zero regression.
 fn listing_file_format(format: TableFileFormat) -> (Arc<dyn FileFormat>, &'static str) {
     match format {
-        // KEEP byte-identical with the historical inline expression.
-        TableFileFormat::Parquet => (Arc::new(ParquetFormat::default()), ".parquet"),
+        // `BasinParquetFormat` is a pass-through to `ParquetFormat` for every
+        // table WITHOUT an interval column, so this stays behaviourally
+        // identical to the historical inline expression for those. Interval
+        // columns are stored as a 16-byte `LargeBinary` blob (Parquet cannot
+        // encode `Interval(MonthDayNano)` any more than Vortex can), and the
+        // wrapper is what stops DataFusion attempting the impossible
+        // LargeBinary → Interval cast and restores the logical type above the
+        // scan. See `crate::parquet_listing_format`.
+        TableFileFormat::Parquet => (
+            Arc::new(BasinParquetFormat::new(Arc::new(ParquetFormat::default()))),
+            ".parquet",
+        ),
         // Opt-in Vortex read path. Construct `VortexFormat` directly with
         // `new_with_options` so we can wrap it in `BasinVortexFormat`.
         //

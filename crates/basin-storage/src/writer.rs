@@ -281,17 +281,21 @@ pub(crate) async fn write_batch_with_options(
     // by its BASIN_TYPE=UUID field marker.
     let uuid_xlated_owned;
     let point_xlated_owned;
-    let batch_for_encode = match opts.file_format {
+    let interval_xlated_owned;
+    let format_xlated = match opts.file_format {
         FileFormat::Vortex => {
             // First UUID FSB(16) → Decimal256, then POINT FSB(21) →
             // LargeBinary. The two translations key on disjoint
-            // physical types so order is incidental. The POINT
-            // translation is the write half only — full DataFusion
-            // read-path integration via `vortex_listing_format` is
-            // PG-Wave-β work; today POINT columns only fully round-trip
-            // on `WITH (basin.file_format='parquet')` tables. The write
-            // path is in place so existing Vortex tables that grow a
-            // POINT column don't error during compaction.
+            // physical types so order is incidental.
+            //
+            // (This comment used to say the POINT translation was the
+            // write half only, with the DataFusion read path deferred.
+            // That is no longer true: `vortex_listing_format` carries
+            // `swap_point_fsb_to_binary_view` + `PointFsbRestoreExec`,
+            // so POINT round-trips on Vortex tables as well as Parquet
+            // ones. Corrected while adding the INTERVAL disguise below,
+            // which was modelled on this precedent and had to establish
+            // how complete it actually was.)
             let after_uuid = match uuid_fsb_to_decimal256(batch_to_write) {
                 Some(b) => {
                     uuid_xlated_owned = b;
@@ -308,6 +312,24 @@ pub(crate) async fn write_batch_with_options(
             }
         }
         FileFormat::Parquet => batch_to_write,
+    };
+    // INTERVAL-as-LargeBinary — unlike the two translations above this one
+    // runs for BOTH formats, because NEITHER can encode Arrow's
+    // `Interval(MonthDayNano)`:
+    //   vortex 0.71:    "Array encoding not implemented for Arrow data type
+    //                    Interval(MonthDayNano)"
+    //   parquet 58.4.0: "Attempting to write an Arrow interval type
+    //                    MonthDayNano to parquet" (and NYI on read)
+    // 16 bytes per row, months(i32)|days(i32)|nanos(i64) little-endian, so
+    // the three fields survive INDEPENDENTLY — PG's interval is not
+    // normalisable and `INTERVAL '1 mon'` must not come back as
+    // `INTERVAL '30 days'`.
+    let batch_for_encode = match interval_to_large_binary(format_xlated) {
+        Some(b) => {
+            interval_xlated_owned = b;
+            &interval_xlated_owned
+        }
+        None => format_xlated,
     };
     // #72 Mechanism C: the encode below (BtrBlocks cascade for Vortex, the
     // Parquet writer otherwise) is heavy CPU that runs on the polling runtime
@@ -517,6 +539,127 @@ const BASIN_TYPE_UUID: &str = "UUID";
 /// `LargeBinary` for Vortex (which has no FSB(N) encoder) and rebuild
 /// the FSB layout on read.
 const BASIN_TYPE_POINT: &str = "POINT";
+
+/// `BASIN_TYPE` value for INTERVAL columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_INTERVAL`. The catalog-level Arrow type
+/// is `Interval(MonthDayNano)`; the stored physical type is `LargeBinary`
+/// (16 bytes per row) on BOTH formats.
+const BASIN_TYPE_INTERVAL: &str = "INTERVAL";
+
+/// Width of one stored interval value: months(i32) + days(i32) + nanos(i64).
+pub(crate) const INTERVAL_STORAGE_LEN: usize = 16;
+
+/// Encode one `IntervalMonthDayNano` into its 16-byte little-endian storage
+/// form: `months(i32) | days(i32) | nanos(i64)`.
+///
+/// The three fields are kept SEPARATE deliberately. PostgreSQL's interval is
+/// not normalisable — `INTERVAL '1 mon'` (1, 0, 0) and `INTERVAL '30 days'`
+/// (0, 30, 0) are distinct values (a month is not always 30 days), and any
+/// encoding that folded them into a single scalar would silently corrupt
+/// them into each other.
+pub(crate) fn encode_interval_mdn(v: arrow_buffer::IntervalMonthDayNano) -> [u8; 16] {
+    let mut buf = [0u8; INTERVAL_STORAGE_LEN];
+    buf[0..4].copy_from_slice(&v.months.to_le_bytes());
+    buf[4..8].copy_from_slice(&v.days.to_le_bytes());
+    buf[8..16].copy_from_slice(&v.nanoseconds.to_le_bytes());
+    buf
+}
+
+/// Inverse of [`encode_interval_mdn`]. Returns `None` for a blob that is not
+/// exactly 16 bytes (corruption guard — the caller surfaces it as NULL rather
+/// than reading past the end of a foreign BYTEA).
+pub(crate) fn decode_interval_mdn(bytes: &[u8]) -> Option<arrow_buffer::IntervalMonthDayNano> {
+    if bytes.len() != INTERVAL_STORAGE_LEN {
+        return None;
+    }
+    let months = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let days = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let mut n = [0u8; 8];
+    n.copy_from_slice(&bytes[8..16]);
+    let nanoseconds = i64::from_le_bytes(n);
+    Some(arrow_buffer::IntervalMonthDayNano {
+        months,
+        days,
+        nanoseconds,
+    })
+}
+
+/// Returns `true` iff `field` is an interval column — Arrow
+/// `Interval(MonthDayNano)`. Unlike the UUID / POINT predicates this does NOT
+/// also require the `BASIN_TYPE` marker: `Interval(MonthDayNano)` is not a
+/// physical type any other Basin logical type rides on, and a batch that
+/// reaches the writer with an unmarked interval column would otherwise fail
+/// the encode outright instead of being stored. The marker IS re-stamped on
+/// the rewritten field so the file itself carries it.
+fn field_is_interval(field: &Field) -> bool {
+    matches!(
+        field.data_type(),
+        DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano)
+    )
+}
+
+/// Write-side reinterpretation: `Interval(MonthDayNano)` → `LargeBinary`,
+/// 16 bytes per row (`encode_interval_mdn`). Runs for both Vortex and
+/// Parquet — neither codec can encode the Arrow interval type at all.
+///
+/// The rewritten field keeps its existing metadata and gains
+/// `BASIN_TYPE=INTERVAL` if it was missing, so the on-disk file identifies
+/// itself. (The read path normally recovers the marker by re-stamping from
+/// the catalog schema, since both codecs drop Arrow field metadata.)
+///
+/// Returns `None` when no column needs translation — the caller reuses the
+/// original `batch` without an Arc-clone.
+fn interval_to_large_binary(batch: &RecordBatch) -> Option<RecordBatch> {
+    use arrow_array::{Array, IntervalMonthDayNanoArray, LargeBinaryArray};
+
+    let schema = batch.schema();
+    let needs_xlate = schema.fields().iter().any(|f| field_is_interval(f));
+    if !needs_xlate {
+        return None;
+    }
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, f) in schema.fields().iter().enumerate() {
+        if field_is_interval(f) {
+            let src = batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .expect("Interval(MonthDayNano) column must be IntervalMonthDayNanoArray");
+            let len = src.len();
+            let mut builder = arrow_array::builder::LargeBinaryBuilder::with_capacity(
+                len,
+                len * INTERVAL_STORAGE_LEN,
+            );
+            for r in 0..len {
+                if src.is_null(r) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(encode_interval_mdn(src.value(r)));
+                }
+            }
+            let arr: LargeBinaryArray = builder.finish();
+            let mut md = f.metadata().clone();
+            md.entry(BASIN_TYPE_KEY.to_string())
+                .or_insert_with(|| BASIN_TYPE_INTERVAL.to_string());
+            let new_field =
+                Field::new(f.name(), DataType::LargeBinary, f.is_nullable()).with_metadata(md);
+            new_fields.push(new_field);
+            new_cols.push(std::sync::Arc::new(arr));
+        } else {
+            new_fields.push(f.as_ref().clone());
+            new_cols.push(batch.column(i).clone());
+        }
+    }
+    let new_schema = std::sync::Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    Some(
+        RecordBatch::try_new(new_schema, new_cols)
+            .expect("interval_to_large_binary: metadata-only schema replacement cannot fail"),
+    )
+}
 
 /// Returns `true` iff `field` carries the `BASIN_TYPE=UUID` marker AND has
 /// the physical type `FixedSizeBinary(16)` (the catalog-declared shape for
@@ -1433,6 +1576,117 @@ mod tests {
         let id_arr: Int64Array = ids.iter().copied().collect();
         let name_arr: StringArray = names.iter().map(|s| Some(*s)).collect();
         RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(name_arr)]).unwrap()
+    }
+
+    /// The 16-byte interval codec must be exactly symmetric, and must keep
+    /// months, days and nanos in their OWN slots.
+    ///
+    /// `INTERVAL '1 mon'` and `INTERVAL '30 days'` are DIFFERENT PostgreSQL
+    /// values (verified live on PG 18.2: `SELECT INTERVAL '1 mon' - INTERVAL
+    /// '30 days'` prints `1 mon -30 days`, not `00:00:00`). The rejected
+    /// "Int64 microseconds + BASIN_TYPE sidecar" encoding would have stored
+    /// both as the same scalar; the `assert_ne!` below is what forbids
+    /// regressing to any encoding that can.
+    #[test]
+    fn interval_codec_keeps_months_days_and_nanos_apart() {
+        use arrow_buffer::IntervalMonthDayNano;
+
+        let cases = [
+            IntervalMonthDayNano::new(1, 0, 0),                 // 1 mon
+            IntervalMonthDayNano::new(0, 30, 0),                // 30 days
+            IntervalMonthDayNano::new(0, -3, 0),                // -3 days
+            IntervalMonthDayNano::new(0, 0, 0),                 // 00:00:00
+            IntervalMonthDayNano::new(0, 1, 7_200_000_000_000), // 1 day 02:00:00
+            IntervalMonthDayNano::new(-14, -400, -1),           // all three negative
+            IntervalMonthDayNano::new(i32::MIN, i32::MAX, i64::MIN),
+            IntervalMonthDayNano::new(i32::MAX, i32::MIN, i64::MAX),
+        ];
+        for v in cases {
+            let enc = encode_interval_mdn(v);
+            assert_eq!(enc.len(), INTERVAL_STORAGE_LEN);
+            assert_eq!(decode_interval_mdn(&enc), Some(v), "round-trip of {v:?}");
+        }
+
+        let one_month = encode_interval_mdn(IntervalMonthDayNano::new(1, 0, 0));
+        let thirty_days = encode_interval_mdn(IntervalMonthDayNano::new(0, 30, 0));
+        assert_ne!(
+            one_month, thirty_days,
+            "INTERVAL '1 mon' and INTERVAL '30 days' must not share a stored form"
+        );
+
+        // Corruption guard: anything that is not exactly 16 bytes decodes to
+        // None rather than reading past the end of a foreign blob.
+        assert_eq!(decode_interval_mdn(&[]), None);
+        assert_eq!(decode_interval_mdn(&[0u8; 15]), None);
+        assert_eq!(decode_interval_mdn(&[0u8; 17]), None);
+    }
+
+    /// The write-side translation must rewrite EVERY interval column to
+    /// `LargeBinary` (both formats need it — neither codec can encode the
+    /// Arrow interval type), stamp `BASIN_TYPE=INTERVAL`, preserve the null
+    /// mask, and leave every other column untouched.
+    #[test]
+    fn interval_to_large_binary_rewrites_only_interval_columns() {
+        use arrow_array::{Array, IntervalMonthDayNanoArray, LargeBinaryArray};
+        use arrow_buffer::IntervalMonthDayNano;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "iv",
+                DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
+                true,
+            ),
+            Field::new("blob", DataType::LargeBinary, true),
+        ]));
+        let ivs: IntervalMonthDayNanoArray = vec![
+            Some(IntervalMonthDayNano::new(1, 0, 0)),
+            None,
+            Some(IntervalMonthDayNano::new(0, 30, 0)),
+        ]
+        .into_iter()
+        .collect();
+        let blobs: LargeBinaryArray = vec![Some(&b"raw"[..]), None, Some(&b"bytes"[..])]
+            .into_iter()
+            .collect();
+        let b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+                Arc::new(ivs),
+                Arc::new(blobs),
+            ],
+        )
+        .unwrap();
+
+        let out = interval_to_large_binary(&b).expect("interval column needs translation");
+        let f = out.schema().field(1).clone();
+        assert_eq!(f.data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()),
+            Some(BASIN_TYPE_INTERVAL),
+            "the rewritten column must carry the marker the read path keys off"
+        );
+        // The unmarked LargeBinary column is a genuine BYTEA and must stay one.
+        assert!(out.schema().field(2).metadata().is_empty());
+
+        let stored = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert!(stored.is_null(1), "NULL interval must stay NULL");
+        assert_eq!(
+            decode_interval_mdn(stored.value(0)),
+            Some(IntervalMonthDayNano::new(1, 0, 0))
+        );
+        assert_eq!(
+            decode_interval_mdn(stored.value(2)),
+            Some(IntervalMonthDayNano::new(0, 30, 0))
+        );
+
+        // A batch with no interval column is left alone (no Arc-clone).
+        assert!(interval_to_large_binary(&batch(&[1], &["a"])).is_none());
     }
 
     fn ids(b: &RecordBatch) -> Vec<i64> {

@@ -1342,6 +1342,10 @@ async fn read_one(
             // physical types so order is incidental.
             let s = catalog_schema_uuid_to_decimal256(s.as_ref());
             let s = catalog_schema_point_to_large_binary(&s);
+            // INTERVAL(MonthDayNano) → LargeBinary. Same reason as the two
+            // above, but this disguise is not Vortex-specific: Parquet
+            // cannot encode the Arrow interval type either.
+            let s = catalog_schema_interval_to_large_binary(&s);
             Arc::new(s)
         });
 
@@ -2891,7 +2895,15 @@ where
                     // the catalog schema — Parquet's `ArrowWriter` round-trip
                     // does not re-apply the `ARROW:schema` blob's field
                     // metadata to the per-batch schema the reader emits.
-                    restamp_field_metadata_from_catalog(synth, catalog_schema_for_stamp.as_ref())
+                    let stamped = restamp_field_metadata_from_catalog(
+                        synth,
+                        catalog_schema_for_stamp.as_ref(),
+                    )?;
+                    // INTERVAL-as-LargeBinary read-side inverse. Parquet
+                    // cannot encode `Interval(MonthDayNano)` any more than
+                    // Vortex can, so this disguise — unlike UUID's and
+                    // POINT's — is present on the Parquet path too.
+                    Ok(large_binary_to_interval(stamped))
                 });
 
                 // Page-cache write-through with the synthesised batches.
@@ -3096,7 +3108,12 @@ where
         // `ARROW:schema` blob's field metadata to the per-batch schema the
         // reader emits, so semantic types (MONEY, INET, …) would otherwise
         // be downgraded to their physical Arrow type post-storage.
-        restamp_field_metadata_from_catalog(batch, catalog_schema_for_stamp.as_ref())
+        let stamped = restamp_field_metadata_from_catalog(batch, catalog_schema_for_stamp.as_ref())?;
+        // INTERVAL-as-LargeBinary read-side inverse — see the synth-batch
+        // site above. Parquet cannot encode `Interval(MonthDayNano)`, so
+        // interval columns arrive here as LargeBinary/Binary and are decoded
+        // back before anything above the storage trait sees them.
+        Ok(large_binary_to_interval(stamped))
     });
 
     // Page-cache write-through is keyed on (file, projection, filters)
@@ -3455,6 +3472,11 @@ fn vortex_project_and_filter_limited(
         // metadata pre-condition applies (the restamp above retags the
         // column with `BASIN_TYPE=POINT`).
         let restored = large_binary_to_point_fsb(restored);
+        // INTERVAL-as-LargeBinary read-side inverse. Same metadata
+        // pre-condition as POINT: the restamp above retags the column with
+        // `BASIN_TYPE=INTERVAL`, which is what distinguishes a stored
+        // interval from a genuine BYTEA.
+        let restored = large_binary_to_interval(restored);
         out.push(restored);
     }
     Ok(out)
@@ -3714,6 +3736,134 @@ const BASIN_TYPE_UUID: &str = "UUID";
 /// `basin_engine::types::BASIN_TYPE_POINT`. Vortex stores POINT as
 /// `LargeBinary`; restamping uses this marker to rebuild FSB(21).
 const BASIN_TYPE_POINT: &str = "POINT";
+/// `BASIN_TYPE` value for INTERVAL columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_INTERVAL`. BOTH formats store interval
+/// columns as `LargeBinary` (16 bytes: months|days|nanos, little-endian) —
+/// neither Vortex nor Parquet can encode `Interval(MonthDayNano)`.
+const BASIN_TYPE_INTERVAL: &str = "INTERVAL";
+
+/// `true` when `f` is a stored interval column coming back from a codec:
+/// a binary-family physical type carrying `BASIN_TYPE=INTERVAL`. Both
+/// predicates must hold so a genuine BYTEA column is never miscoerced.
+///
+/// Vortex surfaces the on-disk `LargeBinary` as LargeBinary, Binary or
+/// BinaryView depending on layout; Parquet round-trips it as LargeBinary or
+/// Binary. All four are accepted.
+fn field_is_stored_interval(f: &Field) -> bool {
+    matches!(
+        f.data_type(),
+        arrow_schema::DataType::LargeBinary
+            | arrow_schema::DataType::Binary
+            | arrow_schema::DataType::BinaryView
+    ) && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_INTERVAL)
+}
+
+/// Translate the catalog schema so INTERVAL columns claim `LargeBinary`
+/// instead of `Interval(MonthDayNano)` — the physical type the writer
+/// actually stored. Handing Vortex the catalog's interval type makes its
+/// executor attempt an unsupported cast at scan time. The post-decode
+/// inverse `large_binary_to_interval` rebuilds the interval layout.
+fn catalog_schema_interval_to_large_binary(schema: &Schema) -> Schema {
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if matches!(
+                f.data_type(),
+                arrow_schema::DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano)
+            ) {
+                let mut md = f.metadata().clone();
+                md.entry(BASIN_TYPE_KEY.to_string())
+                    .or_insert_with(|| BASIN_TYPE_INTERVAL.to_string());
+                Field::new(
+                    f.name(),
+                    arrow_schema::DataType::LargeBinary,
+                    f.is_nullable(),
+                )
+                .with_metadata(md)
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(new_fields, schema.metadata().clone())
+}
+
+/// Read-side inverse of `writer::interval_to_large_binary`. For every column
+/// with a binary-family Arrow type + `BASIN_TYPE=INTERVAL`, decode the
+/// 16-byte `months|days|nanos` little-endian payload back into
+/// `Interval(MonthDayNano)` so every layer above the storage trait keeps
+/// seeing PG intervals.
+///
+/// Runs on BOTH format paths (Vortex and Parquet) — unlike the UUID and
+/// POINT inverses, which are Vortex-only.
+///
+/// A row whose blob is not exactly 16 bytes decodes to NULL rather than
+/// panicking; that shape is only reachable through corruption, since the
+/// marker is only ever stamped by the writer on a column it encoded itself.
+fn large_binary_to_interval(batch: RecordBatch) -> RecordBatch {
+    use arrow_array::{
+        Array, BinaryArray, BinaryViewArray, IntervalMonthDayNanoArray, LargeBinaryArray,
+    };
+
+    let schema = batch.schema();
+    if !schema.fields().iter().any(|f| field_is_stored_interval(f)) {
+        return batch;
+    }
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, f) in schema.fields().iter().enumerate() {
+        if field_is_stored_interval(f) {
+            let col = batch.column(i);
+            let len = col.len();
+            let value_at = |r: usize| -> Option<&[u8]> {
+                match col.data_type() {
+                    arrow_schema::DataType::LargeBinary => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<LargeBinaryArray>()
+                            .expect("LargeBinaryArray for INTERVAL");
+                        (!a.is_null(r)).then(|| a.value(r))
+                    }
+                    arrow_schema::DataType::Binary => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<BinaryArray>()
+                            .expect("BinaryArray for INTERVAL");
+                        (!a.is_null(r)).then(|| a.value(r))
+                    }
+                    _ => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<BinaryViewArray>()
+                            .expect("BinaryViewArray for INTERVAL");
+                        (!a.is_null(r)).then(|| a.value(r))
+                    }
+                }
+            };
+            let arr: IntervalMonthDayNanoArray = (0..len)
+                .map(|r| value_at(r).and_then(crate::writer::decode_interval_mdn))
+                .collect();
+            let new_field = Field::new(
+                f.name(),
+                arrow_schema::DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
+                f.is_nullable(),
+            )
+            .with_metadata(f.metadata().clone());
+            new_fields.push(new_field);
+            new_cols.push(Arc::new(arr));
+        } else {
+            new_fields.push(f.as_ref().clone());
+            new_cols.push(batch.column(i).clone());
+        }
+    }
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, new_cols)
+        .expect("large_binary_to_interval: schema swap cannot fail")
+}
 
 /// ADR 0024 — translate the catalog schema so UUID columns claim
 /// `Decimal256(39, 0)` instead of `FixedSizeBinary(16)`. Vortex 0.70 has
