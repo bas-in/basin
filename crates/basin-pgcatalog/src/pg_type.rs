@@ -810,6 +810,45 @@ mod tests {
         );
     }
 
+    /// Pins the exact column order and Arrow type of `pg_type` against live
+    /// PostgreSQL 18.2's `attnum` order, so a future edit cannot silently
+    /// reorder or rename a column out from under positional readers.
+    /// Verified live via:
+    ///
+    /// ```sql
+    /// SELECT attname, atttypid::regtype, attnum, attnotnull
+    ///   FROM pg_attribute
+    ///  WHERE attrelid = 'pg_catalog.pg_type'::regclass AND attnum > 0
+    ///  ORDER BY attnum;
+    /// ```
+    ///
+    /// which reports this module's 8 columns at attnum 1, 2, 3, 5, 7, 8, 14,
+    /// 15 respectively — already monotonically increasing, so (unlike
+    /// `pg_class` and `pg_attribute`) no reorder was needed here; this test
+    /// is the audit's record of that, and a guard against regression.
+    #[test]
+    fn schema_matches_live_postgres_column_order_and_types() {
+        let schema = PgType.schema();
+        let got: Vec<(&str, DataType, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type().clone(), f.is_nullable()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("oid", DataType::UInt32, false),
+                ("typname", DataType::Utf8, false),
+                ("typnamespace", DataType::UInt32, false),
+                ("typlen", DataType::Int16, false),
+                ("typtype", DataType::Utf8, false),
+                ("typcategory", DataType::Utf8, false),
+                ("typelem", DataType::UInt32, false),
+                ("typarray", DataType::UInt32, false),
+            ]
+        );
+    }
+
     #[test]
     fn name_is_pg_type() {
         assert_eq!(PgType.name(), "pg_type");

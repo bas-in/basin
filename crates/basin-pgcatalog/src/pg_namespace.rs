@@ -160,4 +160,37 @@ mod tests {
         let batch = PgNamespace.scan(&MockCatalog::new(), &[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
     }
+
+    /// Pins the exact column set, order, and Arrow type of `pg_namespace`
+    /// against live PostgreSQL 18.2's `attnum` order, so a future edit
+    /// cannot silently reorder or rename a column out from under positional
+    /// readers. Verified live via:
+    ///
+    /// ```sql
+    /// SELECT attname, atttypid::regtype, attnum, attnotnull
+    ///   FROM pg_attribute
+    ///  WHERE attrelid = 'pg_catalog.pg_namespace'::regclass AND attnum > 0
+    ///  ORDER BY attnum;
+    /// ```
+    ///
+    /// which reports `oid` (1), `nspname` (2), `nspowner` (3), `nspacl` (4,
+    /// not reported here) — this module's order already matched; this test
+    /// is the audit's record of that, and a guard against regression.
+    #[test]
+    fn schema_matches_live_postgres_column_order_and_types() {
+        let schema = PgNamespace.schema();
+        let got: Vec<(&str, DataType, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type().clone(), f.is_nullable()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("oid", DataType::UInt32, false),
+                ("nspname", DataType::Utf8, false),
+                ("nspowner", DataType::UInt32, false),
+            ]
+        );
+    }
 }

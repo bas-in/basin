@@ -68,6 +68,15 @@
 //!   has no notion of them — which is why `attnum` being negative for system
 //!   columns is a documented fact about real Postgres, not a case this
 //!   relation's tests exercise.
+//! - **Column order**, re-verified against PostgreSQL 18.2's real `attnum`
+//!   sequence (`attrelid` 1, `attname` 2, `atttypid` 3, `attlen` 4, `attnum`
+//!   5, `atttypmod` 6, `attnotnull` 12, `atthasdef` 13, `attidentity` 15,
+//!   `attgenerated` 16, `attisdropped` 17): `attidentity`/`attgenerated`
+//!   precede `attisdropped` in real Postgres. A prior version of this module
+//!   had `attisdropped` before `attidentity`/`attgenerated` in the
+//!   `arrow_schema()` field order — wrong relative to `attnum` — fixed by
+//!   this audit; see `schema_matches_live_postgres_column_order_and_types`
+//!   below, which pins it.
 
 use std::sync::Arc;
 
@@ -94,9 +103,9 @@ struct AttributeRow {
     atttypmod: i32,
     attnotnull: bool,
     atthasdef: bool,
-    attisdropped: bool,
     attidentity: Option<char>,
     attgenerated: Option<char>,
+    attisdropped: bool,
 }
 
 impl AttributeRow {
@@ -112,7 +121,6 @@ impl AttributeRow {
             "atttypmod" => Value::Int(self.atttypmod as i64),
             "attnotnull" => Value::Bool(self.attnotnull),
             "atthasdef" => Value::Bool(self.atthasdef),
-            "attisdropped" => Value::Bool(self.attisdropped),
             // The "unset" value round-trips to the empty string, not a `'\0'`
             // byte — see the module docs.
             "attidentity" => {
@@ -121,6 +129,7 @@ impl AttributeRow {
             "attgenerated" => {
                 Value::Text(self.attgenerated.map(|c| c.to_string()).unwrap_or_default())
             }
+            "attisdropped" => Value::Bool(self.attisdropped),
             _ => return None,
         })
     }
@@ -141,9 +150,9 @@ impl PgAttribute {
             Field::new("atttypmod", DataType::Int32, false),
             Field::new("attnotnull", DataType::Boolean, false),
             Field::new("atthasdef", DataType::Boolean, false),
-            Field::new("attisdropped", DataType::Boolean, false),
             Field::new("attidentity", DataType::Utf8, false),
             Field::new("attgenerated", DataType::Utf8, false),
+            Field::new("attisdropped", DataType::Boolean, false),
         ]))
     }
 }
@@ -191,9 +200,9 @@ impl crate::SystemView for PgAttribute {
                     atttypmod: col.atttypmod,
                     attnotnull: col.not_null,
                     atthasdef,
-                    attisdropped: col.attisdropped,
                     attidentity: col.attidentity,
                     attgenerated: col.attgenerated,
+                    attisdropped: col.attisdropped,
                 });
             }
         }
@@ -215,7 +224,6 @@ impl crate::SystemView for PgAttribute {
         let atttypmods: Int32Array = rows.iter().map(|r| r.atttypmod).collect();
         let attnotnulls: BooleanArray = rows.iter().map(|r| r.attnotnull).collect();
         let atthasdefs: BooleanArray = rows.iter().map(|r| r.atthasdef).collect();
-        let attisdroppeds: BooleanArray = rows.iter().map(|r| r.attisdropped).collect();
         let attidentities: StringArray = rows
             .iter()
             .map(|r| Some(r.attidentity.map(|c| c.to_string()).unwrap_or_default()))
@@ -224,6 +232,7 @@ impl crate::SystemView for PgAttribute {
             .iter()
             .map(|r| Some(r.attgenerated.map(|c| c.to_string()).unwrap_or_default()))
             .collect();
+        let attisdroppeds: BooleanArray = rows.iter().map(|r| r.attisdropped).collect();
 
         Ok(RecordBatch::try_new(
             schema,
@@ -236,9 +245,9 @@ impl crate::SystemView for PgAttribute {
                 Arc::new(atttypmods),
                 Arc::new(attnotnulls),
                 Arc::new(atthasdefs),
-                Arc::new(attisdroppeds),
                 Arc::new(attidentities),
                 Arc::new(attgenerateds),
+                Arc::new(attisdroppeds),
             ],
         )?)
     }
@@ -492,5 +501,47 @@ mod tests {
     #[test]
     fn name_is_pg_attribute() {
         assert_eq!(PgAttribute.name(), "pg_attribute");
+    }
+
+    /// Pins the exact column set, order, and Arrow type of `pg_attribute`
+    /// against live PostgreSQL 18.2's `attnum` order, so a future edit
+    /// cannot silently reorder or rename a column out from under positional
+    /// readers (psql's `\d`, `pg_dump`, and ORM introspection all read this
+    /// positionally as well as by name). Verified live via:
+    ///
+    /// ```sql
+    /// SELECT attname, atttypid::regtype, attnum, attnotnull
+    ///   FROM pg_attribute
+    ///  WHERE attrelid = 'pg_catalog.pg_attribute'::regclass AND attnum > 0
+    ///  ORDER BY attnum;
+    /// ```
+    ///
+    /// which reports `attidentity` (15) and `attgenerated` (16) *before*
+    /// `attisdropped` (17) — the order this crate had backwards until this
+    /// audit.
+    #[test]
+    fn schema_matches_live_postgres_column_order_and_types() {
+        let schema = PgAttribute.schema();
+        let got: Vec<(&str, DataType, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type().clone(), f.is_nullable()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("attrelid", DataType::UInt32, false),
+                ("attname", DataType::Utf8, false),
+                ("atttypid", DataType::UInt32, false),
+                ("attlen", DataType::Int16, false),
+                ("attnum", DataType::Int16, false),
+                ("atttypmod", DataType::Int32, false),
+                ("attnotnull", DataType::Boolean, false),
+                ("atthasdef", DataType::Boolean, false),
+                ("attidentity", DataType::Utf8, false),
+                ("attgenerated", DataType::Utf8, false),
+                ("attisdropped", DataType::Boolean, false),
+            ]
+        );
     }
 }

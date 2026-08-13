@@ -9,9 +9,17 @@
 //! [`CatalogSource`] methods and proves the trait's shape is usable, not just
 //! declared.
 //!
-//! Live-verified column set and types (`\d pg_class`): `oid` oid, `relname`
-//! name, `relnamespace` oid, `relowner` oid, `relkind` "char", `relnatts`
-//! smallint, `relhasindex` boolean.
+//! Live-verified column set, types, and **order** (`\d pg_class` /
+//! `SELECT attname, atttypid::regtype, attnum FROM pg_attribute WHERE
+//! attrelid = 'pg_catalog.pg_class'::regclass AND attnum > 0 ORDER BY
+//! attnum`, PostgreSQL 18.2): `oid` oid (attnum 1), `relname` name (2),
+//! `relnamespace` oid (3), `relowner` oid (6), `relhasindex` boolean (15),
+//! `relkind` "char" (18), `relnatts` smallint (19). The gaps in that attnum
+//! sequence are real `pg_class` columns this crate does not report (see
+//! above); the columns it does report must stay in *this* relative order —
+//! `relhasindex` precedes `relkind`, which precedes `relnatts`, in real
+//! Postgres, not the alphabetical-looking order it is tempting to write them
+//! in.
 
 use std::sync::Arc;
 
@@ -35,9 +43,9 @@ impl PgClass {
             Field::new("relname", DataType::Utf8, false),
             Field::new("relnamespace", DataType::UInt32, false),
             Field::new("relowner", DataType::UInt32, false),
+            Field::new("relhasindex", DataType::Boolean, false),
             Field::new("relkind", DataType::Utf8, false),
             Field::new("relnatts", DataType::Int16, false),
-            Field::new("relhasindex", DataType::Boolean, false),
         ]))
     }
 }
@@ -57,9 +65,9 @@ fn row_value(row: &ClassRow, column: &str) -> Option<Value> {
         "relname" => Value::Text(row.table.name.clone()),
         "relnamespace" => Value::Oid(row.table.namespace),
         "relowner" => Value::Oid(row.table.owner),
+        "relhasindex" => Value::Bool(row.relhasindex),
         "relkind" => Value::Text(row.table.kind.as_char().to_string()),
         "relnatts" => Value::Int(row.relnatts as i64),
-        "relhasindex" => Value::Bool(row.relhasindex),
         _ => return None,
     })
 }
@@ -107,12 +115,12 @@ impl crate::SystemView for PgClass {
         let relnames: StringArray = rows.iter().map(|r| Some(r.table.name.as_str())).collect();
         let relnamespaces: UInt32Array = rows.iter().map(|r| r.table.namespace.get()).collect();
         let relowners: UInt32Array = rows.iter().map(|r| r.table.owner.get()).collect();
+        let relhasindexes: BooleanArray = rows.iter().map(|r| r.relhasindex).collect();
         let relkinds: StringArray = rows
             .iter()
             .map(|r| Some(r.table.kind.as_char().to_string()))
             .collect();
         let relnatts: Int16Array = rows.iter().map(|r| r.relnatts).collect();
-        let relhasindexes: BooleanArray = rows.iter().map(|r| r.relhasindex).collect();
 
         Ok(RecordBatch::try_new(
             schema,
@@ -121,9 +129,9 @@ impl crate::SystemView for PgClass {
                 Arc::new(relnames),
                 Arc::new(relnamespaces),
                 Arc::new(relowners),
+                Arc::new(relhasindexes),
                 Arc::new(relkinds),
                 Arc::new(relnatts),
-                Arc::new(relhasindexes),
             ],
         )?)
     }
@@ -274,5 +282,42 @@ mod tests {
     fn empty_catalog_yields_zero_rows() {
         let batch = PgClass.scan(&MockCatalog::new(), &[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
+    }
+
+    /// Pins the exact column set, order, and Arrow type of `pg_class` against
+    /// live PostgreSQL 18.2's `attnum` order, so a future edit cannot
+    /// silently reorder or rename a column out from under positional readers
+    /// (psql's `\d`, `pg_dump`, and ORM introspection all read this
+    /// positionally as well as by name). Verified live via:
+    ///
+    /// ```sql
+    /// SELECT attname, atttypid::regtype, attnum, attnotnull
+    ///   FROM pg_attribute
+    ///  WHERE attrelid = 'pg_catalog.pg_class'::regclass AND attnum > 0
+    ///  ORDER BY attnum;
+    /// ```
+    ///
+    /// which reports `relhasindex` at attnum 15, *before* `relkind` (18) and
+    /// `relnatts` (19) — the order this crate had backwards until this audit.
+    #[test]
+    fn schema_matches_live_postgres_column_order_and_types() {
+        let schema = PgClass.schema();
+        let got: Vec<(&str, DataType, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type().clone(), f.is_nullable()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("oid", DataType::UInt32, false),
+                ("relname", DataType::Utf8, false),
+                ("relnamespace", DataType::UInt32, false),
+                ("relowner", DataType::UInt32, false),
+                ("relhasindex", DataType::Boolean, false),
+                ("relkind", DataType::Utf8, false),
+                ("relnatts", DataType::Int16, false),
+            ]
+        );
     }
 }
