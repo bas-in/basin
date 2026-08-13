@@ -14,3 +14,14 @@ publish.workspace = true
 # See docs/migration/df-removal/08-ir-design.md §1.
 [dependencies]
 arrow-schema = { workspace = true }
+
+# Dev-only: `tests/type_matrix.rs` is a differential harness that checks this
+# crate's cast/operator/type tables against a LIVE PostgreSQL when
+# `PG_DIFF_TEST_DSN` is set, following the same DSN convention as
+# `crates/basin-engine/tests/differential_pg.rs` and
+# `tests/integration/tests/differential_pg.rs`. It skips cleanly (and loudly)
+# without a configured server, so this stays test-only — see that crate's
+# Cargo.toml comment for the same justification.
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }

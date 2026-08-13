@@ -32,3 +32,21 @@ basin-common = { workspace = true }
 object_store = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# `tests/catalog_fidelity.rs` diffs every relation's declared arrow_schema()
+# against a live PostgreSQL's real pg_attribute layout (PG_DIFF_TEST_DSN,
+# same convention as crates/basin-engine/tests/differential_pg.rs). Dev-only:
+# a postgres client must never reach this crate's production dependency
+# graph (arrow-array, arrow-schema, basin-pgtype only — see this file's own
+# module docs above).
+tokio-postgres = { workspace = true }
+
+# `catalog_fidelity` is `harness = false` so its output is never captured
+# and hidden on success the way a normal `#[test]`'s stdout is — a skip (no
+# PG_DIFF_TEST_DSN) must print an explicit banner every run, not silently
+# look identical to "1 passed" the way libtest's default summary would (see
+# scripts/check-differential.sh's module docs for why that distinction
+# matters).
+[[test]]
+name = "catalog_fidelity"
+path = "tests/catalog_fidelity.rs"
+harness = false
