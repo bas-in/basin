@@ -348,7 +348,7 @@ fn build_inner(
             let cols: Vec<usize> = projection.iter().map(|c| c.0 as usize).collect();
             let filters: Vec<Expr> = filters
                 .iter()
-                .map(|f| bind_outer(f, outer))
+                .map(|f| bind_outer(f, outer, tables, dml, budget, ctes))
                 .collect::<Result<_, _>>()?;
             let (source, pushed) = tables
                 .open(*table, &cols, &filters)
@@ -374,14 +374,17 @@ fn build_inner(
 
         LogicalPlan::Filter { input, predicate } => {
             let child = build_inner(input, tables, dml, budget, ctes, outer)?;
-            Ok(Box::new(Filter::new(child, bind_outer(predicate, outer)?)))
+            Ok(Box::new(Filter::new(
+                child,
+                bind_outer(predicate, outer, tables, dml, budget, ctes)?,
+            )))
         }
 
         LogicalPlan::Project { input, exprs } => {
             let child = build_inner(input, tables, dml, budget, ctes, outer)?;
             let exprs: Vec<(Expr, String)> = exprs
                 .iter()
-                .map(|(e, n)| Ok((bind_outer(e, outer)?, n.clone())))
+                .map(|(e, n)| Ok((bind_outer(e, outer, tables, dml, budget, ctes)?, n.clone())))
                 .collect::<Result<_, BuildError>>()?;
             Ok(Box::new(Project::new(child, exprs)?))
         }
@@ -399,8 +402,15 @@ fn build_inner(
             if *with_ties {
                 return Err(BuildError::Unsupported("FETCH … WITH TIES".into()));
             }
-            let fetch = fetch.as_ref().map(|e| bind_outer(e, outer)).transpose()?;
-            let skip_n = match skip.as_ref().map(|e| bind_outer(e, outer)).transpose()? {
+            let fetch = fetch
+                .as_ref()
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                .transpose()?;
+            let skip_n = match skip
+                .as_ref()
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                .transpose()?
+            {
                 Some(e) => Some(
                     const_usize(&e)
                         .ok_or_else(|| BuildError::Unsupported("non-constant OFFSET".into()))?,
@@ -426,7 +436,7 @@ fn build_inner(
             match (input.as_ref(), skip_n, fetch_n) {
                 (LogicalPlan::Sort { input: si, keys }, None, Some(k)) => {
                     let child = build_inner(si, tables, dml, budget, ctes, outer)?;
-                    let keys = bind_sort_keys(keys, outer)?;
+                    let keys = bind_sort_keys(keys, outer, tables, dml, budget, ctes)?;
                     Ok(Box::new(TopK::new(child, sort_keys(&keys)?, k)))
                 }
                 _ => {
@@ -438,7 +448,7 @@ fn build_inner(
 
         LogicalPlan::Sort { input, keys } => {
             let child = build_inner(input, tables, dml, budget, ctes, outer)?;
-            let keys = bind_sort_keys(keys, outer)?;
+            let keys = bind_sort_keys(keys, outer, tables, dml, budget, ctes)?;
             Ok(Box::new(Sort::new(child, sort_keys(&keys)?, budget)))
         }
 
@@ -456,7 +466,7 @@ fn build_inner(
             let child = build_inner(input, tables, dml, budget, ctes, outer)?;
             let group: Vec<Expr> = group
                 .iter()
-                .map(|e| bind_outer(e, outer))
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
                 .collect::<Result<_, _>>()?;
             let group_cols = group
                 .iter()
@@ -464,7 +474,7 @@ fn build_inner(
                 .collect::<Result<Vec<_>, _>>()?;
             let aggs: Vec<Expr> = aggs
                 .iter()
-                .map(|e| bind_outer(e, outer))
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
                 .collect::<Result<_, _>>()?;
             let specs = aggs
                 .iter()
@@ -491,8 +501,8 @@ fn build_inner(
             let mut lk = Vec::with_capacity(on.len());
             let mut rk = Vec::with_capacity(on.len());
             for (a, b) in on {
-                let a = bind_outer(a, outer)?;
-                let b = bind_outer(b, outer)?;
+                let a = bind_outer(a, outer, tables, dml, budget, ctes)?;
+                let b = bind_outer(b, outer, tables, dml, budget, ctes)?;
                 lk.push(column_index(&a).ok_or(BuildError::NonColumnKey("join"))?);
                 rk.push(column_index(&b).ok_or(BuildError::NonColumnKey("join"))?);
             }
@@ -584,7 +594,7 @@ fn build_inner(
                 .iter()
                 .map(|r| {
                     r.iter()
-                        .map(|e| bind_outer(e, outer))
+                        .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
                         .collect::<Result<_, _>>()
                 })
                 .collect::<Result<_, BuildError>>()?;
@@ -614,7 +624,7 @@ fn build_inner(
                 Some(exprs) => {
                     let exprs: Vec<Expr> = exprs
                         .iter()
-                        .map(|e| bind_outer(e, outer))
+                        .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
                         .collect::<Result<_, _>>()?;
                     let cols = exprs
                         .iter()
@@ -645,7 +655,7 @@ fn build_inner(
             let child = build_inner(input, tables, dml, budget, ctes, outer)?;
             let windows: Vec<Expr> = windows
                 .iter()
-                .map(|e| bind_outer(e, outer))
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
                 .collect::<Result<_, _>>()?;
             let (partition_by, order_by) = window_keys(&windows)?;
             let specs = windows
@@ -677,7 +687,12 @@ fn build_inner(
             let named: Vec<(Expr, String)> = srfs
                 .iter()
                 .enumerate()
-                .map(|(i, e)| Ok((bind_outer(e, outer)?, format!("srf{i}"))))
+                .map(|(i, e)| {
+                    Ok((
+                        bind_outer(e, outer, tables, dml, budget, ctes)?,
+                        format!("srf{i}"),
+                    ))
+                })
                 .collect::<Result<_, BuildError>>()?;
             Ok(Box::new(ProjectSet::new(child, named)?))
         }
@@ -745,7 +760,7 @@ fn build_inner(
             let want_returning = returning.is_some();
             let dml_op: Box<dyn Operator> =
                 Box::new(Insert::new(input_op, sink, action, want_returning));
-            wrap_returning(dml_op, returning, outer)
+            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes)
         }
 
         // `Update`/`Delete` carry no explicit input plan (unlike `Insert`) —
@@ -779,12 +794,18 @@ fn build_inner(
             };
             let scanned = build_inner(&scan, tables, dml, budget, ctes, outer)?;
             let matched: Box<dyn Operator> = match predicate {
-                Some(p) => Box::new(Filter::new(scanned, bind_outer(p, outer)?)),
+                Some(p) => Box::new(Filter::new(
+                    scanned,
+                    bind_outer(p, outer, tables, dml, budget, ctes)?,
+                )),
                 None => scanned,
             };
             let mut set_map: HashMap<usize, Expr> = HashMap::new();
             for (c, e) in set {
-                set_map.insert(c.0 as usize, bind_outer(e, outer)?);
+                set_map.insert(
+                    c.0 as usize,
+                    bind_outer(e, outer, tables, dml, budget, ctes)?,
+                );
             }
             let exprs: Vec<(Expr, String)> = (0..n)
                 .map(|i| {
@@ -807,7 +828,7 @@ fn build_inner(
                 key_cols,
                 want_returning,
             ));
-            wrap_returning(dml_op, returning, outer)
+            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes)
         }
 
         LogicalPlan::Delete {
@@ -835,13 +856,16 @@ fn build_inner(
             };
             let scanned = build_inner(&scan, tables, dml, budget, ctes, outer)?;
             let matched: Box<dyn Operator> = match predicate {
-                Some(p) => Box::new(Filter::new(scanned, bind_outer(p, outer)?)),
+                Some(p) => Box::new(Filter::new(
+                    scanned,
+                    bind_outer(p, outer, tables, dml, budget, ctes)?,
+                )),
                 None => scanned,
             };
             let want_returning = returning.is_some();
             let dml_op: Box<dyn Operator> =
                 Box::new(Delete::new(matched, sink, key_cols, want_returning));
-            wrap_returning(dml_op, returning, outer)
+            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes)
         }
     }
 }
@@ -893,13 +917,17 @@ fn wrap_returning(
     dml_op: Box<dyn Operator>,
     returning: &Option<Vec<(Expr, String)>>,
     outer: Outer<'_>,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
 ) -> Result<Box<dyn Operator>, BuildError> {
     match returning {
         None => Ok(dml_op),
         Some(ret) => {
             let exprs: Vec<(Expr, String)> = ret
                 .iter()
-                .map(|(e, n)| Ok((bind_outer(e, outer)?, n.clone())))
+                .map(|(e, n)| Ok((bind_outer(e, outer, tables, dml, budget, ctes)?, n.clone())))
                 .collect::<Result<_, BuildError>>()?;
             Ok(Box::new(Project::new(dml_op, exprs)?))
         }
@@ -1137,21 +1165,37 @@ const OUTER_REF: u16 = 1;
 /// Bind `expr` to a specific outer row for a `LateralJoin`'s per-row
 /// rebuild or a `WITH RECURSIVE` recursive term's per-iteration rebuild
 /// (module docs: "constant-folding the correlated column references into
-/// literals, then building a fresh physical operator from that"). A no-op
-/// clone when `outer` is `None` — true everywhere except while rebuilding
-/// one of those two shapes.
-fn bind_outer(expr: &Expr, outer: Outer<'_>) -> Result<Expr, BuildError> {
-    match outer {
-        None => Ok(expr.clone()),
-        Some((batch, row)) => bind_outer_rec(expr, batch, row),
-    }
+/// literals, then building a fresh physical operator from that") — `outer`
+/// is `None` everywhere except while rebuilding one of those two shapes —
+/// AND fold every uncorrelated scalar subquery `expr` contains into its
+/// (once-evaluated) result, regardless of `outer`; see
+/// [`materialize_scalar_subquery`]. No longer a no-op clone when `outer` is
+/// `None`: that used to mean "nothing to do", but a plain, non-LATERAL
+/// `SELECT ... WHERE x = (SELECT ...)` reaches this exact path with `outer:
+/// None` and still has a subquery to fold.
+fn bind_outer(
+    expr: &Expr,
+    outer: Outer<'_>,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
+) -> Result<Expr, BuildError> {
+    bind_outer_rec(expr, outer, tables, dml, budget, ctes)
 }
 
-fn bind_sort_keys(keys: &[PlanSortKey], outer: Outer<'_>) -> Result<Vec<PlanSortKey>, BuildError> {
+fn bind_sort_keys(
+    keys: &[PlanSortKey],
+    outer: Outer<'_>,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
+) -> Result<Vec<PlanSortKey>, BuildError> {
     keys.iter()
         .map(|k| {
             Ok(PlanSortKey {
-                expr: bind_outer(&k.expr, outer)?,
+                expr: bind_outer(&k.expr, outer, tables, dml, budget, ctes)?,
                 descending: k.descending,
                 nulls_first: k.nulls_first,
             })
@@ -1161,31 +1205,52 @@ fn bind_sort_keys(keys: &[PlanSortKey], outer: Outer<'_>) -> Result<Vec<PlanSort
 
 /// The recursive worker behind [`bind_outer`]. Walks every `Expr` variant —
 /// mirroring `basin_plan::Expr::for_each_child`'s own exhaustive match —
-/// replacing `Column(relation == OUTER_REF)` with the corresponding literal
-/// from `batch`'s row `row`. `Subquery`'s own `subplan` is deliberately left
-/// untouched (its `operand`, which belongs to THIS query level, is not) —
-/// the same "a subquery is a separate query level" rule
-/// `Expr::for_each_child` already states for exactly this reason. Aggregate
-/// and window `ORDER BY` lists are left unbound: a correlated ordering
-/// inside an aggregate/window is a corner this builder does not reach today
-/// — narrower than the general case, not silently wrong, since any
-/// `Column(OUTER_REF)` actually hiding there simply survives into `eval`,
-/// which has no relation-0 column to resolve it against and errors instead
-/// of guessing.
-fn bind_outer_rec(expr: &Expr, batch: &RecordBatch, row: usize) -> Result<Expr, BuildError> {
+/// doing two unrelated rewrites in the same pass because both need the same
+/// exhaustive traversal and neither cares about the other:
+///
+/// 1. Replacing `Column(relation == OUTER_REF)` with the corresponding
+///    literal from `outer`'s row, when `outer` is `Some`.
+/// 2. Replacing an uncorrelated scalar subquery (`Subquery { kind: Scalar,
+///    operand: None, .. }`) with its once-evaluated result — see
+///    [`materialize_scalar_subquery`]. This runs regardless of `outer`.
+///
+/// `Subquery`'s own `subplan` is otherwise left untouched by (1) — its
+/// `operand`, which belongs to THIS query level, is not — the same "a
+/// subquery is a separate query level" rule `Expr::for_each_child` already
+/// states for exactly this reason; (2) is the one deliberate exception,
+/// because materializing IS building and running that separate query
+/// level, once, right here. Aggregate and window `ORDER BY` lists are left
+/// unbound by (1): a correlated ordering inside an aggregate/window is a
+/// corner this builder does not reach today — narrower than the general
+/// case, not silently wrong, since any `Column(OUTER_REF)` actually hiding
+/// there simply survives into `eval`, which has no relation-0 column to
+/// resolve it against and errors instead of guessing.
+fn bind_outer_rec(
+    expr: &Expr,
+    outer: Outer<'_>,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
+) -> Result<Expr, BuildError> {
     let b = |e: &Expr| -> Result<Box<Expr>, BuildError> {
-        Ok(Box::new(bind_outer_rec(e, batch, row)?))
+        Ok(Box::new(bind_outer_rec(
+            e, outer, tables, dml, budget, ctes,
+        )?))
     };
     let v = |es: &[Expr]| -> Result<Vec<Expr>, BuildError> {
-        es.iter().map(|e| bind_outer_rec(e, batch, row)).collect()
+        es.iter()
+            .map(|e| bind_outer_rec(e, outer, tables, dml, budget, ctes))
+            .collect()
     };
     let ob = |o: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, BuildError> {
         o.as_deref().map(b).transpose()
     };
     Ok(match expr {
-        Expr::Column(c) if c.relation == OUTER_REF => {
-            outer_literal(batch.column(c.index as usize).as_ref(), row)?
-        }
+        Expr::Column(c) if c.relation == OUTER_REF => match outer {
+            Some((batch, row)) => outer_literal(batch.column(c.index as usize).as_ref(), row)?,
+            None => expr.clone(),
+        },
         Expr::Column(_) | Expr::Literal(..) | Expr::Parameter { .. } => expr.clone(),
         Expr::Unary { op, arg } => Expr::Unary {
             op: *op,
@@ -1211,8 +1276,8 @@ fn bind_outer_rec(expr: &Expr, batch: &RecordBatch, row: usize) -> Result<Expr, 
                 .iter()
                 .map(|(w, t)| {
                     Ok((
-                        bind_outer_rec(w, batch, row)?,
-                        bind_outer_rec(t, batch, row)?,
+                        bind_outer_rec(w, outer, tables, dml, budget, ctes)?,
+                        bind_outer_rec(t, outer, tables, dml, budget, ctes)?,
                     ))
                 })
                 .collect::<Result<_, BuildError>>()?,
@@ -1301,11 +1366,18 @@ fn bind_outer_rec(expr: &Expr, batch: &RecordBatch, row: usize) -> Result<Expr, 
             kind,
             subplan,
             operand,
-        } => Expr::Subquery {
-            kind: *kind,
-            subplan: subplan.clone(),
-            operand: ob(operand)?,
-        },
+        } => {
+            let operand = ob(operand)?;
+            if *kind == basin_plan::SubqueryKind::Scalar && operand.is_none() {
+                materialize_scalar_subquery(subplan, tables, dml, budget, ctes)?
+            } else {
+                Expr::Subquery {
+                    kind: *kind,
+                    subplan: subplan.clone(),
+                    operand,
+                }
+            }
+        }
         Expr::ArrayLit(xs) => Expr::ArrayLit(v(xs)?),
         Expr::RowLit(xs) => Expr::RowLit(v(xs)?),
         Expr::Subscript { arg, indices } => Expr::Subscript {
@@ -1314,18 +1386,18 @@ fn bind_outer_rec(expr: &Expr, batch: &RecordBatch, row: usize) -> Result<Expr, 
                 .iter()
                 .map(|s| {
                     Ok(match s {
-                        basin_plan::Subscript::Index(e) => {
-                            basin_plan::Subscript::Index(bind_outer_rec(e, batch, row)?)
-                        }
+                        basin_plan::Subscript::Index(e) => basin_plan::Subscript::Index(
+                            bind_outer_rec(e, outer, tables, dml, budget, ctes)?,
+                        ),
                         basin_plan::Subscript::Slice { lower, upper } => {
                             basin_plan::Subscript::Slice {
                                 lower: lower
                                     .as_ref()
-                                    .map(|e| bind_outer_rec(e, batch, row))
+                                    .map(|e| bind_outer_rec(e, outer, tables, dml, budget, ctes))
                                     .transpose()?,
                                 upper: upper
                                     .as_ref()
-                                    .map(|e| bind_outer_rec(e, batch, row))
+                                    .map(|e| bind_outer_rec(e, outer, tables, dml, budget, ctes))
                                     .transpose()?,
                             }
                         }
@@ -1340,10 +1412,66 @@ fn bind_outer_rec(expr: &Expr, batch: &RecordBatch, row: usize) -> Result<Expr, 
     })
 }
 
-/// Read one value out of an Arrow array as an [`Expr::Literal`]. Only the
-/// handful of primitive types a `LateralJoin`'s correlated columns are
-/// expected to be built from — matching [`pg_type_for_arrow`]'s coverage —
-/// are supported; anything else is refused rather than guessed at.
+/// Build and run `subplan` exactly once, folding its single-row,
+/// single-column result into a `Literal` — Postgres's InitPlan: a subquery
+/// with no correlated reference to the enclosing query is evaluated once
+/// per statement, not once per row (the only version worth having, since
+/// nothing about its result can vary row to row). Reached only for
+/// `Expr::Subquery { kind: Scalar, operand: None, .. }` (see
+/// [`bind_outer_rec`]) — `basin_plan::opt::decorrelate` guarantees `subplan`
+/// carries no `Column(relation == OUTER_REF)` by the time a plan reaches
+/// this builder still shaped as `Expr::Subquery`: a correlated scalar
+/// subquery it CAN decorrelate becomes a join instead, and anything it
+/// declines to decorrelate has no correlation predicate to lean on in the
+/// first place (see that module's docs). So this always builds with
+/// `outer: None`, and any subquery nested inside `subplan` gets the exact
+/// same one-shot treatment when `build_inner` reaches it in turn.
+///
+/// Two Postgres rules for a scalar subquery, both enforced here: zero rows
+/// is `NULL` — not an error, and not an empty result for the query this
+/// subquery is embedded in, since this only ever produces a `Literal` and
+/// never short-circuits anything above it — and more than one row is
+/// SQLSTATE 21000 `cardinality_violation` ([`ExecError::CardinalityViolation`]),
+/// not a silently-picked first row.
+fn materialize_scalar_subquery(
+    subplan: &LogicalPlan,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
+) -> Result<Expr, BuildError> {
+    let mut op = build_inner(subplan, tables, dml, budget, ctes, None)?;
+    let schema = op.schema();
+    if schema.fields().len() != 1 {
+        return Err(BuildError::Exec(ExecError::Internal(format!(
+            "scalar subquery must return exactly one column, got {} — a planner bug",
+            schema.fields().len()
+        ))));
+    }
+    let ty = pg_type_for_arrow(schema.field(0).data_type())?;
+
+    let mut result: Option<Expr> = None;
+    while let Some(batch) = op.next_batch().map_err(BuildError::Exec)? {
+        let col = batch.column(0).as_ref();
+        for row in 0..batch.num_rows() {
+            if result.is_some() {
+                return Err(BuildError::Exec(ExecError::CardinalityViolation(
+                    "more than one row returned by a subquery used as an expression".into(),
+                )));
+            }
+            result = Some(outer_literal(col, row)?);
+        }
+    }
+    Ok(result.unwrap_or(Expr::Literal(basin_plan::Datum::Null, ty)))
+}
+
+/// Read one value out of an Arrow array as an [`Expr::Literal`]. Shared by
+/// [`bind_outer_rec`]'s `LateralJoin`/`WITH RECURSIVE` outer-row binding and
+/// [`materialize_scalar_subquery`]'s InitPlan result — both need "one Arrow
+/// value, at a known row, folded into a literal". Only the handful of
+/// primitive types either caller is expected to see — matching
+/// [`pg_type_for_arrow`]'s coverage — are supported; anything else is
+/// refused rather than guessed at.
 fn outer_literal(col: &dyn arrow_array::Array, row: usize) -> Result<Expr, BuildError> {
     use arrow_array::{
         BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
@@ -1400,7 +1528,7 @@ fn outer_literal(col: &dyn arrow_array::Array, row: usize) -> Result<Expr, Build
         ),
         other => {
             return Err(BuildError::Unsupported(format!(
-                "LATERAL outer reference of Arrow type {other:?}"
+                "a correlated reference or scalar subquery result of Arrow type {other:?}"
             )))
         }
     };
@@ -1409,10 +1537,10 @@ fn outer_literal(col: &dyn arrow_array::Array, row: usize) -> Result<Expr, Build
 
 /// The [`PgType`] whose [`basin_pgtype::physical`] round-trips to `dt` —
 /// the reverse of the direction `eval.rs`'s `eval_literal` normally needs,
-/// required here because an outer row's column only carries an Arrow type,
-/// and the literal replacing it must carry a `PgType` that maps back to
-/// that exact Arrow type or `eval` will build the wrong kind of array for
-/// it.
+/// required here because [`outer_literal`]'s source column only carries an
+/// Arrow type, and the literal replacing it must carry a `PgType` that maps
+/// back to that exact Arrow type or `eval` will build the wrong kind of
+/// array for it.
 fn pg_type_for_arrow(dt: &arrow_schema::DataType) -> Result<PgType, BuildError> {
     use arrow_schema::DataType;
     Ok(match dt {
@@ -1425,7 +1553,7 @@ fn pg_type_for_arrow(dt: &arrow_schema::DataType) -> Result<PgType, BuildError> 
         DataType::Utf8 => PgType::TEXT,
         other => {
             return Err(BuildError::Unsupported(format!(
-                "LATERAL outer reference of Arrow type {other:?}"
+                "a correlated reference or scalar subquery result of Arrow type {other:?}"
             )))
         }
     })
@@ -1726,7 +1854,7 @@ fn offset_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use basin_pgtype::PgType;
     use basin_plan::{ColId, ColumnRef, Datum, SnapshotId};
@@ -1923,6 +2051,316 @@ mod tests {
         assert_eq!(
             rows, 3,
             "generate_series(1,3) expands one input row to three"
+        );
+    }
+
+    // ── JOIN ─────────────────────────────────────────────────────────────
+    //
+    // Reached from a real `SELECT ... JOIN ... ON ...` these build/exec-error
+    // out (see `fallback_histogram`'s per-query attribution and
+    // `docs/migration/df-removal` session notes for `165cd438`/`3cb16d97`,
+    // the panic fix and the projection-pruning fix that preceded this). This
+    // module had ZERO coverage of `LogicalPlan::Join` -> `HashJoin` before
+    // these tests — only `LateralJoin` (a different node) was exercised.
+    //
+    // Root-caused here (in `basin-exec`, not `basin-plan`): with the
+    // asymmetric-width fixtures below, driving a real
+    // `lower_select`+`optimize_default` plan through `build()` succeeds
+    // end-to-end (self-join, 3-row result) — `column_index()` correctly
+    // reads a join key's `ColumnRef::index` as-is because
+    // `lower/select.rs::split_equijoin_conjuncts` already rebases the
+    // right-hand operand of an `on` pair to be relative to the RIGHT input's
+    // own schema (see that function's doc comment) before `Join::on` ever
+    // reaches this builder — there is no flat-vs-per-side confusion left in
+    // `build.rs` for `on` to trip over. The four SQL shapes in the histogram
+    // still fall back, but for reasons outside this file:
+    //
+    // - Both joins: `basin-plan/src/opt/projection.rs`'s `Join` arm of
+    //   `prune()` (`collect_both_conventions`) applies the FLAT-position
+    //   interpretation to `on`'s right-hand element too. That element is
+    //   already right-schema-relative (rebased, per the paragraph above),
+    //   so treating it as an unrebased flat position across the
+    //   concatenated scope misattributes it to `left_required` whenever its
+    //   (right-relative) index is `< left_width` — which prunes the join
+    //   key clean out of the right scan's projection. Confirmed directly:
+    //   building the SAME plan with `optimize_default` skipped succeeds;
+    //   running it through `optimize_default` first leaves the right scan
+    //   with `projection: []` and `build()` reports exactly
+    //   `join key index 0 is out of range for the right side's 0-column
+    //   schema`. Fix belongs in that `Join` arm: `r`'s columns should be
+    //   attributed to `right_required` directly (offset by 0, not
+    //   `left_width`), not run through the same flat/relation-1 dispatch as
+    //   `l`.
+    // - `WITH x AS (SELECT id FROM t) SELECT id FROM x`: builds and executes
+    //   fine here (see the CTE section below, and `CteRegistry` in this
+    //   file) — the plan itself never gets a chance to run. The bridge in
+    //   `basin-engine/src/owned_engine.rs`'s `collect_tables_stmt` walks
+    //   only `stmt.from_clause` (plus `larg`/`rarg` for a set op) and never
+    //   `stmt.with_clause`, so a CTE's real table references (here, `t`
+    //   inside the CTE body) are never prefetched into the resolver, and
+    //   the CTE's own name (`x`) is looked up as if it were a catalog table
+    //   and fails — `Fallback::Ineligible("table not found in the
+    //   catalog")`, before `lower_select` is ever called.
+    // - `SELECT generate_series(1,3)`: `ProjectSet` builds and expands fine
+    //   here (see `a_set_returning_function_builds_and_expands` above) —
+    //   again, the plan never gets that far. `basin-plan/src/lower/select.rs`'s
+    //   `lower_target_list` hard-refuses with `LowerError::Unsupported`
+    //   ("set-returning functions in the SELECT list are not yet lowered")
+    //   the moment it sees `expr.contains_srf()`, rather than building the
+    //   `LogicalPlan::ProjectSet` this file already knows how to run.
+    //
+    // None of the three bullets above are in `crates/basin-exec/**`.
+
+    /// A left side and a right side with DIFFERENT widths and the join key
+    /// at a DIFFERENT position on each side (left index 2, right index 0) —
+    /// deliberately not the "both sides are column 0 of equal-width
+    /// schemas" shape that a flat-vs-per-side index mixup could pass by
+    /// coincidence. If `build()` ever started treating a join key as a flat
+    /// position across the concatenated left+right schema (rather than the
+    /// per-side position `HashJoin::new` documents), the right key here
+    /// would land out of bounds (right schema is 1 column wide) and this
+    /// would fail loudly rather than quietly return the wrong rows.
+    fn asymmetric_join_resolver() -> MemTableResolver {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+            Field::new("id", DataType::Int32, true),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100, 100, 100])),
+                Arc::new(Int32Array::from(vec![200, 201, 202])),
+                Arc::new(Int32Array::from(vec![1, 2, 5])),
+            ],
+        )
+        .unwrap();
+
+        let right_schema = Arc::new(Schema::new(vec![Field::new("rid", DataType::Int32, true)]));
+        let right_batch = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let mut r = MemTableResolver::new();
+        r.insert(TableId(1), left_schema, vec![left_batch]);
+        r.insert(TableId(2), right_schema, vec![right_batch]);
+        r
+    }
+
+    fn asymmetric_join_plan(kind: basin_plan::JoinKind) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(LogicalPlan::Scan {
+                table: TableId(1),
+                projection: vec![ColId(0), ColId(1), ColId(2)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            right: Box::new(LogicalPlan::Scan {
+                table: TableId(2),
+                projection: vec![ColId(0)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            kind,
+            on: vec![(col(2, "id"), col(0, "rid"))],
+            filter: None,
+        }
+    }
+
+    /// Inner join, asymmetric widths: only `id`s 1 and 2 are on both sides
+    /// (5 has no match on the right, 3 has no match on the left), so an
+    /// inner join keeps exactly those two rows — and, crucially, keeps them
+    /// with the RIGHT `id`/`rid` values lined up with the correct row, which
+    /// a scrambled key index would not reliably do.
+    #[test]
+    fn an_inner_join_with_asymmetric_widths_matches_the_right_rows() {
+        let plan = asymmetric_join_plan(basin_plan::JoinKind::Inner);
+        let batches = drain(build(&plan, &asymmetric_join_resolver()).unwrap());
+        let mut pairs: Vec<(i32, i32)> = Vec::new();
+        for b in &batches {
+            let id = b.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+            let rid = b.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
+            for i in 0..b.num_rows() {
+                pairs.push((id.value(i), rid.value(i)));
+            }
+        }
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![(1, 1), (2, 2)],
+            "only id=1 and id=2 match on both sides, each id lined up with the SAME rid"
+        );
+    }
+
+    /// Left join, asymmetric widths: every left row survives (1, 2, 5), with
+    /// `rid` NULL for the unmatched `id=5` — proving the join key comparison
+    /// used the right side's OWN column 0, not some flat position that would
+    /// either miss real matches or fabricate ones.
+    #[test]
+    fn a_left_join_with_asymmetric_widths_keeps_every_left_row() {
+        let plan = asymmetric_join_plan(basin_plan::JoinKind::Left);
+        let batches = drain(build(&plan, &asymmetric_join_resolver()).unwrap());
+        let mut pairs: Vec<(i32, Option<i32>)> = Vec::new();
+        for b in &batches {
+            let id = b.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+            let rid = b.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
+            for i in 0..b.num_rows() {
+                pairs.push((
+                    id.value(i),
+                    if rid.is_null(i) {
+                        None
+                    } else {
+                        Some(rid.value(i))
+                    },
+                ));
+            }
+        }
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![(1, Some(1)), (2, Some(2)), (5, None)],
+            "every left row survives; only id=5 (no right match) gets a NULL rid"
+        );
+    }
+
+    // ── SCALAR SUBQUERY (InitPlan) ──────────────────────────────────────
+    //
+    // `SELECT id FROM t WHERE id = (SELECT max(id) FROM t)` fell back with
+    // `eval.rs`'s `Expr::Subquery { .. } => Err(Internal("subqueries must be
+    // decorrelated into a join (or a scalar materialized elsewhere) before
+    // scalar eval sees them"))` — the "materialized elsewhere" the comment
+    // promised did not exist. `basin_plan::opt::decorrelate` correctly
+    // leaves this one alone (uncorrelated: no correlation predicate to join
+    // on, better run once than turned into a join), so it reached `build()`
+    // still shaped as `Expr::Subquery`. `materialize_scalar_subquery`
+    // (called from `bind_outer_rec`, reached from every `bind_outer` call
+    // site including `Filter`'s predicate) now builds and runs it exactly
+    // once — an InitPlan — and folds the result into a `Literal` before
+    // `eval` ever sees it.
+
+    /// `max(id)` — an aggregate with no GROUP BY over the whole table,
+    /// exactly the shape `SELECT max(id) FROM t` lowers to.
+    fn max_id_subplan() -> LogicalPlan {
+        LogicalPlan::Aggregate {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            group: vec![],
+            // `max(int4)` is pg_proc oid 2116 — see `agg_func_of`.
+            aggs: vec![Expr::Aggregate {
+                func: basin_plan::FuncId(basin_pgtype::Oid(2116)),
+                args: vec![col(0, "id")],
+                distinct: false,
+                filter: None,
+                order_by: vec![],
+            }],
+            grouping_sets: None,
+        }
+    }
+
+    /// The happy path: exactly one row (id=4) equals the table's max id.
+    #[test]
+    fn a_scalar_subquery_materializes_once_and_filters_correctly() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            // id = (SELECT max(id) FROM t) — OID 96 is int4 '='.
+            predicate: Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                lhs: Box::new(col(0, "id")),
+                rhs: Box::new(Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(max_id_subplan()),
+                    operand: None,
+                }),
+            },
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "only id=4 equals max(id)=4");
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![4]);
+    }
+
+    /// Zero rows from the subquery is Postgres's NULL rule, not an error and
+    /// not an empty result for the whole query — `id = NULL` is never true
+    /// under three-valued logic, so every row is filtered out, but the
+    /// STATEMENT still succeeds.
+    #[test]
+    fn a_scalar_subquery_with_zero_rows_is_null_not_an_error() {
+        let empty_subplan = LogicalPlan::Aggregate {
+            // `WHERE false` empties the input before the aggregate ever
+            // sees a row — `max` over zero rows is the classic "NULL, not
+            // zero" aggregate case.
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Literal(Datum::Bool(false), PgType::BOOL),
+            }),
+            group: vec![],
+            aggs: vec![Expr::Aggregate {
+                func: basin_plan::FuncId(basin_pgtype::Oid(2116)),
+                args: vec![col(0, "id")],
+                distinct: false,
+                filter: None,
+                order_by: vec![],
+            }],
+            grouping_sets: None,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            predicate: Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                lhs: Box::new(col(0, "id")),
+                rhs: Box::new(Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(empty_subplan),
+                    operand: None,
+                }),
+            },
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 0,
+            "id = NULL is never true, so every row is filtered — but this is \
+             success (Ok with 0 rows), not an error"
+        );
+    }
+
+    /// More than one row from a scalar subquery is SQLSTATE 21000
+    /// `cardinality_violation` in Postgres — a real runtime error, not a
+    /// silently-picked first row.
+    #[test]
+    fn a_scalar_subquery_with_more_than_one_row_is_a_cardinality_violation() {
+        let multi_row_subplan = scan_plan(vec![ColId(0)], vec![]); // 4 rows, not 1
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            predicate: Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                lhs: Box::new(col(0, "id")),
+                rhs: Box::new(Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(multi_row_subplan),
+                    operand: None,
+                }),
+            },
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("a multi-row scalar subquery must be refused, not built"),
+        };
+        assert!(
+            matches!(err, BuildError::Exec(ExecError::CardinalityViolation(_))),
+            "got {err:?}, expected a CardinalityViolation"
         );
     }
 

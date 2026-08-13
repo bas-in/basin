@@ -24,6 +24,12 @@ pub enum ExecError {
     /// inherited from the kernel.
     Overflow(&'static str),
     DivisionByZero,
+    /// A subquery used as a scalar expression (e.g. `x = (SELECT ...)`)
+    /// returned more than one row. Postgres's own rule — SQLSTATE 21000
+    /// `cardinality_violation` — not a silently-picked first row; see
+    /// `basin-exec/src/build.rs`'s `materialize_scalar_subquery`, the only
+    /// place this is raised.
+    CardinalityViolation(String),
     Internal(String),
 }
 
@@ -37,6 +43,7 @@ impl std::fmt::Display for ExecError {
             ExecError::TypeMismatch(m) => write!(f, "type mismatch: {m}"),
             ExecError::Overflow(op) => write!(f, "{op} out of range"),
             ExecError::DivisionByZero => write!(f, "division by zero"),
+            ExecError::CardinalityViolation(m) => write!(f, "cardinality violation: {m}"),
             ExecError::Internal(m) => write!(f, "internal error: {m}"),
         }
     }
