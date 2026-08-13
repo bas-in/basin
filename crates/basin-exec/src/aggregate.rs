@@ -25,6 +25,19 @@
 //!   gap: every result below is still exact, just not as fast as it could be
 //!   on a wide `GROUP BY`.
 //!
+//! - **Statistical** (`stddev*`/`var*`, `bool_and`/`bool_or`, `bit_and`/
+//!   `bit_or`/`bit_xor`, the nine `regr_*` plus `corr`/`covar_pop`/
+//!   `covar_samp`): row-wise in *arrival order*, on both paths. These were
+//!   the aggregate half of the orphan census in
+//!   `docs/migration/df-removal/17-udf-rehosting.md` §3 — names Basin
+//!   answered only because DataFusion's builtin registry answered them. The
+//!   variance family is not eligible for the arrow-kernel path even when
+//!   ungrouped and non-`DISTINCT`, because PostgreSQL's answer comes from a
+//!   *sequential* Youngs-Cramer recurrence: reassociating the work into a
+//!   kernel changes the last digits. See the section comment above `VarAcc`,
+//!   which also records how that arithmetic was recovered from a live server
+//!   rather than recalled.
+//!
 //! # What this operator does not evaluate
 //!
 //! `eval.rs` (general `basin_plan::Expr` evaluation) is still a stub, so this
@@ -67,10 +80,71 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::operator::{ExecError, Operator};
 
-/// The eight aggregate functions this operator implements.
+/// Which member of the variance family an [`AggFunc::Variance`] accumulator
+/// finalizes to. All four (six, counting the `stddev`/`variance` aliases)
+/// share one Youngs-Cramer accumulator and differ only in [`AccState::finalize`]
+/// — see [`VarAcc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarKind {
+    /// `var_pop(x)` — `Sxx / N`. NULL over zero non-NULL rows, `0` over one.
+    VarPop,
+    /// `var_samp(x)`, and its Postgres alias `variance(x)` — `Sxx / (N - 1)`.
+    /// NULL over fewer than two non-NULL rows.
+    VarSamp,
+    /// `stddev_pop(x)` — `sqrt(Sxx / N)`.
+    StddevPop,
+    /// `stddev_samp(x)`, and its Postgres alias `stddev(x)` —
+    /// `sqrt(Sxx / (N - 1))`.
+    StddevSamp,
+}
+
+/// Which member of the two-argument statistical family an [`AggFunc::Regr`]
+/// accumulator finalizes to. All twelve share one [`RegrAcc`] — Postgres
+/// gives all twelve the same `float8_regr_accum` transition function
+/// (confirmed against the live server's `pg_aggregate`) and differ only in
+/// the final function.
+///
+/// Postgres's argument order is `f(Y, X)` — the *dependent* variable first.
+/// [`AggregateSpec::input_col`] is therefore `Y` and `AggFunc::Regr::x_col`
+/// is `X`, not the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegrKind {
+    /// `regr_count(y, x)` — the count of rows where *both* are non-NULL.
+    /// The one member of this family that is `bigint`, and the one that is
+    /// never NULL: over zero rows it is `0` (verified live), because its
+    /// aggregate has a non-NULL `agginitval`.
+    Count,
+    /// `regr_avgx(y, x)` — `Sx / N`.
+    AvgX,
+    /// `regr_avgy(y, x)` — `Sy / N`.
+    AvgY,
+    /// `regr_sxx(y, x)` — `sum((x - avg(x))^2)`.
+    Sxx,
+    /// `regr_syy(y, x)` — `sum((y - avg(y))^2)`.
+    Syy,
+    /// `regr_sxy(y, x)` — `sum((x - avg(x)) * (y - avg(y)))`.
+    Sxy,
+    /// `regr_slope(y, x)` — `Sxy / Sxx`.
+    Slope,
+    /// `regr_intercept(y, x)` — `(Sy - Sx * Sxy / Sxx) / N`.
+    Intercept,
+    /// `regr_r2(y, x)` — `Sxy^2 / (Sxx * Syy)`, or exactly `1.0` when
+    /// `Syy = 0`.
+    R2,
+    /// `corr(y, x)` — `Sxy / sqrt(Sxx * Syy)`.
+    Corr,
+    /// `covar_pop(y, x)` — `Sxy / N`.
+    CovarPop,
+    /// `covar_samp(y, x)` — `Sxy / (N - 1)`.
+    CovarSamp,
+}
+
+/// The aggregate functions this operator implements.
 ///
 /// This is deliberately not the full `pg_proc` aggregate surface — no
-/// ordered-set aggregates or `GROUPING SETS` — see
+/// ordered-set aggregates (`percentile_cont`/`percentile_disc`/`mode`, which
+/// need `WITHIN GROUP` machinery this operator has no representation for) or
+/// `GROUPING SETS` — see
 /// `docs/migration/df-removal/03-physical-operators.md` §3.2 for what else
 /// basin-exec eventually needs; those are separate operators/specs.
 /// `array_agg`/`string_agg` were the last of the "ordinary" aggregates
@@ -78,6 +152,16 @@ use crate::operator::{ExecError, Operator};
 /// group-wise variant was prototyped on `spike/vectorised-aggregate` and
 /// measured at 0.60x the row-wise loop, so it was shelved rather than
 /// merged (`docs/migration/df-removal/17-udf-rehosting.md`).
+///
+/// # Extension shape
+///
+/// Adding a function is four edits, all in this file: a variant here, an arm
+/// in [`resolve_aggregate`] (which fixes the output `Field`), a variant in
+/// [`AccState`] plus arms in `new`/`update_scalar`/`update_kernel`/`finalize`,
+/// and — only if the function needs a *second* per-row column — a payload
+/// field on the variant itself (`StringAgg { delim_col }`,
+/// `Regr { x_col, .. }`) rather than a new field on [`AggregateSpec`], so
+/// that every other aggregate's spec stays the shape it already is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
     /// `count(*)`. Counts rows, including all-null ones — never inspects a
@@ -108,6 +192,59 @@ pub enum AggFunc {
     StringAgg {
         delim_col: usize,
     },
+    /// `var_pop` / `var_samp` / `variance` / `stddev_pop` / `stddev_samp` /
+    /// `stddev`. NULLs are skipped like `sum`/`avg`; see [`VarKind`] for what
+    /// each spelling finalizes to and [`VarAcc`] for the accumulator.
+    Variance(VarKind),
+    /// `bool_and(b)` — `true` iff every non-NULL input is true. NULL over
+    /// zero non-NULL rows (verified live), never `true`.
+    BoolAnd,
+    /// `bool_or(b)` — `true` iff any non-NULL input is true. NULL over zero
+    /// non-NULL rows (verified live), never `false`.
+    BoolOr,
+    /// `bit_and(i)` over `smallint`/`integer`/`bigint`. Preserves the input's
+    /// exact integer width (verified live: `pg_typeof(bit_and(x::int2))` is
+    /// `smallint`). NULL over zero non-NULL rows.
+    BitAnd,
+    /// `bit_or(i)` — see [`AggFunc::BitAnd`].
+    BitOr,
+    /// `bit_xor(i)` — see [`AggFunc::BitAnd`].
+    BitXor,
+    /// The `regr_*` / `corr` / `covar_*` family. `x_col` is the *second*
+    /// SQL argument's resolved column; [`AggregateSpec::input_col`] is the
+    /// first (`Y`). Same second-column-on-the-variant convention as
+    /// [`AggFunc::StringAgg`], and for the same reason.
+    ///
+    /// A row is skipped unless *both* columns are non-NULL — not just the
+    /// first — verified live: `regr_count(y, x)` over
+    /// `(1,10),(2,NULL),(NULL,30),(4,25)` is `2`, not `3` or `4`.
+    Regr {
+        kind: RegrKind,
+        x_col: usize,
+    },
+}
+
+/// Aggregates that can never take the ungrouped arrow-kernel fast path in
+/// [`HashAggregate::update_ungrouped_one`], because they need something a
+/// single filtered `ArrayRef` cannot express: `array_agg` needs each row's
+/// NULL kept as an element, and `string_agg`/`regr_*` need a *second*
+/// per-row column read in lockstep with the first.
+fn is_row_wise_only(func: AggFunc) -> bool {
+    matches!(
+        func,
+        AggFunc::ArrayAgg | AggFunc::StringAgg { .. } | AggFunc::Regr { .. }
+    )
+}
+
+/// The second per-row column an aggregate reads, if it has one. Carried on
+/// the [`AggFunc`] variant rather than on [`AggregateSpec`] — see
+/// [`AggFunc::StringAgg`].
+fn second_arg_col(func: AggFunc) -> Option<usize> {
+    match func {
+        AggFunc::StringAgg { delim_col } => Some(delim_col),
+        AggFunc::Regr { x_col, .. } => Some(x_col),
+        _ => None,
+    }
 }
 
 /// One aggregate in the SELECT list, already resolved to a column position.
@@ -314,6 +451,97 @@ fn resolve_aggregate(
                 field,
             ))
         }
+        AggFunc::Variance(_) => {
+            let col = require_input_col(&spec)?;
+            let dt = input_schema.field(col).data_type();
+            let num_kind = num_kind_of(dt).ok_or_else(|| {
+                ExecError::TypeMismatch(format!(
+                    "stddev()/variance() over non-numeric column {dt:?}"
+                ))
+            })?;
+            // FIDELITY GAP, the same one `Avg` documents and measured the
+            // same way. Postgres routes `stddev(int2|int4|int8|numeric)`
+            // through `numeric_accum`/`int*_accum` — *exact* arbitrary-
+            // precision accumulation — and only `stddev(float4|float8)`
+            // through the f64 `float8_accum` this file reproduces. basin-exec
+            // has no arbitrary-precision decimal type, so integer input is
+            // widened to f64 and answered by the float path. The divergence
+            // is real and was measured rather than assumed: on the live
+            // server `stddev(x::float8)` over `{1,2,4}` is
+            // 1.5275252316519468 and `stddev(x::int)` over the same values is
+            // 1.5275252316519467 — one ULP apart, and a different declared
+            // type (`double precision` vs `numeric`).
+            let field = Field::new(&spec.alias, DataType::Float64, true);
+            Ok((ResolvedAgg { spec, num_kind }, field))
+        }
+        AggFunc::BoolAnd | AggFunc::BoolOr => {
+            let col = require_input_col(&spec)?;
+            let dt = input_schema.field(col).data_type();
+            if !matches!(dt, DataType::Boolean) {
+                return Err(ExecError::TypeMismatch(format!(
+                    "bool_and()/bool_or() over non-boolean column {dt:?}"
+                )));
+            }
+            // Nullable: zero non-NULL rows is NULL, not the operator's
+            // identity element — verified live, `bool_and` over an empty
+            // input is a blank, not `t`.
+            let field = Field::new(&spec.alias, DataType::Boolean, true);
+            Ok((
+                ResolvedAgg {
+                    spec,
+                    num_kind: NumKind::Int,
+                },
+                field,
+            ))
+        }
+        AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => {
+            let col = require_input_col(&spec)?;
+            let dt = input_schema.field(col).data_type().clone();
+            if !matches!(dt, DataType::Int16 | DataType::Int32 | DataType::Int64) {
+                return Err(ExecError::TypeMismatch(format!(
+                    "bit_and()/bit_or()/bit_xor() over non-integer column {dt:?}"
+                )));
+            }
+            // Preserves the input's exact width, like min/max and unlike
+            // sum — verified live: `pg_typeof(bit_and(x))` is `smallint`,
+            // `integer` and `bigint` for int2/int4/int8 input respectively.
+            // Postgres also defines these over `bit` strings; Basin has no
+            // bit-string type, so that overload is out of scope rather than
+            // silently answered with an integer.
+            let field = Field::new(&spec.alias, dt, true);
+            Ok((
+                ResolvedAgg {
+                    spec,
+                    num_kind: NumKind::Int,
+                },
+                field,
+            ))
+        }
+        AggFunc::Regr { kind, x_col } => {
+            let y_col = require_input_col(&spec)?;
+            for (which, c) in [("first", y_col), ("second", x_col)] {
+                let dt = input_schema.field(c).data_type();
+                if num_kind_of(dt).is_none() {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "regr_*()/corr()/covar_*() {which} argument is non-numeric column {dt:?}"
+                    )));
+                }
+            }
+            // `regr_count` is `bigint` and never NULL (zero rows is 0);
+            // every other member is `double precision` and nullable. Both
+            // read off the live server's `pg_typeof`.
+            let field = match kind {
+                RegrKind::Count => Field::new(&spec.alias, DataType::Int64, false),
+                _ => Field::new(&spec.alias, DataType::Float64, true),
+            };
+            Ok((
+                ResolvedAgg {
+                    spec,
+                    num_kind: NumKind::Float,
+                },
+                field,
+            ))
+        }
     }
 }
 
@@ -355,6 +583,14 @@ enum HashKey {
     Float64Bits(u64),
     Utf8(String),
     Bool(bool),
+    /// A two-column key, used only by `DISTINCT` on a two-argument aggregate
+    /// (`regr_slope(DISTINCT y, x)`). Postgres applies `DISTINCT` to the
+    /// whole argument *list*, not to the first argument — verified live:
+    /// `regr_count(DISTINCT y, x)` over `(1,10),(1,10),(2,20)` is `2` and
+    /// `regr_avgx(DISTINCT y, x)` is `1.5`, so the duplicate *pair*
+    /// collapses. Boxed to keep `HashKey` the size it already was; group
+    /// keys and single-column `DISTINCT` sets never allocate one.
+    Pair(Box<(HashKey, HashKey)>),
 }
 
 impl From<&Option<CellValue>> for HashKey {
@@ -390,6 +626,7 @@ fn hash_key_bytes(k: &HashKey) -> usize {
     std::mem::size_of::<HashKey>()
         + match k {
             HashKey::Utf8(s) => s.len(),
+            HashKey::Pair(p) => hash_key_bytes(&p.0) + hash_key_bytes(&p.1),
             _ => 0,
         }
 }
@@ -425,6 +662,19 @@ fn extract_cell(array: &ArrayRef, row: usize) -> Result<Option<CellValue>, ExecE
     }))
 }
 
+/// Widen an already-non-NULL numeric cell to `f64` for the statistical
+/// accumulators. Reaching the error arm is a planner bug — `resolve_aggregate`
+/// has already rejected a non-numeric input column.
+fn numeric_f64(v: &CellValue, who: &str) -> Result<f64, ExecError> {
+    match v {
+        CellValue::Int64(i) => Ok(*i as f64),
+        CellValue::Float64(f) => Ok(*f),
+        _ => Err(ExecError::TypeMismatch(format!(
+            "{who}(): non-numeric value reached the accumulator"
+        ))),
+    }
+}
+
 fn update_extreme(cur: &mut Option<CellValue>, v: &CellValue, want_min: bool) {
     let better = match cur {
         None => true,
@@ -441,6 +691,217 @@ fn update_extreme(cur: &mut Option<CellValue>, v: &CellValue, want_min: bool) {
     };
     if better {
         *cur = Some(v.clone());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The statistical accumulators
+//
+// # Why these are not a two-pass or a Welford loop
+//
+// PostgreSQL's `float8_accum`/`float8_regr_accum` use the **Youngs-Cramer**
+// algorithm (`src/backend/utils/adt/float.c`), not `sum(x)`/`sum(x^2)`/`n`
+// and not textbook Welford. Reproducing its *answers* means reproducing its
+// *arithmetic*, operation for operation and in row order — a mathematically
+// equivalent rearrangement disagrees in the last digits.
+//
+// This was not taken on faith. `float8_accum` and `float8_regr_accum` are
+// ordinary SQL-callable functions, so the transition state was read straight
+// out of the live server, one row at a time, and the Rust below was fitted to
+// it:
+//
+// ```sql
+// with recursive s(i, st) as (
+//   select 0, '{0,0,0}'::float8[]
+//   union all
+//   select s.i+1, float8_accum(s.st, d.x) from s join d on d.rn = s.i+1)
+// select i, st::text from s order by i;
+// ```
+//
+// Two things that trace settled, both of which a from-memory implementation
+// gets wrong:
+//
+// 1. **`float8_accum` divides where `float8_regr_accum` multiplies by a
+//    reciprocal.** `Sxx += tmp*tmp/(N*Nold)` versus
+//    `scale = 1.0/(N*Nold); Sxx += tmp*tmp*scale`. Those are different f64
+//    expressions and they produce different last bits. Both spellings are
+//    reproduced verbatim below.
+// 2. **`tmp = newval * N - Sx` is compiled as a fused multiply-add** by the
+//    server's build (PostgreSQL 18.2, Homebrew, Apple clang 17, aarch64 —
+//    `-ffp-contract=on` is clang's default), and `Sxx += tmp*tmp*scale` in
+//    the regr accumulator is fused too. `f64::mul_add` below is what
+//    reproduces that. Without it the answers drift: measured over 20 random
+//    53-row datasets × 6 statistics, the non-fused spelling matched the
+//    server exactly 50/120 times with a worst case of 18 ULP, while the
+//    spelling below matched **300/300** across 20 datasets × 15 statistics.
+//
+// **The honest caveat that measurement also exposes**: FP contraction is a
+// property of *the server's build*, not of PostgreSQL. A build compiled
+// without it (a generic x86-64 Linux package, say) would produce the
+// non-fused answers, which differ from these by ≤ 2 ULP. Rust's `mul_add` is
+// correctly rounded and deterministic on every target, so Basin's answer is
+// stable where PostgreSQL's is not. The residual disagreement against a
+// non-contracting build is ≤ 2 ULP — two orders of magnitude smaller than the
+// `avg`-returns-`float8`-instead-of-`numeric` gap this file already documents.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Youngs-Cramer state for the one-argument variance family, mirroring
+/// PostgreSQL's `float8_accum` three-element transition array `{N, Sx, Sxx}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct VarAcc {
+    n: f64,
+    sx: f64,
+    sxx: f64,
+}
+
+impl VarAcc {
+    /// One row, in row order. Transcribed from `float8_accum` — including
+    /// the Inf/NaN rule, which is not decoration: `stddev` over a column
+    /// containing `Infinity` is `NaN` on the live server, and an
+    /// implementation that lets `Sxx` go infinite reports `Infinity` instead.
+    /// The first-row branch matters for the same reason — a lone `Infinity`
+    /// input must poison `Sxx` immediately or `stddev_pop` falsely reports
+    /// `0` (verified live: it is `NaN`).
+    fn push(&mut self, x: f64) {
+        let n_old = self.n;
+        self.n += 1.0;
+        self.sx += x;
+        if n_old > 0.0 {
+            // `newval * N - Sx`, fused — see the section comment above.
+            let tmp = x.mul_add(self.n, -self.sx);
+            // Division, not multiplication by a reciprocal. `float8_accum`
+            // and `float8_regr_accum` genuinely differ here.
+            self.sxx += tmp * tmp / (self.n * n_old);
+            if self.sx.is_infinite() || self.sxx.is_infinite() {
+                self.sxx = f64::NAN;
+            }
+        } else if !x.is_finite() {
+            self.sxx = f64::NAN;
+        }
+    }
+
+    /// The finalizer for one member of the family, or `None` for SQL NULL.
+    /// The N thresholds differ between the population and sample forms and
+    /// were each confirmed live: over exactly one row `var_pop`/`stddev_pop`
+    /// are `0` while `var_samp`/`stddev_samp` are NULL; over zero rows all
+    /// four are NULL.
+    fn finalize(&self, kind: VarKind) -> Option<f64> {
+        match kind {
+            VarKind::VarPop | VarKind::StddevPop => {
+                if self.n == 0.0 {
+                    return None;
+                }
+                let v = self.sxx / self.n;
+                Some(if matches!(kind, VarKind::StddevPop) {
+                    v.sqrt()
+                } else {
+                    v
+                })
+            }
+            VarKind::VarSamp | VarKind::StddevSamp => {
+                if self.n <= 1.0 {
+                    return None;
+                }
+                let v = self.sxx / (self.n - 1.0);
+                Some(if matches!(kind, VarKind::StddevSamp) {
+                    v.sqrt()
+                } else {
+                    v
+                })
+            }
+        }
+    }
+}
+
+/// Youngs-Cramer state for the two-argument family, mirroring PostgreSQL's
+/// `float8_regr_accum` six-element transition array
+/// `{N, Sx, Sxx, Sy, Syy, Sxy}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RegrAcc {
+    n: f64,
+    sx: f64,
+    sxx: f64,
+    sy: f64,
+    syy: f64,
+    sxy: f64,
+}
+
+impl RegrAcc {
+    /// One row, in row order, with `y` the *first* SQL argument. Only called
+    /// when both are non-NULL — the skip-if-either-is-NULL rule lives in
+    /// [`AccState::push_regr`] so that `DISTINCT`'s dedup sees the same rows
+    /// this does.
+    fn push(&mut self, y: f64, x: f64) {
+        let n_old = self.n;
+        self.n += 1.0;
+        self.sx += x;
+        self.sy += y;
+        if n_old > 0.0 {
+            let tmp_x = x.mul_add(self.n, -self.sx);
+            let tmp_y = y.mul_add(self.n, -self.sy);
+            // Reciprocal-multiply, not division — the opposite of
+            // `VarAcc::push`, matching `float8_regr_accum`. The three
+            // accumulations are fused multiply-adds; see the section comment.
+            let scale = 1.0 / (self.n * n_old);
+            self.sxx = (tmp_x * tmp_x).mul_add(scale, self.sxx);
+            self.syy = (tmp_y * tmp_y).mul_add(scale, self.syy);
+            self.sxy = (tmp_x * tmp_y).mul_add(scale, self.sxy);
+            if self.sx.is_infinite() || self.sxx.is_infinite() {
+                self.sxx = f64::NAN;
+            }
+            if self.sy.is_infinite() || self.syy.is_infinite() {
+                self.syy = f64::NAN;
+            }
+            if self.sx.is_infinite() || self.sy.is_infinite() || self.sxy.is_infinite() {
+                self.sxy = f64::NAN;
+            }
+        } else {
+            if !x.is_finite() {
+                self.sxx = f64::NAN;
+                self.sxy = f64::NAN;
+            }
+            if !y.is_finite() {
+                self.syy = f64::NAN;
+                self.sxy = f64::NAN;
+            }
+        }
+    }
+
+    /// The finalizer, or `None` for SQL NULL. Every threshold below was read
+    /// off the live server rather than recalled — over a single row
+    /// `regr_sxx`/`regr_syy`/`regr_sxy`/`covar_pop` are `0`,
+    /// `regr_avgx`/`regr_avgy` are the values themselves, and
+    /// `regr_slope`/`regr_intercept`/`regr_r2`/`corr`/`covar_samp` are all
+    /// NULL. [`RegrKind::Count`] is handled by the caller: it is the only
+    /// member returning `bigint`, and the only one that is `0` rather than
+    /// NULL over zero rows.
+    fn finalize(&self, kind: RegrKind) -> Option<f64> {
+        let n = self.n;
+        match kind {
+            RegrKind::Count => Some(n),
+            RegrKind::AvgX => (n >= 1.0).then(|| self.sx / n),
+            RegrKind::AvgY => (n >= 1.0).then(|| self.sy / n),
+            RegrKind::Sxx => (n >= 1.0).then_some(self.sxx),
+            RegrKind::Syy => (n >= 1.0).then_some(self.syy),
+            RegrKind::Sxy => (n >= 1.0).then_some(self.sxy),
+            RegrKind::CovarPop => (n >= 1.0).then(|| self.sxy / n),
+            RegrKind::CovarSamp => (n >= 2.0).then(|| self.sxy / (n - 1.0)),
+            RegrKind::Slope => (n >= 2.0 && self.sxx != 0.0).then(|| self.sxy / self.sxx),
+            RegrKind::Intercept => {
+                (n >= 2.0 && self.sxx != 0.0).then(|| (self.sy - self.sx * self.sxy / self.sxx) / n)
+            }
+            RegrKind::R2 => {
+                if n < 2.0 || self.sxx == 0.0 {
+                    None
+                } else if self.syy == 0.0 {
+                    Some(1.0)
+                } else {
+                    Some((self.sxy * self.sxy) / (self.sxx * self.syy))
+                }
+            }
+            RegrKind::Corr => (n >= 2.0 && self.sxx != 0.0 && self.syy != 0.0)
+                .then(|| self.sxy / (self.sxx * self.syy).sqrt()),
+        }
     }
 }
 
@@ -477,6 +938,30 @@ enum AccState {
     /// are skipped entirely, unlike `ArrayAgg` — see
     /// [`AccState::push_string_agg`]).
     StringAgg(Option<String>),
+    /// The variance family. NULLs are skipped before reaching [`VarAcc`], so
+    /// `n` counts non-NULL rows only.
+    Variance(VarKind, VarAcc),
+    /// `bool_and`/`bool_or`. `None` until the first non-NULL input, which is
+    /// what makes zero-non-NULL-rows finalize to SQL NULL rather than to the
+    /// operator's identity element (`true` for `and`, `false` for `or`) —
+    /// the same trap [`AccState::SumInt`] documents for `sum`.
+    Bool {
+        and_semantics: bool,
+        acc: Option<bool>,
+    },
+    /// `bit_and`/`bit_or`/`bit_xor`. Same `None`-until-first-value rule and
+    /// for the same reason (`bit_and`'s identity is all-ones, `bit_or`'s and
+    /// `bit_xor`'s is zero; neither is the right answer over zero rows —
+    /// verified live, all three are NULL). Accumulates in `i64` regardless of
+    /// the input width; [`build_typed_array`] narrows back to the output
+    /// field's declared type, which `resolve_aggregate` sets to the input's
+    /// exact type.
+    Bits {
+        op: AggFunc,
+        acc: Option<i64>,
+    },
+    /// The `regr_*`/`corr`/`covar_*` family. See [`RegrAcc`].
+    Regr(RegrKind, RegrAcc),
 }
 
 impl AccState {
@@ -493,7 +978,42 @@ impl AccState {
             AggFunc::Avg => AccState::Avg { sum: 0.0, count: 0 },
             AggFunc::ArrayAgg => AccState::ArrayAgg(None),
             AggFunc::StringAgg { .. } => AccState::StringAgg(None),
+            AggFunc::Variance(k) => AccState::Variance(k, VarAcc::default()),
+            AggFunc::BoolAnd => AccState::Bool {
+                and_semantics: true,
+                acc: None,
+            },
+            AggFunc::BoolOr => AccState::Bool {
+                and_semantics: false,
+                acc: None,
+            },
+            AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => AccState::Bits {
+                op: func,
+                acc: None,
+            },
+            AggFunc::Regr { kind, .. } => AccState::Regr(kind, RegrAcc::default()),
         }
+    }
+
+    /// `regr_*`/`corr`/`covar_*`: one row's `(y, x)` pair. Never routed
+    /// through [`AccState::update_scalar`] — it needs two per-row values, the
+    /// same reason `string_agg` has its own entry point.
+    ///
+    /// **A row is skipped unless BOTH arguments are non-NULL.** This is not
+    /// the same as the blanket null-skip every one-argument aggregate here
+    /// does, and getting it wrong inflates `regr_count` and silently biases
+    /// every other member of the family. Verified live: `regr_count(y, x)`
+    /// over `(1,10),(2,NULL),(NULL,30),(4,25)` is `2`, and over the same data
+    /// `regr_avgx` is `2.5` — the mean of `{1, 4}`, not of `{1, 2, 4}`.
+    fn push_regr(&mut self, y: &Option<CellValue>, x: &Option<CellValue>) -> Result<(), ExecError> {
+        let AccState::Regr(_, acc) = self else {
+            unreachable!("push_regr is only called for a Regr accumulator")
+        };
+        let (Some(y), Some(x)) = (y, x) else {
+            return Ok(()); // either argument NULL: the row does not exist for this aggregate
+        };
+        acc.push(numeric_f64(y, "regr")?, numeric_f64(x, "regr")?);
+        Ok(())
     }
 
     /// `array_agg`: append one row's value — NULL included — and return the
@@ -619,12 +1139,51 @@ impl AccState {
                 *sum += f;
                 *count += 1;
             }
+            AccState::Variance(_, acc) => acc.push(numeric_f64(v, "variance")?),
+            AccState::Bool { and_semantics, acc } => {
+                let CellValue::Bool(b) = v else {
+                    return Err(ExecError::TypeMismatch(
+                        "bool_and()/bool_or(): non-boolean value reached the accumulator".into(),
+                    ));
+                };
+                *acc = Some(match *acc {
+                    None => *b,
+                    Some(cur) => {
+                        if *and_semantics {
+                            cur && *b
+                        } else {
+                            cur || *b
+                        }
+                    }
+                });
+            }
+            AccState::Bits { op, acc } => {
+                let CellValue::Int64(n) = v else {
+                    return Err(ExecError::TypeMismatch(
+                        "bit_and()/bit_or()/bit_xor(): non-integer value reached the accumulator"
+                            .into(),
+                    ));
+                };
+                *acc = Some(match *acc {
+                    None => *n,
+                    Some(cur) => match op {
+                        AggFunc::BitAnd => cur & *n,
+                        AggFunc::BitOr => cur | *n,
+                        AggFunc::BitXor => cur ^ *n,
+                        _ => unreachable!("AccState::Bits only ever carries a bitwise AggFunc"),
+                    },
+                });
+            }
             AccState::CountStar(_) => unreachable!("count(*) never inspects a per-row value"),
             AccState::ArrayAgg(_) => unreachable!(
                 "array_agg is never routed through update_scalar — see push_array_agg's doc"
             ),
             AccState::StringAgg(_) => unreachable!(
                 "string_agg is never routed through update_scalar — see push_string_agg's doc"
+            ),
+            AccState::Regr(..) => unreachable!(
+                "regr_*/corr/covar_* are never routed through update_scalar — they read two \
+                 per-row columns; see push_regr's doc"
             ),
         }
         Ok(())
@@ -639,6 +1198,25 @@ impl AccState {
     /// there is nothing to match on `self` before reaching one, since this
     /// whole function is skipped for those two functions upstream.
     fn update_kernel(&mut self, arr: &ArrayRef) -> Result<(), ExecError> {
+        // No arrow kernel computes any of these three families, and for the
+        // variance family none *could*: Youngs-Cramer is a strictly
+        // sequential recurrence whose answer depends on row order (see the
+        // section comment on `VarAcc`), so a kernel that reassociated the
+        // work would stop matching Postgres. Looping in row order *is* the
+        // fast path here — it is what the row-wise path does, minus the
+        // per-row `FILTER`/`DISTINCT` re-checks the caller already applied
+        // to `arr`. Handled ahead of the `match` because the loop needs
+        // `self` mutably again for `update_scalar`.
+        if matches!(
+            self,
+            AccState::Variance(..) | AccState::Bool { .. } | AccState::Bits { .. }
+        ) {
+            for row in 0..arr.len() {
+                let val = extract_cell(arr, row)?;
+                self.update_scalar(&val)?;
+            }
+            return Ok(());
+        }
         match self {
             AccState::Count(c) => {
                 *c += (arr.len() - arr.null_count()) as i64;
@@ -678,12 +1256,15 @@ impl AccState {
                 }
                 *count += (arr.len() - arr.null_count()) as i64;
             }
+            AccState::Variance(..) | AccState::Bool { .. } | AccState::Bits { .. } => {
+                unreachable!("handled by the row-order loop above, before this match")
+            }
             AccState::CountStar(_) => {
                 unreachable!("count(*) takes the row-count fast path in build_ungrouped, never a column kernel")
             }
-            AccState::ArrayAgg(_) | AccState::StringAgg(_) => unreachable!(
-                "array_agg/string_agg are always row-wise (push_array_agg/push_string_agg), \
-                 never dispatched to the arrow-kernel fast path"
+            AccState::ArrayAgg(_) | AccState::StringAgg(_) | AccState::Regr(..) => unreachable!(
+                "array_agg/string_agg/regr_* are always row-wise (push_array_agg/\
+                 push_string_agg/push_regr), never dispatched to the arrow-kernel fast path"
             ),
         }
         Ok(())
@@ -709,6 +1290,17 @@ impl AccState {
             }
             AccState::ArrayAgg(list) => list.clone().map(CellValue::List),
             AccState::StringAgg(s) => s.clone().map(CellValue::Utf8),
+            AccState::Variance(kind, acc) => acc.finalize(*kind).map(CellValue::Float64),
+            AccState::Bool { acc, .. } => acc.map(CellValue::Bool),
+            AccState::Bits { acc, .. } => acc.map(CellValue::Int64),
+            // `regr_count` is the family's one integer member and its one
+            // never-NULL member: `RegrAcc::finalize` hands back `N` as an
+            // f64 and this narrows it, so zero rows give `0` rather than SQL
+            // NULL (verified live).
+            AccState::Regr(RegrKind::Count, acc) => acc
+                .finalize(RegrKind::Count)
+                .map(|n| CellValue::Int64(n as i64)),
+            AccState::Regr(kind, acc) => acc.finalize(*kind).map(CellValue::Float64),
         }
     }
 }
@@ -1040,18 +1632,19 @@ impl HashAggregate {
         // `agg` up front (not re-read inside the loop) so this immutable
         // borrow of `self.aggregates[i]` ends before the loop's
         // `self.bump_memory` calls need `self` mutably.
-        if matches!(func, AggFunc::ArrayAgg | AggFunc::StringAgg { .. }) {
+        // `regr_*` joins them for the second of those two reasons: it reads a
+        // `(y, x)` pair per row, and its NULL rule is "skip unless *both* are
+        // non-NULL", which the single-column `filtered` array cannot express
+        // either.
+        if is_row_wise_only(func) {
             let col = agg
                 .spec
                 .input_col
-                .expect("resolved: array_agg/string_agg always carry an input column");
-            let delim_idx = match func {
-                AggFunc::StringAgg { delim_col } => Some(delim_col),
-                _ => None,
-            };
+                .expect("resolved: every row-wise-only aggregate carries an input column");
             let value_col = batch.column(col).clone();
-            let delim_col = delim_idx.map(|d| batch.column(d).clone());
+            let second_col = second_arg_col(func).map(|d| batch.column(d).clone());
             let is_array_agg = matches!(func, AggFunc::ArrayAgg);
+            let is_regr = matches!(func, AggFunc::Regr { .. });
 
             for row in 0..batch.num_rows() {
                 if let Some(m) = mask {
@@ -1060,6 +1653,10 @@ impl HashAggregate {
                     }
                 }
                 let val = extract_cell(&value_col, row)?;
+                let second = match &second_col {
+                    Some(sc) => extract_cell(sc, row)?,
+                    None => None,
+                };
                 if let Some(seen) = distinct.as_mut() {
                     // array_agg(DISTINCT x) still keeps one NULL entry if any
                     // accepted row's value was NULL — verified against a
@@ -1071,7 +1668,14 @@ impl HashAggregate {
                     if val.is_none() && !is_array_agg {
                         continue;
                     }
-                    let key = HashKey::from(&val);
+                    // DISTINCT on a two-argument aggregate dedups the whole
+                    // argument list — see `HashKey::Pair`'s doc for the live
+                    // evidence.
+                    let key = if is_regr {
+                        HashKey::Pair(Box::new((HashKey::from(&val), HashKey::from(&second))))
+                    } else {
+                        HashKey::from(&val)
+                    };
                     if !seen.insert(key.clone()) {
                         continue;
                     }
@@ -1080,12 +1684,10 @@ impl HashAggregate {
                 if is_array_agg {
                     let added = acc.push_array_agg(val);
                     self.bump_memory(added)?;
+                } else if is_regr {
+                    acc.push_regr(&val, &second)?;
                 } else {
-                    let delim_val = match &delim_col {
-                        Some(dc) => extract_cell(dc, row)?,
-                        None => None,
-                    };
-                    let added = acc.push_string_agg(&val, &delim_val)?;
+                    let added = acc.push_string_agg(&val, &second)?;
                     self.bump_memory(added)?;
                 }
             }
@@ -1214,20 +1816,27 @@ impl HashAggregate {
                         .expect("resolved: every non-CountStar aggregate carries an input column");
                     let val = extract_cell(col, row)?;
                     let is_array_agg = matches!(func, AggFunc::ArrayAgg);
-                    let delim_idx = match func {
-                        AggFunc::StringAgg { delim_col } => Some(delim_col),
-                        _ => None,
+                    let is_regr = matches!(func, AggFunc::Regr { .. });
+                    let second = match second_arg_col(func) {
+                        Some(c) => extract_cell(batch.column(c), row)?,
+                        None => None,
                     };
 
                     if distinct {
                         // See update_ungrouped_one's identical rule and its
                         // live-PG citations: array_agg(DISTINCT x) keeps one
                         // NULL entry, every other DISTINCT aggregate here
-                        // (including string_agg) drops NULLs.
+                        // (including string_agg) drops NULLs, and DISTINCT on
+                        // a two-argument aggregate dedups the whole argument
+                        // list (`HashKey::Pair`).
                         if val.is_none() && !is_array_agg {
                             continue; // DISTINCT ignores NULLs, like the aggregate itself
                         }
-                        let key = HashKey::from(&val);
+                        let key = if is_regr {
+                            HashKey::Pair(Box::new((HashKey::from(&val), HashKey::from(&second))))
+                        } else {
+                            HashKey::from(&val)
+                        };
                         let seen = distinct_seen[gid][i].as_mut().expect(
                             "distinct flag on the spec implies a seen-set was allocated above",
                         );
@@ -1240,9 +1849,10 @@ impl HashAggregate {
                     if is_array_agg {
                         let added = accs[gid][i].push_array_agg(val);
                         self.bump_memory(added)?;
-                    } else if let Some(delim_col) = delim_idx {
-                        let delim_val = extract_cell(batch.column(delim_col), row)?;
-                        let added = accs[gid][i].push_string_agg(&val, &delim_val)?;
+                    } else if is_regr {
+                        accs[gid][i].push_regr(&val, &second)?;
+                    } else if matches!(func, AggFunc::StringAgg { .. }) {
+                        let added = accs[gid][i].push_string_agg(&val, &second)?;
                         self.bump_memory(added)?;
                     } else {
                         accs[gid][i].update_scalar(&val)?;
@@ -2311,5 +2921,932 @@ mod tests {
         assert!(matches!(spec.func, AggFunc::ArrayAgg));
         // If this compiles, `AggregateSpec` has exactly the fields listed
         // above — Rust's struct-literal field list is itself the assertion.
+    }
+
+    // ── The statistical family ───────────────────────────────────────────
+    //
+    // Every expected value below was read off a live PostgreSQL 18.2
+    // (`postgres://pc@127.0.0.1:5432/postgres`) and is quoted with the query
+    // that produced it, so any of them can be re-run. `tests/
+    // statistical_aggregates.rs` re-derives the same answers from the server
+    // at test time over randomised data; these unit tests pin the specific
+    // corners that are cheap to get wrong and expensive to notice.
+
+    fn schema_1f64(name: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(name, DataType::Float64, true)]))
+    }
+
+    fn f64_batch(schema: &SchemaRef, values: Vec<Option<f64>>) -> RecordBatch {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(values))]).unwrap()
+    }
+
+    fn agg1(func: AggFunc, col: usize, alias: &str) -> AggregateSpec {
+        AggregateSpec {
+            func,
+            input_col: Some(col),
+            distinct: false,
+            filter_col: None,
+            alias: alias.into(),
+        }
+    }
+
+    /// Run an ungrouped aggregate over one `float8` column and return the
+    /// single output row's value (or `None` for SQL NULL).
+    fn run_f64_agg(values: Vec<Option<f64>>, func: AggFunc) -> Option<f64> {
+        let schema = schema_1f64("x");
+        let batches = vec![f64_batch(&schema, values)];
+        let input = VecOperator::boxed(schema, batches);
+        let mut agg =
+            HashAggregate::new(input, vec![], vec![agg1(func, 0, "v")], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        (!col.is_null(0)).then(|| col.value(0))
+    }
+
+    // THE headline number for this whole family, and the reason a naive
+    // implementation is not good enough. Postgres does not accumulate
+    // `sum(x)`/`sum(x^2)`; it runs Youngs-Cramer (see the section comment on
+    // `VarAcc`). All five spellings are pinned bit-for-bit — `assert_eq!` on
+    // f64, not an epsilon — because an epsilon comparison here would pass for
+    // every wrong-but-close algorithm this test exists to reject.
+    //
+    //   SELECT stddev(x)::text, stddev_samp(x)::text, stddev_pop(x)::text,
+    //          var_samp(x)::text, var_pop(x)::text
+    //     FROM (VALUES (1::float8),(2),(4),(NULL)) t(x);
+    //   → 1.5275252316519468 | 1.5275252316519468 | 1.247219128924647
+    //     | 2.3333333333333335 | 1.5555555555555556
+    #[test]
+    fn variance_family_matches_postgres_bit_for_bit_on_the_orphan_battery() {
+        let data = || vec![Some(1.0), Some(2.0), Some(4.0), None];
+        assert_eq!(
+            run_f64_agg(data(), AggFunc::Variance(VarKind::StddevSamp)),
+            Some(1.5275252316519468),
+            "stddev/stddev_samp over {{1,2,4,NULL}}"
+        );
+        assert_eq!(
+            run_f64_agg(data(), AggFunc::Variance(VarKind::StddevPop)),
+            Some(1.247219128924647),
+            "stddev_pop over {{1,2,4,NULL}}"
+        );
+        assert_eq!(
+            run_f64_agg(data(), AggFunc::Variance(VarKind::VarSamp)),
+            Some(2.3333333333333335),
+            "var_samp over {{1,2,4,NULL}}"
+        );
+        assert_eq!(
+            run_f64_agg(data(), AggFunc::Variance(VarKind::VarPop)),
+            Some(1.5555555555555556),
+            "var_pop over {{1,2,4,NULL}}"
+        );
+    }
+
+    // The discriminator between Youngs-Cramer and `sum(x^2) - sum(x)^2/n`.
+    // With x ≈ 1e8, `sum(x^2)` ≈ 4e16 has an ULP of 8, so the naive
+    // subtraction loses every significant digit of a variance of 30 — it
+    // returns garbage on the order of 1e0..1e1, not 30.
+    //
+    //   SELECT var_samp(x)::text
+    //     FROM (VALUES (1e8::float8+4),(1e8+7),(1e8+13),(1e8+16)) t(x);   → 30
+    #[test]
+    fn variance_survives_the_cancellation_dataset_that_defeats_sum_of_squares() {
+        let base = 1e8;
+        let data = vec![
+            Some(base + 4.0),
+            Some(base + 7.0),
+            Some(base + 13.0),
+            Some(base + 16.0),
+        ];
+        assert_eq!(
+            run_f64_agg(data, AggFunc::Variance(VarKind::VarSamp)),
+            Some(30.0),
+            "var_samp of 1e8+{{4,7,13,16}} is exactly 30 on live PG 18.2; a \
+             sum-of-squares accumulator loses every digit of it"
+        );
+    }
+
+    // A second cancellation dataset where the true answer is *not* exactly
+    // representable, so it also pins the exact rounding Postgres performs
+    // rather than only "didn't catastrophically cancel". The true value is
+    // 0.05/3 = 0.01666…; both Postgres and this operator report
+    // 0.016666665176550587, the error coming from the inputs' own f64
+    // quantisation.
+    //
+    //   SELECT var_samp(x)::text, var_pop(x)::text, stddev_samp(x)::text,
+    //          stddev_pop(x)::text
+    //     FROM (VALUES (100000000.0::float8),(100000000.1),(100000000.2),
+    //                  (100000000.3)) t(x);
+    #[test]
+    fn variance_matches_postgres_on_a_dataset_whose_answer_is_not_exact() {
+        let data = || {
+            vec![
+                Some(100000000.0),
+                Some(100000000.1),
+                Some(100000000.2),
+                Some(100000000.3),
+            ]
+        };
+        assert_eq!(
+            run_f64_agg(data(), AggFunc::Variance(VarKind::VarSamp)),
+            Some(0.016666665176550587)
+        );
+        assert_eq!(
+            run_f64_agg(data(), AggFunc::Variance(VarKind::VarPop)),
+            Some(0.012499998882412941)
+        );
+        assert_eq!(
+            run_f64_agg(data(), AggFunc::Variance(VarKind::StddevSamp)),
+            Some(0.12909943910238567)
+        );
+        assert_eq!(
+            run_f64_agg(data(), AggFunc::Variance(VarKind::StddevPop)),
+            Some(0.11180339387698811)
+        );
+    }
+
+    // The population/sample split at N = 1 is the family's own version of
+    // "SUM over zero rows is NULL, not 0" — and it is asymmetric, which is
+    // what makes it easy to get wrong. Verified live:
+    //
+    //   SELECT stddev(x), stddev_pop(x), var_samp(x), var_pop(x)
+    //     FROM (VALUES (5::float8)) t(x);          → NULL | 0 | NULL | 0
+    //   ... same four over zero rows                → NULL | NULL | NULL | NULL
+    #[test]
+    fn variance_over_one_row_is_zero_for_pop_and_null_for_samp() {
+        for (kind, want) in [
+            (VarKind::StddevSamp, None),
+            (VarKind::VarSamp, None),
+            (VarKind::StddevPop, Some(0.0)),
+            (VarKind::VarPop, Some(0.0)),
+        ] {
+            assert_eq!(
+                run_f64_agg(vec![Some(5.0)], AggFunc::Variance(kind)),
+                want,
+                "{kind:?} over exactly one row"
+            );
+        }
+    }
+
+    #[test]
+    fn variance_over_zero_non_null_rows_is_null_for_every_spelling() {
+        for kind in [
+            VarKind::StddevSamp,
+            VarKind::StddevPop,
+            VarKind::VarSamp,
+            VarKind::VarPop,
+        ] {
+            assert_eq!(
+                run_f64_agg(vec![], AggFunc::Variance(kind)),
+                None,
+                "{kind:?} over zero rows"
+            );
+            assert_eq!(
+                run_f64_agg(vec![None, None], AggFunc::Variance(kind)),
+                None,
+                "{kind:?} over all-NULL rows"
+            );
+        }
+    }
+
+    // A non-finite input poisons the whole accumulator, including when it is
+    // the *first* row (which is a separate branch in `VarAcc::push` and the
+    // one an implementation is most likely to omit — leaving `Sxx` at 0 and
+    // falsely reporting a population stddev of 0).
+    //
+    //   SELECT stddev(x) FROM (VALUES (1::float8),('Infinity'::float8)) t(x);  → NaN
+    //   SELECT stddev_pop(x) FROM (VALUES ('Infinity'::float8)) t(x);          → NaN
+    #[test]
+    fn non_finite_input_makes_the_variance_family_nan_not_infinity_or_zero() {
+        let got = run_f64_agg(
+            vec![Some(1.0), Some(f64::INFINITY)],
+            AggFunc::Variance(VarKind::StddevSamp),
+        )
+        .expect("two rows: stddev_samp is defined");
+        assert!(
+            got.is_nan(),
+            "stddev over {{1, Infinity}} must be NaN, got {got}"
+        );
+
+        let got = run_f64_agg(
+            vec![Some(f64::INFINITY)],
+            AggFunc::Variance(VarKind::StddevPop),
+        )
+        .expect("one row: stddev_pop is defined");
+        assert!(
+            got.is_nan(),
+            "stddev_pop over a lone Infinity must be NaN, not 0 — got {got}"
+        );
+    }
+
+    // Integer input is a documented fidelity gap, not a silent substitution:
+    // Postgres answers `stddev(int)` through exact numeric accumulation and
+    // returns NUMERIC, this returns DOUBLE PRECISION through the float path.
+    // Measured, not assumed — the two disagree in the last ULP:
+    //
+    //   SELECT stddev(x::float8) FROM (VALUES (1),(2),(4)) t(x);  → 1.5275252316519468
+    //   SELECT stddev(x)         FROM (VALUES (1),(2),(4)) t(x);  → 1.5275252316519467
+    //
+    // This test pins the float answer this operator gives, so the gap stays
+    // visible and a future numeric accumulator changes a *test*, not just
+    // behaviour.
+    #[test]
+    fn variance_over_integers_takes_the_float_path_a_documented_fidelity_gap() {
+        let schema = schema_1int("x");
+        let batch = int_batch(&schema, vec![Some(1), Some(2), Some(4)]);
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let mut agg = HashAggregate::new(
+            input,
+            vec![],
+            vec![agg1(AggFunc::Variance(VarKind::StddevSamp), 0, "s")],
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            agg.schema().field(0).data_type(),
+            &DataType::Float64,
+            "Postgres says numeric here; basin-exec has no arbitrary-precision decimal"
+        );
+        let out = agg.next_batch().unwrap().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(
+            col.value(0),
+            1.5275252316519468,
+            "the float8 answer; Postgres's numeric answer for the same integers \
+             is 1.5275252316519467, one ULP away — the documented gap"
+        );
+    }
+
+    // DISTINCT dedups before the accumulator sees anything, so a duplicated
+    // value must not move the answer at all.
+    //
+    //   SELECT stddev(DISTINCT x) FROM (VALUES (1::float8),(1),(2),(4)) t(x);
+    //   → 1.5275252316519468
+    #[test]
+    fn distinct_variance_dedups_before_accumulating() {
+        let schema = schema_1f64("x");
+        let batch = f64_batch(&schema, vec![Some(1.0), Some(1.0), Some(2.0), Some(4.0)]);
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let spec = AggregateSpec {
+            func: AggFunc::Variance(VarKind::StddevSamp),
+            input_col: Some(0),
+            distinct: true,
+            filter_col: None,
+            alias: "s".into(),
+        };
+        let mut agg = HashAggregate::new(input, vec![], vec![spec], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 1.5275252316519468);
+    }
+
+    // ── bool_and / bool_or ───────────────────────────────────────────────
+
+    fn run_bool_agg(values: Vec<Option<bool>>, func: AggFunc) -> Option<bool> {
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Boolean, true)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(BooleanArray::from(values))])
+                .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let mut agg =
+            HashAggregate::new(input, vec![], vec![agg1(func, 0, "b")], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        (!col.is_null(0)).then(|| col.value(0))
+    }
+
+    //   SELECT bool_and(b), bool_or(b) FROM (VALUES (true),(false),(NULL)) t(b);
+    //   → false | true
+    //   ... (true),(true),(NULL)  → true  | true
+    //   ... (false),(false)       → false | false
+    #[test]
+    fn bool_and_or_skip_nulls_and_agree_with_postgres() {
+        for (data, and_want, or_want) in [
+            (vec![Some(true), Some(false), None], Some(false), Some(true)),
+            (vec![Some(true), Some(true), None], Some(true), Some(true)),
+            (vec![Some(false), Some(false)], Some(false), Some(false)),
+        ] {
+            assert_eq!(
+                run_bool_agg(data.clone(), AggFunc::BoolAnd),
+                and_want,
+                "bool_and over {data:?}"
+            );
+            assert_eq!(
+                run_bool_agg(data.clone(), AggFunc::BoolOr),
+                or_want,
+                "bool_or over {data:?}"
+            );
+        }
+    }
+
+    // The identity-element trap, exactly the one `sum_of_empty_input_is_null_
+    // not_zero` guards for SUM: `and` over nothing is *not* true and `or`
+    // over nothing is *not* false. Verified live — both are a blank.
+    #[test]
+    fn bool_and_or_over_zero_non_null_rows_are_null_not_the_identity_element() {
+        for func in [AggFunc::BoolAnd, AggFunc::BoolOr] {
+            assert_eq!(run_bool_agg(vec![], func), None, "{func:?} over zero rows");
+            assert_eq!(
+                run_bool_agg(vec![None, None], func),
+                None,
+                "{func:?} over all-NULL rows"
+            );
+        }
+    }
+
+    // ── bit_and / bit_or / bit_xor ───────────────────────────────────────
+
+    fn run_bit_agg(values: Vec<Option<i64>>, func: AggFunc) -> Option<i64> {
+        let schema = schema_1int("x");
+        let batch = int_batch(&schema, values);
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let mut agg =
+            HashAggregate::new(input, vec![], vec![agg1(func, 0, "b")], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        (!col.is_null(0)).then(|| col.value(0))
+    }
+
+    //   SELECT bit_and(x), bit_or(x), bit_xor(x)
+    //     FROM (VALUES (12),(10),(NULL)) t(x);   → 8 | 14 | 6
+    //   ... (-1),(6),(3)                          → 2 | -1 | -6
+    //
+    // The negative row matters: these are two's-complement bit operations on
+    // a *signed* integer, so `bit_and(-1, 6, 3)` is 2 and `bit_or` is -1 —
+    // an implementation that accumulated in an unsigned type or masked to the
+    // input's width would disagree on both.
+    #[test]
+    fn bitwise_aggregates_skip_nulls_and_agree_with_postgres_including_negatives() {
+        let data = vec![Some(12), Some(10), None];
+        assert_eq!(run_bit_agg(data.clone(), AggFunc::BitAnd), Some(8));
+        assert_eq!(run_bit_agg(data.clone(), AggFunc::BitOr), Some(14));
+        assert_eq!(run_bit_agg(data, AggFunc::BitXor), Some(6));
+
+        let neg = vec![Some(-1), Some(6), Some(3)];
+        assert_eq!(run_bit_agg(neg.clone(), AggFunc::BitAnd), Some(2));
+        assert_eq!(run_bit_agg(neg.clone(), AggFunc::BitOr), Some(-1));
+        assert_eq!(run_bit_agg(neg, AggFunc::BitXor), Some(-6));
+    }
+
+    // Same identity-element trap as bool_and/bool_or, and worse for
+    // `bit_and`, whose identity is all-ones (-1) — a plausible-looking wrong
+    // answer rather than an obviously wrong one. Verified live: all three are
+    // NULL over zero rows.
+    #[test]
+    fn bitwise_aggregates_over_zero_non_null_rows_are_null() {
+        for func in [AggFunc::BitAnd, AggFunc::BitOr, AggFunc::BitXor] {
+            assert_eq!(run_bit_agg(vec![], func), None, "{func:?} over zero rows");
+            assert_eq!(
+                run_bit_agg(vec![None], func),
+                None,
+                "{func:?} over an all-NULL column"
+            );
+        }
+    }
+
+    // bit_and/bit_or/bit_xor preserve the input's exact integer width — they
+    // do not widen to bigint the way `sum` does. Verified live:
+    // `pg_typeof(bit_and(x::int2))` is `smallint`.
+    #[test]
+    fn bitwise_aggregates_preserve_the_input_width() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int16, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int16Array::from(vec![
+                Some(12i16),
+                Some(10),
+            ]))],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let mut agg = HashAggregate::new(
+            input,
+            vec![],
+            vec![agg1(AggFunc::BitAnd, 0, "b")],
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(agg.schema().field(0).data_type(), &DataType::Int16);
+        let out = agg.next_batch().unwrap().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int16Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 8);
+    }
+
+    // ── regr_* / corr / covar_* ──────────────────────────────────────────
+
+    /// `(x, y)` pairs into a two-column batch, then one two-argument
+    /// aggregate over it. Column 0 is `x`, column 1 is `y`; the spec reads
+    /// `y` as its first argument, matching Postgres's `f(Y, X)` order.
+    fn run_regr(pairs: Vec<(Option<f64>, Option<f64>)>, kind: RegrKind) -> Option<f64> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float64, true),
+        ]));
+        let xs: Vec<Option<f64>> = pairs.iter().map(|(x, _)| *x).collect();
+        let ys: Vec<Option<f64>> = pairs.iter().map(|(_, y)| *y).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(xs)),
+                Arc::new(Float64Array::from(ys)),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let spec = agg1(AggFunc::Regr { kind, x_col: 0 }, 1, "r");
+        let mut agg = HashAggregate::new(input, vec![], vec![spec], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        if kind == RegrKind::Count {
+            let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            return Some(col.value(0) as f64);
+        }
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        (!col.is_null(0)).then(|| col.value(0))
+    }
+
+    fn regr_battery() -> Vec<(Option<f64>, Option<f64>)> {
+        vec![
+            (Some(1.0), Some(10.0)),
+            (Some(2.0), Some(20.0)),
+            (Some(4.0), Some(25.0)),
+            (None, None),
+        ]
+    }
+
+    // All twelve members, pinned bit-for-bit against the live server over the
+    // orphan battery's own dataset:
+    //
+    //   SELECT regr_count(y,x), regr_sxx(y,x), regr_syy(y,x), regr_sxy(y,x),
+    //          regr_avgx(y,x), regr_avgy(y,x), regr_slope(y,x),
+    //          regr_intercept(y,x), regr_r2(y,x), corr(y,x),
+    //          covar_pop(y,x), covar_samp(y,x)
+    //     FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y);
+    //
+    // Note `regr_sxy` is 21.666666666666664 and not 21.666666666666668 — the
+    // Youngs-Cramer accumulation's own rounding, not the mathematically
+    // "nicer" value a two-pass formula produces.
+    #[test]
+    fn regr_family_matches_postgres_bit_for_bit_on_the_orphan_battery() {
+        for (kind, want) in [
+            (RegrKind::Count, 3.0),
+            (RegrKind::Sxx, 4.666666666666666),
+            (RegrKind::Syy, 116.66666666666666),
+            (RegrKind::Sxy, 21.666666666666664),
+            (RegrKind::AvgX, 2.3333333333333335),
+            (RegrKind::AvgY, 18.333333333333332),
+            (RegrKind::Slope, 4.642857142857143),
+            (RegrKind::Intercept, 7.5),
+            (RegrKind::R2, 0.8622448979591837),
+            (RegrKind::Corr, 0.9285714285714285),
+            (RegrKind::CovarPop, 7.222222222222221),
+            (RegrKind::CovarSamp, 10.833333333333332),
+        ] {
+            assert_eq!(
+                run_regr(regr_battery(), kind),
+                Some(want),
+                "{kind:?} over the orphan battery"
+            );
+        }
+    }
+
+    // The rule that separates this family from every other aggregate in this
+    // file: a row is skipped unless BOTH arguments are non-NULL. An
+    // implementation that applies the ordinary per-column null-skip counts 3
+    // rows here and averages x over {1, 2, 4}.
+    //
+    //   SELECT regr_count(y,x), regr_avgx(y,x), regr_avgy(y,x)
+    //     FROM (VALUES (1::float8,10::float8),(2,NULL),(NULL,30),(4,25)) t(x,y);
+    //   → 2 | 2.5 | 17.5
+    #[test]
+    fn regr_skips_a_row_unless_both_arguments_are_non_null() {
+        let data = vec![
+            (Some(1.0), Some(10.0)),
+            (Some(2.0), None),
+            (None, Some(30.0)),
+            (Some(4.0), Some(25.0)),
+        ];
+        assert_eq!(run_regr(data.clone(), RegrKind::Count), Some(2.0));
+        assert_eq!(
+            run_regr(data.clone(), RegrKind::AvgX),
+            Some(2.5),
+            "avg of {{1,4}}, not of {{1,2,4}}"
+        );
+        assert_eq!(run_regr(data, RegrKind::AvgY), Some(17.5));
+    }
+
+    // regr_count is the family's odd one out twice over: it is the only
+    // bigint member and the only one that is 0 rather than NULL over zero
+    // rows (its Postgres aggregate has a non-NULL `agginitval`, unlike the
+    // other eleven). Verified live.
+    #[test]
+    fn regr_count_over_zero_rows_is_zero_while_every_sibling_is_null() {
+        assert_eq!(run_regr(vec![], RegrKind::Count), Some(0.0));
+        for kind in [
+            RegrKind::Sxx,
+            RegrKind::Syy,
+            RegrKind::Sxy,
+            RegrKind::AvgX,
+            RegrKind::AvgY,
+            RegrKind::Slope,
+            RegrKind::Intercept,
+            RegrKind::R2,
+            RegrKind::Corr,
+            RegrKind::CovarPop,
+            RegrKind::CovarSamp,
+        ] {
+            assert_eq!(run_regr(vec![], kind), None, "{kind:?} over zero rows");
+        }
+    }
+
+    // The N thresholds inside the family are not uniform, which is the whole
+    // reason to check them one by one. Over exactly one row, live PG 18.2
+    // gives:
+    //
+    //   regr_count=1, regr_sxx=0, regr_syy=0, regr_sxy=0, regr_avgx=2,
+    //   regr_avgy=3, covar_pop=0, and NULL for regr_slope, regr_intercept,
+    //   regr_r2, corr and covar_samp.
+    #[test]
+    fn regr_over_exactly_one_row_splits_into_defined_and_null_members() {
+        let one = vec![(Some(2.0), Some(3.0))];
+        for (kind, want) in [
+            (RegrKind::Count, Some(1.0)),
+            (RegrKind::Sxx, Some(0.0)),
+            (RegrKind::Syy, Some(0.0)),
+            (RegrKind::Sxy, Some(0.0)),
+            (RegrKind::AvgX, Some(2.0)),
+            (RegrKind::AvgY, Some(3.0)),
+            (RegrKind::CovarPop, Some(0.0)),
+            (RegrKind::Slope, None),
+            (RegrKind::Intercept, None),
+            (RegrKind::R2, None),
+            (RegrKind::Corr, None),
+            (RegrKind::CovarSamp, None),
+        ] {
+            assert_eq!(run_regr(one.clone(), kind), want, "{kind:?} over one row");
+        }
+    }
+
+    // DISTINCT on a two-argument aggregate dedups the whole argument *list*,
+    // not the first argument. Verified live:
+    //
+    //   SELECT regr_count(DISTINCT y, x), regr_avgx(DISTINCT y, x),
+    //          regr_avgy(DISTINCT y, x)
+    //     FROM (VALUES (1::float8,10::float8),(1,10),(2,20)) t(x,y);
+    //   → 2 | 1.5 | 15
+    #[test]
+    fn distinct_on_a_two_argument_aggregate_dedups_the_whole_pair() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![Some(1.0), Some(1.0), Some(2.0)])),
+                Arc::new(Float64Array::from(vec![Some(10.0), Some(10.0), Some(20.0)])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![
+            AggregateSpec {
+                func: AggFunc::Regr {
+                    kind: RegrKind::Count,
+                    x_col: 0,
+                },
+                input_col: Some(1),
+                distinct: true,
+                filter_col: None,
+                alias: "n".into(),
+            },
+            AggregateSpec {
+                func: AggFunc::Regr {
+                    kind: RegrKind::AvgX,
+                    x_col: 0,
+                },
+                input_col: Some(1),
+                distinct: true,
+                filter_col: None,
+                alias: "ax".into(),
+            },
+            AggregateSpec {
+                func: AggFunc::Regr {
+                    kind: RegrKind::AvgY,
+                    x_col: 0,
+                },
+                input_col: Some(1),
+                distinct: true,
+                filter_col: None,
+                alias: "ay".into(),
+            },
+        ];
+        let mut agg = HashAggregate::new(input, vec![], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2,
+            "the duplicated (y,x) pair collapses"
+        );
+        assert_eq!(
+            out.column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            1.5
+        );
+        assert_eq!(
+            out.column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            15.0
+        );
+    }
+
+    // The grouped path is a different code path from the ungrouped one (see
+    // `build_grouped` vs. `update_ungrouped_one`), so every new family is
+    // exercised through it too — including a group whose sample statistic is
+    // NULL because it has a single row, next to one that is not.
+    //
+    //   SELECT g, stddev(x), var_pop(x), bool_or(x>1), bit_xor(x::int)
+    //     FROM (VALUES (1,1::float8),(1,2),(1,4),(2,10),(2,NULL)) t(g,x)
+    //    GROUP BY g ORDER BY g;
+    //   → 1 | 1.5275252316519468 | 1.5555555555555556 | true | 7
+    //     2 | NULL               | 0                  | true | 10
+    #[test]
+    fn statistical_aggregates_work_through_the_grouped_path_too() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("x", DataType::Float64, true),
+            Field::new("xi", DataType::Int64, true),
+            Field::new("gt1", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1, 1, 2, 2])),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.0),
+                    Some(2.0),
+                    Some(4.0),
+                    Some(10.0),
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    Some(1i64),
+                    Some(2),
+                    Some(4),
+                    Some(10),
+                    None,
+                ])),
+                Arc::new(BooleanArray::from(vec![
+                    Some(false),
+                    Some(true),
+                    Some(true),
+                    Some(true),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![
+            agg1(AggFunc::Variance(VarKind::StddevSamp), 1, "sd"),
+            agg1(AggFunc::Variance(VarKind::VarPop), 1, "vp"),
+            agg1(AggFunc::BoolOr, 3, "bo"),
+            agg1(AggFunc::BitXor, 2, "bx"),
+        ];
+        let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 2);
+
+        let g = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sd = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let vp = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let bo = out
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let bx = out.column(4).as_any().downcast_ref::<Int64Array>().unwrap();
+        for row in 0..2 {
+            match g.value(row) {
+                1 => {
+                    assert_eq!(sd.value(row), 1.5275252316519468);
+                    assert_eq!(vp.value(row), 1.5555555555555556);
+                    assert!(bo.value(row));
+                    assert_eq!(bx.value(row), 7, "1 ^ 2 ^ 4");
+                }
+                2 => {
+                    assert!(sd.is_null(row), "one-row group: stddev_samp is NULL");
+                    assert_eq!(vp.value(row), 0.0, "one-row group: var_pop is 0");
+                    assert!(bo.value(row), "the NULL row is skipped, not false");
+                    assert_eq!(bx.value(row), 10, "the NULL row contributes nothing");
+                }
+                other => panic!("unexpected group {other}"),
+            }
+        }
+    }
+
+    // The grouped path for the two-argument family specifically, which routes
+    // through `push_regr` rather than `update_scalar`.
+    //
+    //   SELECT g, regr_slope(y,x), regr_count(y,x)
+    //     FROM (VALUES (1,1::float8,10::float8),(1,2,20),(1,4,25),
+    //                  (2,1,1),(2,2,5)) t(g,x,y)
+    //    GROUP BY g ORDER BY g;   → 1 | 4.642857142857143 | 3
+    //                               2 | 4                 | 2
+    #[test]
+    fn regr_works_through_the_grouped_path_too() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1, 1, 2, 2])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 4.0, 1.0, 2.0])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 25.0, 1.0, 5.0])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![
+            agg1(
+                AggFunc::Regr {
+                    kind: RegrKind::Slope,
+                    x_col: 1,
+                },
+                2,
+                "slope",
+            ),
+            agg1(
+                AggFunc::Regr {
+                    kind: RegrKind::Count,
+                    x_col: 1,
+                },
+                2,
+                "n",
+            ),
+        ];
+        let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let g = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let slope = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let n = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        for row in 0..out.num_rows() {
+            match g.value(row) {
+                1 => {
+                    assert_eq!(slope.value(row), 4.642857142857143);
+                    assert_eq!(n.value(row), 3);
+                }
+                2 => {
+                    assert_eq!(slope.value(row), 4.0);
+                    assert_eq!(n.value(row), 2);
+                }
+                other => panic!("unexpected group {other}"),
+            }
+        }
+    }
+
+    // Multi-batch input must give the same answer as single-batch input:
+    // Youngs-Cramer is a sequential recurrence, so an operator that reset or
+    // re-seeded state per batch would silently produce a different number.
+    #[test]
+    fn variance_is_identical_across_a_batch_boundary() {
+        let schema = schema_1f64("x");
+        let split = vec![
+            f64_batch(&schema, vec![Some(1.0), Some(2.0)]),
+            f64_batch(&schema, vec![Some(4.0), None]),
+        ];
+        let input = VecOperator::boxed(schema, split);
+        let mut agg = HashAggregate::new(
+            input,
+            vec![],
+            vec![agg1(AggFunc::Variance(VarKind::StddevSamp), 0, "s")],
+            usize::MAX,
+        )
+        .unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(
+            col.value(0),
+            1.5275252316519468,
+            "two batches must give the same bits as one"
+        );
+    }
+
+    // Type checking is construction-time for the new families too, matching
+    // the planner-bug-guard posture the rest of this file takes.
+    #[test]
+    fn statistical_aggregates_reject_the_wrong_input_type_at_construction() {
+        let text = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        for func in [
+            AggFunc::Variance(VarKind::VarPop),
+            AggFunc::BoolAnd,
+            AggFunc::BitOr,
+        ] {
+            let input = VecOperator::boxed(text.clone(), vec![]);
+            let err = HashAggregate::new(input, vec![], vec![agg1(func, 0, "v")], usize::MAX)
+                .err()
+                .unwrap_or_else(|| panic!("{func:?} over text must be rejected"));
+            assert!(matches!(err, ExecError::TypeMismatch(_)), "{func:?}: {err}");
+        }
+        // bool_and over an integer column, and bit_and over a float one, are
+        // the near-miss cases a numeric-family check would wave through.
+        let ints = schema_1int("x");
+        let input = VecOperator::boxed(ints.clone(), vec![]);
+        assert!(matches!(
+            HashAggregate::new(
+                input,
+                vec![],
+                vec![agg1(AggFunc::BoolAnd, 0, "v")],
+                usize::MAX
+            )
+            .err(),
+            Some(ExecError::TypeMismatch(_))
+        ));
+        let floats = schema_1f64("x");
+        let input = VecOperator::boxed(floats, vec![]);
+        assert!(matches!(
+            HashAggregate::new(
+                input,
+                vec![],
+                vec![agg1(AggFunc::BitAnd, 0, "v")],
+                usize::MAX
+            )
+            .err(),
+            Some(ExecError::TypeMismatch(_))
+        ));
+    }
+
+    // Both of `regr`'s columns are type-checked, not just the first — the
+    // second arrives from the `AggFunc` payload rather than from
+    // `AggregateSpec::input_col`, so it is the one an implementation forgets.
+    #[test]
+    fn regr_type_checks_its_second_argument_column_too() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Utf8, true),
+            Field::new("y", DataType::Float64, true),
+        ]));
+        let input = VecOperator::boxed(schema, vec![]);
+        let spec = agg1(
+            AggFunc::Regr {
+                kind: RegrKind::Slope,
+                x_col: 0,
+            },
+            1,
+            "s",
+        );
+        let err = HashAggregate::new(input, vec![], vec![spec], usize::MAX)
+            .err()
+            .expect("a text second argument must be rejected");
+        assert!(matches!(err, ExecError::TypeMismatch(_)), "{err}");
     }
 }

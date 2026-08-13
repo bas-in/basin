@@ -17,7 +17,13 @@
 //!
 //! # The four function families
 //!
-//! - **Ranking** (no frame, no argument): `row_number`, `rank`, `dense_rank`.
+//! - **Ranking** (no frame, no argument): `row_number`, `rank`, `dense_rank`,
+//!   `percent_rank`, `cume_dist`, `ntile`. The last three were the window
+//!   half of the orphan census in
+//!   `docs/migration/df-removal/17-udf-rehosting.md` §3 — answered today only
+//!   by DataFusion's builtin registry, with no Basin code on either side.
+//!   `percent_rank` and `cume_dist` are peer-group sensitive; `ntile` is
+//!   deliberately not (see [`WindowFunc::Ntile`]).
 //! - **Offset** (no frame): `lag`, `lead`, with a per-row offset and default.
 //! - **Aggregate-as-window** (frame-driven): `sum`, `count`, `min`, `max`, `avg`.
 //! - **Value-at-position** (frame-driven): `first_value`, `last_value`,
@@ -239,11 +245,46 @@ pub struct WindowFrame {
 }
 
 /// The window functions this operator implements.
+///
+/// # Extension shape
+///
+/// A new function is a variant here plus an arm in [`resolve_window`] (which
+/// fixes the output `Field` and decides whether the function is
+/// frame-driven) plus an arm in either [`compute_window_for_partition`]
+/// (partition-shaped functions) or [`apply_frame_func`] (frame-shaped ones).
+/// A function needing an extra per-row column carries the column position on
+/// the variant itself (`Ntile { buckets_col }`) rather than adding a field to
+/// [`WindowSpec`], so that every existing call site keeps compiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowFunc {
     RowNumber,
     Rank,
     DenseRank,
+    /// `percent_rank()` — `(rank - 1) / (partition rows - 1)`, and exactly
+    /// `0` in a one-row partition rather than a division by zero. Peer-group
+    /// sensitive: tied rows share a `rank` and therefore share a
+    /// `percent_rank`.
+    PercentRank,
+    /// `cume_dist()` — `(rows at or before the current peer group) /
+    /// (partition rows)`. Peer-group sensitive, and note it counts through
+    /// the *end* of the current peer group, which is what makes it `1` for
+    /// every row of a partition with a single peer group.
+    CumeDist,
+    /// `ntile(n)` — the current row's 1-based bucket when the partition is
+    /// split into `n` as-equal-as-possible buckets, larger buckets first.
+    ///
+    /// Unlike [`WindowFunc::PercentRank`] and [`WindowFunc::CumeDist`] this
+    /// is **not** peer-group sensitive: it divides by physical row position,
+    /// so tied rows can land in different buckets (verified live — five rows
+    /// all equal under `ntile(2)` give `1,1,1,2,2`, not five equal values).
+    ///
+    /// `buckets_col` is the resolved column holding `n`, evaluated **once per
+    /// partition, at the partition's first row** — also verified live, by
+    /// varying `n` per row and observing the whole partition follow the first
+    /// row's value.
+    Ntile {
+        buckets_col: usize,
+    },
     Lag,
     Lead,
     Sum,
@@ -688,6 +729,49 @@ fn resolve_window(
                 field,
             ))
         }
+        PercentRank | CumeDist => {
+            if spec.arg_col.is_some() {
+                return Err(ExecError::TypeMismatch(format!(
+                    "{:?} takes no argument column",
+                    spec.func
+                )));
+            }
+            // `double precision`, and non-nullable: both are defined for
+            // every row of every non-empty partition (a one-row partition
+            // gives 0 and 1 respectively — verified live, not a division by
+            // zero and not NULL).
+            let field = Field::new(spec.alias.as_str(), DataType::Float64, false);
+            Ok((
+                ResolvedWindow {
+                    spec,
+                    num_kind: NumKind::Float,
+                    frame,
+                },
+                field,
+            ))
+        }
+        Ntile { .. } => {
+            if spec.arg_col.is_some() {
+                return Err(ExecError::TypeMismatch(
+                    "ntile() carries its bucket count on the WindowFunc variant \
+                     (Ntile { buckets_col }), not in arg_col"
+                        .into(),
+                ));
+            }
+            // `integer`, not `bigint` — verified live with `pg_typeof`, and
+            // unlike `row_number`/`rank`, which really are `bigint`.
+            // Nullable because `ntile(NULL)` is NULL for the whole partition
+            // (also verified live; it is not an error, while `ntile(0)` is).
+            let field = Field::new(spec.alias.as_str(), DataType::Int32, true);
+            Ok((
+                ResolvedWindow {
+                    spec,
+                    num_kind: NumKind::Int,
+                    frame,
+                },
+                field,
+            ))
+        }
         Lag | Lead => {
             let col = require_arg(&spec)?;
             let dt = input_schema.field(col).data_type().clone();
@@ -1113,6 +1197,39 @@ fn compute_window_for_partition(
                 *slot = Some(Cell::Int64((g + 1) as i64));
             }
         }
+        WindowFunc::PercentRank => {
+            // (rank - 1) / (rows - 1), with the one-row partition special
+            // case Postgres defines as 0 rather than 0/0. Ties matter: this
+            // reads `rank` off the peer group's first row, so tied rows share
+            // a value — verified live, `percent_rank()` over `1,2,2,4` is
+            // `0, 0.3333333333333333, 0.3333333333333333, 1`.
+            let rows = part.end - part.start;
+            for (offset, slot) in out_part.iter_mut().enumerate() {
+                let g = peer.id[offset] as usize;
+                let rank = peer.first[g] - part.start + 1;
+                *slot = Some(Cell::Float64(if rows <= 1 {
+                    0.0
+                } else {
+                    (rank - 1) as f64 / (rows - 1) as f64
+                }));
+            }
+        }
+        WindowFunc::CumeDist => {
+            // (rows through the END of the current peer group) / rows. Using
+            // the peer group's *last* row rather than the current row is the
+            // whole difference between this and a row-number ratio — verified
+            // live, `cume_dist()` over `1,2,2,4` is `0.25, 0.75, 0.75, 1`,
+            // where both tied rows report 3/4 and neither reports 2/4.
+            let rows = part.end - part.start;
+            for (offset, slot) in out_part.iter_mut().enumerate() {
+                let g = peer.id[offset] as usize;
+                let through = peer.last[g] - part.start + 1;
+                *slot = Some(Cell::Float64(through as f64 / rows as f64));
+            }
+        }
+        WindowFunc::Ntile { buckets_col } => {
+            compute_ntile(batch, part, buckets_col, out_part)?;
+        }
         WindowFunc::Lag | WindowFunc::Lead => {
             compute_offset(batch, part, rw, out_part)?;
         }
@@ -1134,6 +1251,74 @@ fn compute_window_for_partition(
                 *slot = apply_frame_func(batch, rw, i, range)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// `ntile(n)`: split the partition into `n` as-equal-as-possible buckets and
+/// report each row's 1-based bucket.
+///
+/// Three rules, all read off a live PostgreSQL 18.2 rather than recalled,
+/// because all three are places implementations go wrong:
+///
+/// 1. **The remainder goes to the *first* buckets, one row each.** With
+///    `rows = 5, n = 3` the answer is `1,1,2,2,3` — buckets of size 2, 2, 1,
+///    not 1, 2, 2 and not 2, 1, 2.
+/// 2. **`n` is evaluated once, at the partition's first row.** Verified by
+///    feeding a per-row bucket count of `3,1,1,1,1`: the whole partition came
+///    back as `ntile(3)` (`1,1,2,2,3`), so later rows' values are never read.
+/// 3. **Peer groups are irrelevant.** Unlike `rank`/`percent_rank`/
+///    `cume_dist`, `ntile` splits on physical position, so tied rows can land
+///    in different buckets — five equal values under `ntile(2)` give
+///    `1,1,1,2,2`.
+///
+/// `n <= 0` is an error in Postgres (`argument of ntile must be greater than
+/// zero`), and `n` NULL makes the whole partition NULL — an error and a NULL
+/// respectively, not the same thing.
+fn compute_ntile(
+    batch: &RecordBatch,
+    part: &Partition,
+    buckets_col: usize,
+    out: &mut [Option<Cell>],
+) -> Result<(), ExecError> {
+    let rows = part.end - part.start;
+    let n = match extract_cell(batch.column(buckets_col), part.start)? {
+        Some(Cell::Int64(n)) => n,
+        // A NULL bucket count yields NULL for every row of the partition —
+        // the slots are already `None`, so there is nothing to write.
+        None => return Ok(()),
+        Some(other) => {
+            return Err(ExecError::TypeMismatch(format!(
+                "ntile()'s bucket count must be an integer, got {other:?}"
+            )));
+        }
+    };
+    if n <= 0 {
+        // Postgres's own wording and its own error, not a clamp to 1 and not
+        // a NULL. `ExecError` has no invalid-parameter-value variant yet
+        // (Postgres raises SQLSTATE 22023 here); when one is added this
+        // should move to it rather than keep masquerading as internal.
+        return Err(ExecError::Internal(
+            "argument of ntile must be greater than zero".into(),
+        ));
+    }
+    let n = n as usize;
+    // Bucket `b` (0-based) holds `rows / n` rows, plus one more for the first
+    // `rows % n` buckets — rule 1 above.
+    let base = rows / n;
+    let remainder = rows % n;
+    let mut bucket = 0usize;
+    let mut left = base + usize::from(bucket < remainder);
+    for slot in out.iter_mut() {
+        // A bucket can legitimately be empty when `n > rows` (base = 0 and
+        // this bucket is past the remainder), so this must be a loop, not an
+        // `if`.
+        while left == 0 {
+            bucket += 1;
+            left = base + usize::from(bucket < remainder);
+        }
+        *slot = Some(Cell::Int64((bucket + 1) as i64));
+        left -= 1;
     }
     Ok(())
 }
@@ -1485,6 +1670,9 @@ fn apply_frame_func(
         WindowFunc::RowNumber
         | WindowFunc::Rank
         | WindowFunc::DenseRank
+        | WindowFunc::PercentRank
+        | WindowFunc::CumeDist
+        | WindowFunc::Ntile { .. }
         | WindowFunc::Lag
         | WindowFunc::Lead => {
             unreachable!("apply_frame_func is only called for frame-driven functions")
@@ -2857,5 +3045,390 @@ mod tests {
             assert_eq!(mn.value(i), "a");
             assert_eq!(mx.value(i), "c");
         }
+    }
+
+    // ── percent_rank / cume_dist / ntile ─────────────────────────────────
+    //
+    // Every expected sequence below was read off a live PostgreSQL 18.2
+    // (`postgres://pc@127.0.0.1:5432/postgres`), with the query quoted so it
+    // can be re-run. These three are where peer-group handling usually goes
+    // wrong, so the fixtures deliberately contain ties.
+
+    fn no_arg_spec(func: WindowFunc, alias: &str) -> WindowSpec {
+        WindowSpec {
+            func,
+            arg_col: None,
+            offset_col: None,
+            default_col: None,
+            nth_col: None,
+            frame: None,
+            alias: alias.into(),
+        }
+    }
+
+    fn col_i32(batch: &RecordBatch, name: &str) -> Vec<Option<i32>> {
+        batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("no column {name}"))
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap_or_else(|| panic!("column {name} is not Int32"))
+            .iter()
+            .collect()
+    }
+
+    /// `x` values plus a broadcast `ntile` bucket-count column, already in
+    /// the physical order this operator requires.
+    fn ntile_fixture(xs: Vec<i64>, buckets: Vec<Option<i64>>) -> (SchemaRef, RecordBatch) {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![i64_col("x"), i64_col("n")]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(xs)),
+                Arc::new(Int64Array::from(buckets)),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    //   SELECT x, percent_rank() OVER (ORDER BY x), cume_dist() OVER (ORDER BY x)
+    //     FROM (VALUES (1),(2),(2),(4)) t(x) ORDER BY x;
+    //   → 1 | 0                  | 0.25
+    //     2 | 0.3333333333333333 | 0.75
+    //     2 | 0.3333333333333333 | 0.75
+    //     4 | 1                  | 1
+    //
+    // The two tied rows are the whole test. `percent_rank` must read the peer
+    // group's *first* row (both report rank 2, hence 1/3) and `cume_dist` its
+    // *last* (both report 3/4). A row-number-based implementation gives
+    // 1/3 and 2/3 for percent_rank and 2/4 and 3/4 for cume_dist — plausible,
+    // and wrong on both.
+    #[test]
+    fn percent_rank_and_cume_dist_share_a_value_across_a_peer_group() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![i64_col("x")]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 2, 4]))],
+        )
+        .unwrap();
+        let child = Feed::boxed(Arc::clone(&schema), batch);
+        let windows = vec![
+            no_arg_spec(WindowFunc::PercentRank, "pr"),
+            no_arg_spec(WindowFunc::CumeDist, "cd"),
+        ];
+        let mut op =
+            WindowAgg::new(child, vec![], vec![oc(0, false)], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        assert_eq!(
+            col_f64(&out, "pr"),
+            vec![
+                Some(0.0),
+                Some(0.3333333333333333),
+                Some(0.3333333333333333),
+                Some(1.0)
+            ]
+        );
+        assert_eq!(
+            col_f64(&out, "cd"),
+            vec![Some(0.25), Some(0.75), Some(0.75), Some(1.0)]
+        );
+    }
+
+    //   SELECT g, x, percent_rank() OVER (PARTITION BY g ORDER BY x),
+    //               cume_dist()   OVER (PARTITION BY g ORDER BY x),
+    //               ntile(2)      OVER (PARTITION BY g ORDER BY x)
+    //     FROM (VALUES (1,10),(1,20),(1,20),(2,5),(2,5),(2,7),(2,9)) t(g,x)
+    //    ORDER BY g, x;
+    //   → 1,10 | 0                  | 0.3333333333333333 | 1
+    //     1,20 | 0.5                | 1                  | 1
+    //     1,20 | 0.5                | 1                  | 2
+    //     2,5  | 0                  | 0.5                | 1
+    //     2,5  | 0                  | 0.5                | 1
+    //     2,7  | 0.6666666666666666 | 0.75               | 2
+    //     2,9  | 1                  | 1                  | 2
+    //
+    // Note the `1,20` pair: it is one peer group for percent_rank/cume_dist
+    // but is *split* by ntile, which counts physical rows. Both behaviours in
+    // one fixture, so an implementation cannot satisfy one by breaking the
+    // other.
+    #[test]
+    fn percent_rank_cume_dist_and_ntile_reset_per_partition_and_disagree_on_ties() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![i64_col("g"), i64_col("x"), i64_col("n")]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1, 1, 2, 2, 2, 2])),
+                Arc::new(Int64Array::from(vec![10i64, 20, 20, 5, 5, 7, 9])),
+                Arc::new(Int64Array::from(vec![2i64; 7])),
+            ],
+        )
+        .unwrap();
+        let child = Feed::boxed(Arc::clone(&schema), batch);
+        let windows = vec![
+            no_arg_spec(WindowFunc::PercentRank, "pr"),
+            no_arg_spec(WindowFunc::CumeDist, "cd"),
+            no_arg_spec(WindowFunc::Ntile { buckets_col: 2 }, "nt"),
+        ];
+        let mut op =
+            WindowAgg::new(child, vec![0], vec![oc(1, false)], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        assert_eq!(
+            col_f64(&out, "pr"),
+            vec![
+                Some(0.0),
+                Some(0.5),
+                Some(0.5),
+                Some(0.0),
+                Some(0.0),
+                Some(0.6666666666666666),
+                Some(1.0),
+            ]
+        );
+        assert_eq!(
+            col_f64(&out, "cd"),
+            vec![
+                Some(0.3333333333333333),
+                Some(1.0),
+                Some(1.0),
+                Some(0.5),
+                Some(0.5),
+                Some(0.75),
+                Some(1.0),
+            ]
+        );
+        assert_eq!(
+            col_i32(&out, "nt"),
+            vec![
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(2)
+            ],
+            "ntile splits the (1,20) peer group; percent_rank/cume_dist do not"
+        );
+    }
+
+    //   SELECT x, ntile(3) OVER (ORDER BY x)
+    //     FROM (VALUES (1),(2),(3),(4),(5)) t(x) ORDER BY x;   → 1,1,2,2,3
+    //
+    // Five rows into three buckets: the remainder goes to the *first*
+    // buckets, so sizes are 2, 2, 1 — not 1, 2, 2.
+    #[test]
+    fn ntile_gives_the_remainder_to_the_first_buckets() {
+        let (schema, batch) = ntile_fixture(vec![1, 2, 3, 4, 5], vec![Some(3); 5]);
+        let child = Feed::boxed(Arc::clone(&schema), batch);
+        let windows = vec![no_arg_spec(WindowFunc::Ntile { buckets_col: 1 }, "nt")];
+        let mut op =
+            WindowAgg::new(child, vec![], vec![oc(0, false)], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        assert_eq!(
+            col_i32(&out, "nt"),
+            vec![Some(1), Some(1), Some(2), Some(2), Some(3)]
+        );
+    }
+
+    //   SELECT x, ntile(2) OVER (ORDER BY x), ntile(7) OVER (ORDER BY x),
+    //             ntile(1) OVER (ORDER BY x)
+    //     FROM (VALUES (1),(1),(1),(1),(1)) t(x);
+    //   → 1,1,1,2,2 | 1,2,3,4,5 | 1,1,1,1,1
+    //
+    // All five rows are peers, and ntile still splits them — the clearest
+    // statement that this function is not peer-group sensitive. `ntile(7)`
+    // over 5 rows also exercises the empty-bucket path (`base = 0`), which a
+    // single `if left == 0 { bucket += 1 }` step gets wrong.
+    #[test]
+    fn ntile_ignores_peer_groups_and_handles_more_buckets_than_rows() {
+        for (n, want) in [
+            (2i64, vec![1, 1, 1, 2, 2]),
+            (7, vec![1, 2, 3, 4, 5]),
+            (1, vec![1, 1, 1, 1, 1]),
+        ] {
+            let (schema, batch) = ntile_fixture(vec![1, 1, 1, 1, 1], vec![Some(n); 5]);
+            let child = Feed::boxed(Arc::clone(&schema), batch);
+            let windows = vec![no_arg_spec(WindowFunc::Ntile { buckets_col: 1 }, "nt")];
+            let mut op =
+                WindowAgg::new(child, vec![], vec![oc(0, false)], windows, usize::MAX).unwrap();
+            let out = run_all(&mut op);
+            assert_eq!(
+                col_i32(&out, "nt"),
+                want.into_iter().map(Some).collect::<Vec<_>>(),
+                "ntile({n}) over five tied rows"
+            );
+        }
+    }
+
+    // ntile's bucket count is read once, at the partition's first row.
+    // Verified live by varying it per row:
+    //
+    //   SELECT x, ntile(k) OVER (PARTITION BY g ORDER BY x)
+    //     FROM (VALUES (1,1,3),(1,2,1),(1,3,1),(1,4,1),(1,5,1)) t(g,x,k)
+    //    ORDER BY x;   → 1,1,2,2,3
+    //
+    // i.e. the whole partition behaves as ntile(3) even though four of the
+    // five rows say 1. A per-row implementation would return 1,1,1,1,1 for
+    // rows 2-5.
+    #[test]
+    fn ntile_reads_its_bucket_count_only_at_the_partitions_first_row() {
+        let (schema, batch) = ntile_fixture(
+            vec![1, 2, 3, 4, 5],
+            vec![Some(3), Some(1), Some(1), Some(1), Some(1)],
+        );
+        let child = Feed::boxed(Arc::clone(&schema), batch);
+        let windows = vec![no_arg_spec(WindowFunc::Ntile { buckets_col: 1 }, "nt")];
+        let mut op =
+            WindowAgg::new(child, vec![], vec![oc(0, false)], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        assert_eq!(
+            col_i32(&out, "nt"),
+            vec![Some(1), Some(1), Some(2), Some(2), Some(3)],
+            "the first row's 3 governs the whole partition"
+        );
+    }
+
+    // `ntile(NULL)` is NULL for the whole partition; `ntile(0)` is an ERROR.
+    // Two different outcomes for two adjacent bad inputs — verified live:
+    //
+    //   SELECT ntile(NULL) OVER (ORDER BY x) FROM (VALUES (1),(2)) t(x);  → NULL, NULL
+    //   SELECT ntile(0) OVER () FROM (VALUES (1)) t(x);
+    //   → ERROR: argument of ntile must be greater than zero
+    #[test]
+    fn ntile_null_argument_is_null_but_a_non_positive_one_is_an_error() {
+        let (schema, batch) = ntile_fixture(vec![1, 2], vec![None, None]);
+        let child = Feed::boxed(Arc::clone(&schema), batch);
+        let windows = vec![no_arg_spec(WindowFunc::Ntile { buckets_col: 1 }, "nt")];
+        let mut op =
+            WindowAgg::new(child, vec![], vec![oc(0, false)], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        assert_eq!(col_i32(&out, "nt"), vec![None, None]);
+
+        for n in [0i64, -2] {
+            let (schema, batch) = ntile_fixture(vec![1, 2], vec![Some(n); 2]);
+            let child = Feed::boxed(Arc::clone(&schema), batch);
+            let windows = vec![no_arg_spec(WindowFunc::Ntile { buckets_col: 1 }, "nt")];
+            let mut op =
+                WindowAgg::new(child, vec![], vec![oc(0, false)], windows, usize::MAX).unwrap();
+            let err = op.next_batch().unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "internal error: argument of ntile must be greater than zero",
+                "ntile({n}) must error like Postgres, not clamp or return NULL"
+            );
+        }
+    }
+
+    // A one-row partition is the division-by-zero corner for percent_rank.
+    // Verified live: `SELECT percent_rank() OVER (), cume_dist() OVER (),
+    // ntile(3) OVER ()` over a single row is `0 | 1 | 1`.
+    #[test]
+    fn single_row_partition_gives_zero_one_and_one_not_nan() {
+        let (schema, batch) = ntile_fixture(vec![1], vec![Some(3)]);
+        let child = Feed::boxed(Arc::clone(&schema), batch);
+        let windows = vec![
+            no_arg_spec(WindowFunc::PercentRank, "pr"),
+            no_arg_spec(WindowFunc::CumeDist, "cd"),
+            no_arg_spec(WindowFunc::Ntile { buckets_col: 1 }, "nt"),
+        ];
+        let mut op =
+            WindowAgg::new(child, vec![], vec![oc(0, false)], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        assert_eq!(col_f64(&out, "pr"), vec![Some(0.0)]);
+        assert_eq!(col_f64(&out, "cd"), vec![Some(1.0)]);
+        assert_eq!(col_i32(&out, "nt"), vec![Some(1)]);
+    }
+
+    // With no ORDER BY the whole partition is one peer group, so every row
+    // has rank 1 and every row's peer group ends at the partition's end.
+    // Verified live:
+    //
+    //   SELECT x, percent_rank() OVER (), cume_dist() OVER (), ntile(2) OVER ()
+    //     FROM (VALUES (1),(2),(3)) t(x);   → 0|1|1, 0|1|1, 0|1|2
+    #[test]
+    fn without_an_order_by_percent_rank_is_zero_and_cume_dist_is_one_everywhere() {
+        let (schema, batch) = ntile_fixture(vec![1, 2, 3], vec![Some(2); 3]);
+        let child = Feed::boxed(Arc::clone(&schema), batch);
+        let windows = vec![
+            no_arg_spec(WindowFunc::PercentRank, "pr"),
+            no_arg_spec(WindowFunc::CumeDist, "cd"),
+            no_arg_spec(WindowFunc::Ntile { buckets_col: 1 }, "nt"),
+        ];
+        let mut op = WindowAgg::new(child, vec![], vec![], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        assert_eq!(col_f64(&out, "pr"), vec![Some(0.0); 3]);
+        assert_eq!(col_f64(&out, "cd"), vec![Some(1.0); 3]);
+        assert_eq!(col_i32(&out, "nt"), vec![Some(1), Some(1), Some(2)]);
+    }
+
+    // Same planner-bug-guard posture the rest of this file takes: an argument
+    // column on a no-argument window function is refused at construction, not
+    // ignored.
+    #[test]
+    fn percent_rank_and_cume_dist_with_an_argument_column_are_rejected() {
+        for func in [WindowFunc::PercentRank, WindowFunc::CumeDist] {
+            let schema: SchemaRef = Arc::new(Schema::new(vec![i64_col("x")]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1i64]))],
+            )
+            .unwrap();
+            let child = Feed::boxed(Arc::clone(&schema), batch);
+            let mut spec = no_arg_spec(func, "w");
+            spec.arg_col = Some(0);
+            let err = WindowAgg::new(child, vec![], vec![oc(0, false)], vec![spec], usize::MAX)
+                .err()
+                .unwrap_or_else(|| panic!("{func:?} with an argument column must be rejected"));
+            assert!(matches!(err, ExecError::TypeMismatch(_)), "{err}");
+        }
+    }
+
+    // The partition-scan buffers input across batches, so the new functions
+    // must give the same answer when the same rows arrive split. Same
+    // fixture and expected values as
+    // `percent_rank_and_cume_dist_share_a_value_across_a_peer_group`, fed in
+    // two pieces that cut *through* the tied peer group.
+    #[test]
+    fn percent_rank_cume_dist_and_ntile_are_identical_across_a_batch_boundary() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![i64_col("x"), i64_col("n")]));
+        let mk = |xs: Vec<i64>| {
+            let len = xs.len();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(xs)),
+                    Arc::new(Int64Array::from(vec![2i64; len])),
+                ],
+            )
+            .unwrap()
+        };
+        let child = Feed::multi(Arc::clone(&schema), vec![mk(vec![1, 2]), mk(vec![2, 4])]);
+        let windows = vec![
+            no_arg_spec(WindowFunc::PercentRank, "pr"),
+            no_arg_spec(WindowFunc::CumeDist, "cd"),
+            no_arg_spec(WindowFunc::Ntile { buckets_col: 1 }, "nt"),
+        ];
+        let mut op =
+            WindowAgg::new(child, vec![], vec![oc(0, false)], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        assert_eq!(
+            col_f64(&out, "pr"),
+            vec![
+                Some(0.0),
+                Some(0.3333333333333333),
+                Some(0.3333333333333333),
+                Some(1.0)
+            ]
+        );
+        assert_eq!(
+            col_f64(&out, "cd"),
+            vec![Some(0.25), Some(0.75), Some(0.75), Some(1.0)]
+        );
+        assert_eq!(
+            col_i32(&out, "nt"),
+            vec![Some(1), Some(1), Some(2), Some(2)]
+        );
     }
 }
