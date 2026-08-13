@@ -2,449 +2,576 @@
 title: "DF removal — UDF re-hosting inventory"
 nav_section: migration
 sidebar_position: 17
-summary: "The 249 UDFs are mostly not a porting problem. Their logic is already DataFusion-independent; what they need is a session-context abstraction the owned engine does not have, and several are fake stubs returning wrong answers today."
+summary: "Basin registers 308 SQL function names on DataFusion. basin-exec already implements 12 of them. A separate, previously uncounted 48 pg_catalog function names are served today only by DataFusion's own builtins and have no Basin code at all — deleting the dependency deletes them."
 tags: [migration, udf, functions, pg-compat]
 ---
 
 # 17 — UDF re-hosting inventory
 
 Part of the [ADR 0030](../../decisions/0030-own-query-engine-remove-datafusion.md)
-migration map. [04](./04-function-gap.md) measured the *size* of this block —
-238 `ScalarUDFImpl` plus 11 aggregate/window across ~37k LOC, the largest
-untouched piece of the migration. This document asks the different question:
-**what kind of work is it?**
+migration map. [04](./04-function-gap.md) measured the *size* of the block;
+the previous revision of this document surveyed its *character*. This revision
+answers the question that actually gates the work:
 
-**Status: complete.** All eight families are inventoried below, plus the
-fourth ABSENT category (math) found along the way.
+> **How much of it does `basin-exec` already do?**
 
-## The headline: it is not mostly a porting problem
+**Answer: 12 names of 308. 296 remain, plus 48 more nobody had counted.**
 
-Across the families surveyed, the logic is **already
-DataFusion-independent pure Rust**. The advisory-lock module's own docs note it
-has zero external dependencies; the sketches live in `basin-sketch`; the
-wasmtime sandbox is standalone. What couples them to DataFusion is, in most
-cases, only the `ScalarUDFImpl` trait shell.
+## Method, and its limits
 
-What they actually need is something the owned engine does not have:
+Everything below was measured on 2026-08-13 against
+`feat/own-engine-remove-datafusion` at `6f0d9630`, with the working tree dirty
+(`crates/basin-exec/src/eval.rs` and four `basin-engine` files are being edited
+concurrently by other agents — `eval.rs`'s coverage numbers are a *floor* and
+will only go up). Every command is stated inline so any number can be re-run.
+Where a count could not be obtained mechanically, that is said rather than
+smoothed over.
 
-> **A session-context abstraction reachable from function resolution.**
+**The one thing that is genuinely hard to count**, and the reason this was not
+done earlier: *registered function names are not statically enumerable by a
+single grep.* Basin registers UDFs five different ways —
 
-`basin-exec`'s `eval.rs` is scalar-expression-only and has no notion of a
-session, a lock table, a cancellation channel, or an HTTP client — its own
-module docs say so. Advisory locks, `pg_cancel_backend`, the cron and net glue,
-and the sequence rewrite path all need a session context threaded into wherever
-function calls resolve. **That plumbing is a bigger lift than porting any
-individual function's logic**, and it is shared by every ENTANGLED entry below.
+1. a literal in `fn name(&self) -> &str { "foo" }`;
+2. a `match self.field { … => "foo" }` inside that same method;
+3. a `name: "foo"` / `name: "foo".into()` field on a parameterised struct
+   filled at the registration site (all of `pg_catalog_udf.rs`, most of
+   `range_udf.rs`, `advisory_lock.rs`, `string_dt_udf.rs`, …);
+4. a constructor argument — `JsonAggUdaf::new("json_agg")`,
+   `make_alias_f64("ceiling", f64::ceil)`, `make_udf("l2_distance", …)`;
+5. a macro literal — `simple_udf!(GeomFromTextUdf, "st_geomfromtext", …)`,
+   which is how 26 of the geo functions are declared.
 
-## Surveyed families
+A name-only grep sees (1) and misses the rest. **46 `fn name()` bodies return
+`self.name` rather than a literal** —
 
-| Family | Names | LOC | TRIVIAL | MECHANICAL | ENTANGLED |
-|---|---:|---:|---:|---:|---:|
-| Aggregate / window | 10 | ~4,265 | 0 | 9 | 1 |
-| System / misc | ~25 | ~7,482 | 13 | 2 | 15 |
-| Date / time / interval | 26 | ~3,116 | 10 | 14 | 2 |
-| Regex / FTS / trigram | 25 | ~4,454 | 8 | 17 | **0** |
-| Geo / PostGIS | 43 live | ~3,820 | 12 | 45 | 3 |
-| String | 19 | ~2,502 | 12 | 7 | 0 |
-| JSONB | 51 live | ~11,628 | 16 | 31 | 4 |
-| Range | 30 live | ~3,155 | 2 | 13 | 0 |
-| Math | **see below** | — | — | — | — |
-| **Surveyed total** | **~229** | **~40,422** | **73** | **138** | **25** |
-
-### Math: the taxonomy has no slot for it, and that is the finding
-
-The string family behaves as expected — 19 structs across `string_dt_udf.rs`
-(14, 1,285 lines) and `string_more_udf.rs` (5, 1,217 lines), zero entangled,
-mostly pure text manipulation that ports as plain Rust.
-
-Math does not, because **Basin does not implement it**. Searching the whole of
-`basin-engine` for `sqrt`, `cbrt`, `ln`, `log`, `exp`, `power`, `trunc`,
-`degrees`, `radians`, `atan2` and the trigonometric family returns **nothing**.
-The only math-ish names Basin registers of its own are `div`, `width_bucket`,
-`to_number` and `sign`, in `pg_scalar_aliases.rs`.
-
-`SELECT sqrt(2)` works today entirely because DataFusion's built-in
-`datafusion-functions` math module is registered on the `SessionContext`.
-
-That makes the math family a **fourth category** this document did not have:
-
-> **ABSENT** — no Basin code exists to re-host. Deleting DataFusion deletes the
-> function outright, and it must be *written*, not moved.
-
-The other three categories all describe code that exists and needs a new home.
-This one describes a capability that silently belongs to the dependency being
-removed. It is invisible to any inventory that counts `ScalarUDFImpl`
-definitions, because there is nothing to count — which is exactly why it went
-unrecorded through four earlier surveys.
-
-The current state across the owned crates:
-
-| | Math names known |
-|---|---|
-| `basin-pgtype`'s `pg_proc` table | 7 — `abs`, `ceil`, `floor`, `mod`, `power`, `round`, `sqrt` |
-| `basin-exec`'s evaluator | 4 — `abs`, `ceil`, `floor`, `round` |
-
-So even the names Basin has OIDs for are only half executable, and `sqrt` is
-already a table entry with no implementation behind it.
-
-**This is not a large amount of work** — the functions are individually trivial
-and mostly one `f64` method call each, with the real care going into Postgres's
-rounding and error semantics (`round` on `double precision` is half-to-even, on
-`numeric` half-away-from-zero; `ln(0)` and `sqrt(-1)` must error rather than
-return infinity or NaN). It is, however, work that no one had counted, and it is
-a hard blocker on step 5: the `Cargo.toml` line cannot be deleted while `sqrt`
-has no implementation.
-
-The regex/FTS/trigram family is worth singling out: **zero entangled**, across
-4,454 lines including the whole full-text search stack. `tsvector` and `tsquery`
-are not Arrow extension types — they are plain `Utf8` holding a canonical text
-form, and every parser, ranker and evaluator over them is self-contained Rust
-touching DataFusion only at the `invoke_with_args` boundary. Since `eval.rs`
-already speaks raw `ArrayRef`/`RecordBatch` rather than DataFusion's
-`ColumnarValue`, the shell swap is mechanical. `ts_rank_cd`'s sliding-window
-minimal-cover algorithm is the most involved thing in the family and is still
-pure arithmetic.
-
-### Geo: 59 structs behind 43 names, and 16 of them are dead
-
-The geo family was assumed to be ~34 structs. It is **59**, in two
-generations. Thirty-three "wave-α" structs handle POINT only, stored as
-`FixedSizeBinary(21)`, with many bodies degenerate for non-POINT semantics —
-`st_area` returns a constant `0.0`, `st_centroid` is identity, `st_numpoints`
-returns `1`. Twenty-six later general-geometry structs handle real
-LineString/Polygon/Multi* over variable-length WKB.
-
-**Sixteen SQL names are registered twice**, and because `register_udf`
-overwrites by name, the general implementation wins and the wave-α struct is
-unreachable from SQL — while still compiling, and still being unit-tested
-directly by tests that instantiate it by hand. So those tests pass against code
-no query can reach.
-
-The re-hosting target is therefore **43 live names, not 59 structs**, always
-taking the general implementation where a name is shadowed. Porting all 59
-would either duplicate OIDs or silently pick the degenerate POINT-only version
-of a function that currently works properly.
-
-The geometry itself is in excellent shape for the migration: `basin-geo` is a
-pure-Rust crate with zero Arrow and zero DataFusion dependency, and `geo` and
-`proj4rs` are likewise independent. The coupling is only the trait shell — with
-one real exception. `st_srid` and `st_transform` read `BASIN_SRID` out of
-DataFusion's per-call `ScalarFunctionArgs.arg_fields[].metadata()`, and
-`basin-exec`'s evaluator has no equivalent: it sees arrays, not the source
-columns' Field metadata. That is a design question, not a translation.
-
-### JSONB: 59 structs, two of them shadowed the same way Geo's are
-
-`jsonb_udf.rs` (7,524 lines), `jsonb_path_udf.rs` (1,952), `jsonb_modify_udf.rs`
-(1,395) and `json_build_udf.rs` (757) together register 59 `ScalarUDFImpl`
-structs. Eight are dead on arrival, shadowed the same way the geo family's
-wave-α structs are: `session.rs` calls `register_jsonb_udfs` first, then
-`register_jsonb_path_udfs`, then `register_jsonb_modify_udfs` — and DataFusion's
-`register_udf` replaces by name, so whichever registers last wins.
-
-- `jsonb_modify_udf.rs` re-registers `jsonb_typeof`, `jsonb_pretty`,
-  `jsonb_strip_nulls`, `jsonb_set` and `jsonb_insert` (`session.rs:380`, after
-  `jsonb_udf.rs`'s copies at `session.rs:371`). This one is **intentional and
-  self-documented** — `jsonb_modify_udf.rs:23-25` says so in a doc comment,
-  and its versions genuinely handle the `text[]` path argument better. The
-  five structs left behind in `jsonb_udf.rs` (`JsonbTypeofUdf` at line 1883,
-  `JsonbPrettyUdf` at 1944, `JsonbStripNullsUdf` at 2054, `JsonbSetUdf` at
-  2100, `JsonbInsertUdf` at 2211) are unreachable from SQL and should not be
-  ported.
-- `jsonb_path_udf.rs` re-registers `jsonb_path_query_first`,
-  `jsonb_path_query_array` and `jsonb_path_match` (`session.rs:379`, also
-  after `jsonb_udf.rs`'s copies). This one is **not** documented as
-  intentional shadowing anywhere, and it is the more consequential of the
-  two — see below.
-
-Re-hosting target: **51 live names across the 59 structs**, same rule as
-geo — always take the version that wins the registration race, never the
-one left behind.
-
-### JSONB path functions: the real JSONPath engine only covers three of five entry points
-
-`jsonb_path_udf.rs`'s module doc advertises a real JSONPath subset — `$`,
-`.key`, `[0]`, `[*]`, `.*`, `..key`, and `[?(@.x > 1)]` filters — implemented
-by a genuine recursive-descent parser and evaluator (`parse_jsonpath` /
-`jsonpath_eval`, `jsonb_path_udf.rs:526-928`). But that parser only backs
-three of the five JSONPath entry points PostgreSQL exposes:
-`jsonb_path_query_first`, `jsonb_path_query_array`, and `jsonb_path_match`
-(the `@@` operator). It does **not** back plain `jsonb_path_query` in scalar
-position, and it does not back `jsonb_path_exists` (the `@?` operator) at
-all — `register_jsonb_path_udfs` (`jsonb_path_udf.rs:72-106`) never
-registers either name.
-
-Both of those names fall through to `jsonb_udf.rs`'s original, much weaker
-implementation: `JsonbPathQueryUdf` (line 2619) and `JsonbPathExistsUdf`
-(line 2719) strip the leading `$.` and split what's left on `.` — no `[*]`,
-no filters, no recursive descent, no array-index brackets as anything but
-literal path segments. `jsonb_path_match` on the *jsonb_udf.rs* copy
-(line 2814, dead — shadowed as above) even says so in its own comment:
-`// jsonb_path_match  (alias of jsonb_path_exists for simple paths)`.
-
-`jsonb_path_query` in scalar/SELECT-list position is also missing PostgreSQL's
-row-expansion behavior entirely — it's a genuine SRF there (one output row
-per match), but the scalar stub caps out at one match per input row, same as
-`jsonb_path_query_first`. Confirmed against Postgres 18.2:
-
-```sql
--- jsonb_path_exists: filter predicate
-SELECT jsonb_path_exists('{"a":[1,2,3]}'::jsonb, '$.a[*] ? (@ > 2)');
--- Postgres: t.  Basin's live jsonb_path_exists: parse_path("a[*] ? (@ > 2)")
--- treats the whole filter text as one literal key segment and never finds
--- it → f.
-
--- jsonb_path_query: row expansion in scalar position
-SELECT jsonb_path_query('{"a":[1,2,3]}'::jsonb, '$.a[*]');
--- Postgres: three rows (1, 2, 3).  Basin's live jsonb_path_query strips
--- '$.' and splits on '.', leaving the single segment "a[*]" which matches no
--- object key → one row, NULL.
+```
+$ grep -rEA2 'fn name\(&self\) -> &str' --include='*.rs' crates/basin-engine/src \
+    | grep -c 'self\.name\|self\.fn_name\|\$name'
+46
 ```
 
-Whoever re-hosts this family should retire `JsonbPathQueryUdf` and
-`JsonbPathExistsUdf` and route both names through `jsonpath_eval` instead —
-otherwise the fuller parser's own module doc becomes misleading: it describes
-capabilities two of the five call sites into it don't have.
+— so the true set was assembled by a script combining all five forms, with the
+enclosing `impl … for` walked backwards from each `fn name()` so that
+`ExecutionPlan`/`OptimizerRule`/`AnalyzerRule` name methods (which are *not*
+SQL functions) are excluded. That exclusion matters: a naive harvest returns
+`sort_streaming_limit`, `GinRowGroupScanExec` and `citext_analyzer` as if they
+were callable SQL.
 
-### Range: only `range_eq` knows its own subtype, and every other predicate silently mishandles date/timestamp bounds
+Two things remain genuinely uncountable and are excluded from every total:
 
-Range values are stored as JSON text: `{"l":<lower>,"u":<upper>,"li":<bool>,
-"ui":<bool>}` (`range_udf.rs:1-6`). For `int4range`/`int8range`/`numrange`
-the bounds are JSON numbers. For `daterange`/`tsrange`/`tstzrange` they are
-JSON **strings** — `"2024-01-01"`, `"2024-01-01 00:00:00"` — because dates and
-timestamps don't fit in a JSON number.
+- **WASM UDFs.** `wasm_udf.rs`'s names come from the project catalog at session
+  open (`session.rs:2965-2980`), not from source. The count is per-project and
+  unbounded. Treated as a category, not a number — see §5.3.
+- **DataFusion's own builtin registry.** Enumerated below at **174 names**, but
+  by the same `fn name()`/`aliases()` heuristic applied to
+  `datafusion-functions{,-aggregate,-nested,-window}-53.1.0` in
+  `~/.cargo/registry`. It is known to **under**-count: `rank`, `dense_rank` and
+  `percent_rank` are macro-generated in `datafusion-functions-window`'s
+  `rank.rs` and the heuristic misses them. So "48 orphaned pg_catalog names"
+  in §3 is a floor, not a ceiling.
 
-Every predicate except `range_eq` reads bounds through `range_bound_f64`
-(`range_udf.rs:849-856`), which does
-`fv.as_f64().or_else(|| fv.as_str().and_then(|s| s.parse().ok()))` — a plain
-`f64::from_str` on the bound text. `"2024-01-01".parse::<f64>()` fails
-(multiple hyphens are not valid float syntax), so **every finite date or
-timestamp bound silently becomes
-`None`**, and every one of these functions treats `None` the same as an
-*infinite* bound rather than "couldn't parse":
+## 1. The measured baseline
 
-- `range_overlaps` (`range_udf.rs:778-847`): with both bounds unparseable,
-  `a_ends_before_b` and `b_ends_before_a` both default to `false` (the `_ =>
-  false` arms at lines 826, 837) → the function reports **every pair of
-  date/timestamp ranges as overlapping**, even ones nowhere near each other.
-- `range_contains_range` (`range_udf.rs:873-958`): `i_hi` parses to `None`,
-  which the `(None, _) => false` arm at line 932 treats as "inner extends to
-  +infinity, outer can't contain it" → **always `false`** for date/timestamp
-  containment, even when the inner range is fully inside the outer one.
-- `range_contains_elem` (`range_udf.rs:686-761`): the *element* is also text
-  (`"2024-03-01"`), so `elem_s.parse::<f64>()` fails too and the whole
-  closure short-circuits via `?` → returns **SQL `NULL`** instead of a
-  boolean, for every date/timestamp element test.
-- `range_strictly_left` / `range_strictly_right` / `range_adjacent`
-  (`RangeRelationalUdf`, `range_udf.rs:977-1118`): every `_ => Some(false)`
-  fallback arm fires on the unparseable bound → **always `false`**, so `<<`,
-  `>>` and `-|-` never fire for date/timestamp ranges no matter how the
-  ranges actually relate.
-- `range_merge` / `range_union` / `range_intersection` / `range_diff`
-  (`RangeParts`, `range_udf.rs:1322-1384`): `RangeParts.lo`/`.hi` are
-  `Option<f64>`; a date bound parses to `None`, and `format_range_parts`
-  writes `None` back out as JSON `null` — the storage encoding for
-  **infinity**. A `range_merge` of two ordinary, fully-bounded date ranges
-  silently produces `(-infinity, +infinity)`, discarding the actual dates
-  entirely rather than erroring.
-- `isempty` also reads bounds through `range_bound_f64`
-  (`range_is_empty`, `range_udf.rs:239-257`), so it inherits the same
-  failure — see below.
-
-`range_eq` is the one exception, and the reason is structural, not
-accidental: it's the only predicate the pre-parse rewriter hands a third
-argument, the subtype name (`range_udf.rs:1160-1197`), and it delegates to
-`basin_common::types::range::RangeValue::semantic_eq`, whose `bounds_eq`
-helper (`basin-common/src/types/range.rs:473-485`) falls back to plain
-string comparison when the numeric parse fails. Every other range function
-in `range_udf.rs` has no subtype argument in its signature at all — `isempty`
-is `Signature::exact(vec![DataType::Utf8], ...)`, one argument, no way to
-know discreteness even in principle — and none of them has the string
-fallback either.
-
-Confirmed against Postgres 18.2 (all five diverge from Basin's current
-behavior):
-
-```sql
-SELECT
-  daterange('2024-01-01','2024-06-01') @> '2024-03-01'::date,        -- t (Basin: NULL)
-  daterange('2024-01-01','2024-03-01')
-    && daterange('2024-06-01','2024-08-01'),                          -- f (Basin: t)
-  daterange('2024-01-01','2024-06-01')
-    @> daterange('2024-02-01','2024-03-01'),                          -- t (Basin: f)
-  daterange('2024-01-01','2024-03-01')
-    << daterange('2024-06-01','2024-08-01'),                          -- t (Basin: f)
-  daterange('2024-01-01','2024-03-01')
-    -|- daterange('2024-03-01','2024-06-01');                         -- t (Basin: f)
+```
+$ grep -rc datafusion --include='*.rs' crates/basin-engine/src | awk -F: '{s+=$2} END {print s}'
+1017
+$ grep -rl datafusion --include='*.rs' crates/basin-engine/src | wc -l
+67
+$ grep -rE 'register_udf|register_udaf|ScalarUDF::|AggregateUDF::' --include='*.rs' crates/basin-engine/src | wc -l
+372
 ```
 
-A second, smaller bug shares the same root cause of "predicates don't know
-their own subtype": `range_is_empty` treats an open range between adjacent
-integers as non-empty, because nothing tells it the type is discrete.
-PostgreSQL canonicalizes `(5,6)::int4range` to `empty` (no integer lies
-strictly between 5 and 6); Basin's `range_is_empty` only checks `lo > hi` or
-`lo == hi` (`range_udf.rs:239-257`), sees `5 < 6`, and reports non-empty.
-Confirmed: `SELECT isempty('(5,6)'::int4range)` is `t` in Postgres 18.2.
-`int4range`/`int8range`/`daterange` are exactly the three subtypes this
-affects, and they're also three of the six range constructors.
+Two corrections to how those figures have been quoted:
 
-`range_udf.rs` has **zero ENTANGLED** functions — no session, no catalog, no
-async, same as regex/FTS — but re-hosting it correctly requires first
-deciding how every predicate learns its subtype, not just `range_eq`. That's
-a smaller version of the session-context problem this document keeps
-surfacing: the missing input isn't DataFusion-shaped, it's "which of six
-range types is this text really".
+- **67 files, not 69.** `find crates/basin-engine/src -name '*.rs' | wc -l` is
+  133; 67 of them mention `datafusion`.
+- **372 is a line count, not a function count.** Most registration lines match
+  two of the four patterns at once (`ctx.register_udf(ScalarUDF::from(…))`).
+  The component counts are `register_udf` 349, `register_udaf` 13,
+  `register_udtf` 14, `ScalarUDF::` 348, `AggregateUDF::` 13. Those ~362
+  registration calls resolve to **308 distinct SQL names**, because 23 names
+  are registered twice under a `pg_catalog.`-qualified alias and 18 more are
+  registered from two different modules (§6).
 
-## The cheapest win, and the most expensive one
+Also settled: `datafusion = "53"` (`Cargo.toml:149`) is consumed by
+**`basin-engine` only**. `basin-plan/Cargo.toml` mentions DataFusion in a
+comment; it has no dependency on it. `grep -rln datafusion --include=Cargo.toml`
+returns the workspace root, `basin-engine` (real) and `basin-plan` (comment).
 
-**Cheapest:** the ~17 `pg_catalog` stub functions in `pg_catalog_udf.rs` are
-hardcoded constants or trivial format strings with no session or catalog
-dependency — `pg_table_is_visible` returns `true`, `current_schema` returns
-`'public'`, `pg_relation_size` returns `0`. They port as plain Rust functions
-in an afternoon.
+## 2. The three lists
 
-**Most expensive:** `array_agg` is the one genuine *algorithmic* entanglement.
-`PgArrayAggUdaf` hand-rolls a vectorised `GroupsAccumulator` — global
-`lexsort_to_indices` plus `interleave` plus a partial-state struct layout —
-specifically because DataFusion's generic accumulator was 6.5× slower than
-Postgres at 1M rows. `basin-exec`'s `aggregate.rs` has **no vectorised
-group-wise tier**; its own header says that is future work. So re-hosting
-`array_agg` means building infrastructure Basin does not have, or accepting a
-documented performance regression.
+`basin-exec` dispatches scalar functions on `pg_proc` OID, not on name
+(`eval.rs:1195 fn eval_scalar_fn(func: FuncId, …)`), so both sides were
+reduced to names before diffing. The exec side is:
 
-> **Measured 2026-08-13, and it changes this entry.** A first vectorised tier
-> was built and benchmarked in release against a faithful stand-in for the
-> existing row-wise algorithm:
->
-> | Shape | Row-wise | Vectorised | |
-> |---|---:|---:|---:|
-> | 1M rows / 100k groups | 99 ms | 165 ms | **0.60×** |
-> | 1M rows / 10 groups | 77 ms | 102 ms | **0.76×** |
->
-> Correct on all 334 tests, and slower on both shapes. It is preserved on
-> `spike/vectorised-aggregate` and deliberately not merged.
->
-> This entry assumed the expensive part of re-hosting `array_agg` is that the
-> tier does not exist. That was wrong. The expensive part is building one that
-> **beats the scalar loop** — DataFusion's own generic accumulator was 6.5×
-> slower than Postgres, which is why `PgArrayAggUdaf` hand-rolls
-> `lexsort_to_indices` + `interleave` rather than looping. Reproducing that
-> specific algorithm is the work; "add a vectorised tier" is not a plan.
->
-> A caution about the measurement itself: the benchmark was initially broken in
-> a way that hid this. It pulled a single batch from the operator and compared
-> its row count to the full group count — asserting `8192 == 100000` — because
-> the operator emits groups in output-sized batches like every other one in the
-> crate. A benchmark that measures the first 8192 groups and calls it the whole
-> aggregation would have reported a flattering number just as confidently.
+| Where | How counted | Names |
+|---|---|---:|
+| `eval.rs` scalar | `grep -c 'const OID_' crates/basin-exec/src/eval.rs` → 52 OIDs, whose trailing comments give the signature | **35** |
+| `build.rs` `agg_func_of` (l. 1639) | read directly | 7 |
+| `build.rs` `window_func_of` (l. 1747) | read directly | 8 |
+| `cte.rs` `srf_kind_of` (l. 353) | read directly | 2 |
+| | | **52 total** |
 
-## Traps worth knowing before anyone starts
+`eval_scalar_fn`'s `match` is **151 lines** and references exactly 52 `OID_*`
+constants — there is no second dispatch table, no macro expansion, and no
+name-keyed fallback. Everything else in the `match` falls to
+`ExecError::Internal("… is not implemented in eval yet")`.
 
-These are the findings that change how the work should be approached, rather
-than its size.
+### 2a. ALREADY COVERED — 12
 
-**Several functions are fake stubs that return wrong answers today.** Not
-simplified — wrong.
-- `array_contains` (`@>`) checks `rhs.len() <= lhs.len()` instead of element
-  containment.
-- `arrays_overlap` (`&&`) checks "both non-empty" instead of intersection.
-- `timezone` / `at_time_zone` pass non-UTC zones through **unchanged**, so any
-  zone other than UTC silently produces a wrong value with a UTC annotation
-  attached.
-Re-hosting these mechanically would carry the wrongness forward under a new
-implementation that looks more trustworthy. Each needs a decision: fix, or
-carry the stub-ness forward with equal prominence.
+Engine-registered **and** implemented in `basin-exec`:
+
+```
+array_agg  btrim  ceiling  left  length  lower  ltrim
+power  right  rtrim  sign  upper
+```
+
+### 2b. NOT COVERED — 296
+
+The remaining engine-registered names. 178 of them are real
+`pg_catalog` functions in PostgreSQL 18.2; 118 are not. Verified by loading
+the list into the live server:
+
+```
+$ psql postgres://pc@127.0.0.1:5432/postgres -tAF'|' <<'SQL'
+create temp table n(name text);
+\copy n from 'notcov.txt'
+select case when exists (select 1 from pg_proc p
+                          where p.proname = n.name and p.pronamespace = 11)
+            then 1 else 0 end, n.name from n order by 1 desc, 2;
+SQL
+… in pg_catalog: 178   not: 118
+```
+
+Family breakdown in §4.
+
+### 2c. COVERED BUT DIVERGENT — 12 of 12
+
+**Every one of the 12 covered names is implemented on both sides**, so all 12
+are divergence candidates by construction. Reading both implementations, five
+are materially divergent and one of those is a live wrong answer:
+
+| Name | Engine | `basin-exec` | Verdict |
+|---|---|---|---|
+| **`lower` / `upper`** | `range_udf.rs:503 RangeAccessorUdf` — registered under the bare names `lower`/`upper`, shadowing DataFusion's string builtins (`session.rs:378`, after `string_dt_udf` at 369; `register_udf` overwrites by name). Dispatches on a **content heuristic**: if the text starts with `{` and parses as range JSON, return the bound; else lowercase/uppercase. | `OID_LOWER` 870 / `OID_UPPER` 871 — unconditional case conversion | **Engine is wrong.** `SELECT lower('{"l":1,"u":5,"li":true,"ui":false}')` is the lowercased literal in Postgres 18.2 (verified); Basin returns `1`. exec is correct — port nothing, delete the shadow, and give `lower(anyrange)` its own OID. |
+| **`sign` / `ceiling`** | `pg_scalar_aliases.rs:67-69 make_alias_f64` — `Signature::one_of([Float64, Int64, Int32, Float32])`, returns `Float64`. No `Decimal128` arm. | `OID_SIGN_NUMERIC` 1706 → `decimal_sign`, `OID_CEILING_NUMERIC` 2167 → `decimal_ceil` | **exec is correct and wider.** Postgres: `pg_typeof(sign(2.5::numeric))` is `numeric` (verified). exec already covers the numeric overload the engine never had. |
+| **`length`** | `udf.rs:3066 LengthPgUdf` — also counts **bytes** for `Binary` input (`length(bytea)`) | `OID_LENGTH_TEXT` 1317 only | **exec is narrower.** `length('abc'::bytea)` is `3::integer` in PG 18.2. The bytea overload is a real gap exec must add before the engine copy is deleted. |
+| **`array_agg`** | `pg_agg_udf.rs` `PgArrayAggUdaf` — supports in-call `ORDER BY`, and hand-rolls a vectorised `GroupsAccumulator` (`pg_agg_udf.rs:1030`) | `aggregate.rs` `AggFunc::ArrayAgg`, row-wise; in-call `ORDER BY` is *refused* in `build.rs`'s `agg_spec` for every aggregate | **exec is narrower on capability and slower.** See §5.1. |
+| `btrim` `ltrim` `rtrim` `left` `right` `power` | `string_dt_udf.rs:183-220`, `string_more_udf.rs:98`, `udf.rs:3684` | `OID_BTRIM_1/2`, `OID_LTRIM_1/2`, `OID_RTRIM_1/2`, `OID_LEFT`, `OID_RIGHT`, `OID_POWER_FLOAT8` | **Agree.** Negative-`n` `left`/`right` semantics match char-for-char (`eval.rs:1499 pg_left` vs `string_more_udf.rs:500`). `power(numeric,numeric)` (oid 1738) is missing on both sides. |
+
+`crates/basin-exec/tests/function_equivalence.rs` can adjudicate all of these
+today: it enumerates the same 52 OIDs from `eval_scalar_fn`'s `match`, batters
+each with a per-type edge-case battery (NULL, `i32::MIN`, `±inf`, `NaN`,
+subnormals, multibyte UTF-8, embedded NUL, half-integer ties), and diffs value,
+NULL-ness **and error-vs-success** against PostgreSQL 18.2. It does not yet
+cover the engine's implementations — pointing it at both sides of the 12 is
+cheap and is Tranche 0 below.
+
+## 3. The fourth list nobody counted: functions with no Basin code at all
+
+This is the finding that most changes the plan. `SELECT date_trunc(…)` works
+today, and there is nothing in `basin-engine` to re-host — DataFusion's own
+builtin registry supplies it. The previous revision of this document caught
+this for the math family; the same hole is much larger than math.
+
+```
+$ python3 …  # fn name()/aliases() harvest over datafusion-functions{,-aggregate,-nested,-window}-53.1.0
+datafusion-functions-53.1.0            94
+datafusion-functions-aggregate-53.1.0  26
+datafusion-functions-nested-53.1.0     48
+datafusion-functions-window-53.1.0      9
+union                                 174
+```
+
+Of those 174, **33 are already implemented in `basin-exec`** (the math family
+and core aggregates/window functions — that work has been done), and 18 are
+shadowed by a Basin registration. **123 have no owned implementation on either
+side. 48 of those 123 are real `pg_catalog` function names** (same
+`pg_proc` check as §2b):
+
+```
+array_append  array_length  array_ndims  array_position  array_positions
+array_prepend  array_remove  array_replace  array_reverse  array_sort
+array_to_string  bit_length  bool_and  bool_or  cardinality  character_length
+concat_ws  corr  cot  covar_pop  covar_samp  cume_dist  date_part  date_trunc
+factorial  gcd  initcap  lcm  lpad  make_date  md5  now  ntile  octet_length
+overlay  percentile_cont  random  regexp_count  regexp_instr  regexp_like
+repeat  rpad  starts_with  stddev  stddev_pop  string_to_array  to_hex  var_pop
+```
+
+Plus `percent_rank`, which the heuristic missed (macro-generated) and which
+`basin-exec` also does not implement — `grep -rn 'percent_rank\|cume_dist\|ntile'
+crates/basin-exec/src` returns nothing.
+
+**`date_trunc`, `date_part`, `now`, `md5`, `lpad`/`rpad`, `initcap`, `repeat`,
+`concat_ws`, `overlay`, `starts_with`, `stddev`, `bool_and`/`bool_or`,
+`array_length`, `cardinality`, `string_to_array`, `random`, `ntile`,
+`cume_dist`, `percent_rank`** are not exotic. They are ordinary SQL that Basin
+answers correctly today and will stop answering the moment
+`Cargo.toml:149` is deleted, with no code to port and nothing in
+`basin-engine` to point at.
+
+> **The real remaining function surface is 296 + 49 = 345 names, not 296.**
+> The 49 are strictly harder to notice and strictly easier to write.
+
+## 4. What remains, by family
+
+296 not-covered names. "pg-std" = the name exists in PostgreSQL 18.2's
+`pg_catalog`; "ext" = it does not (a Basin extension, or a PG extension
+Basin reimplements: PostGIS, pgvector, pg_trgm, citext, pgcrypto, uuid-ossp).
+
+| Family | Names | pg-std | ext | Verdict |
+|---|---:|---:|---:|---|
+| jsonb / json | 54 | 43 | 11 | **Must reimplement.** The 11 non-pg names (`jsonb_has_key`, `jsonb_contained_by`, `json_get`, `jsonb_delete_*`, `json_path_extract*`) are Basin's spellings for the `?`/`<@`/`->`/`#>`/`-` **operators**, which Postgres exposes only as operators. They stay, but as `pg_operator` rows in `basin-pgtype`, not as function names. |
+| pg_catalog / system | 47 | 46 | 1 | **Must reimplement**, but see §5.4 — the majority are constant stubs. |
+| geo (PostGIS) | 43 | 0 | 43 | **Reimplement** — see §5.2, the dependency is not DataFusion. |
+| range / multirange | 28 | 21 | 7 | **Must reimplement.** The 7 non-pg names are function spellings of `&&`/`@>`/`<<`/`>>`/`-|-`; same operator note as jsonb. Carries the correctness debt in §7. |
+| datetime / interval | 28 | 17 | 11 | **Must reimplement.** Non-pg: `at_time_zone` (an operator in PG), `time_bucket` (TimescaleDB), `date_add_int`/`date_sub_int`/`date_diff_days`/`extract_epoch_from_interval`/`cast_infinity_timestamp` (Basin internals). |
+| string | 19 | 19 | 0 | **Must reimplement.** Entirely Postgres-standard, entirely pure text manipulation. Cheapest large family. |
+| FTS (tsvector / tsquery) | 17 | 14 | 3 | **Must reimplement.** `tsvector`/`tsquery` are plain `Utf8` holding a canonical text form, not Arrow extension types; the whole stack is self-contained Rust touching DataFusion only at `invoke_with_args`. |
+| aggregate | 11 | 6 | 5 | **Structurally hard** — §5.1. |
+| vector (pgvector) | 7 | 0 | 7 | **Reimplement.** `basin-vector` has no DataFusion dep; `vector_avg` is an aggregate (§5.1). |
+| citext | 7 | 0 | 7 | **Drop as functions.** `citext_eq`…`citext_like` exist only to back the citext operators; in the owned engine they are `pg_operator` rows plus a collation rule, not seven UDFs. |
+| crypto / encoding | 6 | 2 | 4 | **Reimplement.** `encode`/`decode` are pg-std; `crypt`/`gen_salt`/`digest`/`uuid_generate_v4` are pgcrypto / uuid-ossp. |
+| advisory locks | 6 | 6 | 0 | **Must reimplement**, and they are the canonical ENTANGLED case: they need a session context reachable from function resolution. |
+| sequences | 4 | 4 | 0 | **Must reimplement — but not as UDFs.** §7, "red herring". |
+| internal / tablesample | 4 | 0 | 4 | **Drop.** `basin_tablesample_*` are planner-internal predicates; the owned planner should express TABLESAMPLE as a plan node, not a UDF call. |
+| trigram (pg_trgm) | 3 | 0 | 3 | **Reimplement.** `basin-trgm` has no DataFusion dep. The ~250 lines of operator rewriting in `trgm_glue.rs` travel with it and are not UDF-body work. |
+| auth (Basin ext) | 3 | 0 | 3 | **Reimplement.** Needs session context (the JWT claims) — same prerequisite as advisory locks. |
+| net / http | 2 | 0 | 2 | **Reimplement or drop.** §7 — they `block_on` inside a scalar function today. |
+| internal (`__basin_*`) | 2 | 0 | 2 | **Drop.** Planner-internal. |
+| inet / cidr | 2 | 0 | 2 | **Reimplement** as operators (`<<`/`>>` on inet). |
+| cron | 2 | 0 | 2 | **Reimplement.** Needs session context + async catalog. |
+| regex | 1 | 0 | 1 | `substring_regex` — unreachable today without a SQL-text rewrite that is still a TODO (§7). |
+| **Total** | **296** | **178** | **118** | |
+
+## 5. Structurally hard cases
+
+### 5.1 Aggregates and window functions need machinery, not signatures
+
+11 not-covered aggregate names —
+`approx_count_distinct`, `approx_percentile`, `approx_percentile_cont`,
+`first`, `last`, `mode`, `percentile_disc`, `json_agg`, `json_object_agg`,
+`jsonb_agg`, `jsonb_object_agg` — plus `vector_avg` in the vector family.
+
+```
+$ grep -rn 'impl.*Accumulator for' --include='*.rs' crates/basin-engine/src | wc -l
+10
+$ grep -rn 'impl GroupsAccumulator for' --include='*.rs' crates/basin-engine/src
+crates/basin-engine/src/pg_agg_udf.rs:1030:impl GroupsAccumulator for OrderedArrayAggGroupsAccumulator
+```
+
+Each is an `Accumulator` — `update_batch` / `merge_batch` / `state` /
+`evaluate` — with partial-state serialisation for two-phase aggregation.
+`basin-exec`'s `aggregate.rs` has one row-wise `AccState` enum over eight
+fixed variants; it has no extension point for a user accumulator and no
+vectorised group-wise tier. Two of the eleven (`percentile_disc`, `mode`) are
+ordered-set aggregates, which `aggregate.rs`'s own module doc explicitly
+excludes.
+
+Basin registers **zero** custom window functions — there is no `WindowUDFImpl`
+anywhere in `basin-engine`. Every window function Basin answers today is either
+a DataFusion builtin or, for the eight in `window_func_of`, already
+reimplemented in `basin-exec/src/window.rs`. The window gap is therefore
+entirely in §3's orphan list (`percent_rank`, `cume_dist`, `ntile`), not here —
+but those three do need real frame/partition machinery, not a scalar signature.
+
+**On `array_agg` specifically, the previous revision's measurement stands and
+should not be re-litigated:** a vectorised group-wise tier was built,
+benchmarked in release, measured at **0.60× (1M rows / 100k groups)** and
+**0.76× (1M rows / 10 groups)** against the row-wise loop, correct on all 334
+tests, and deliberately shelved on `spike/vectorised-aggregate`. The expensive
+part is not "add a vectorised tier"; it is building one that *beats* the scalar
+loop, reproducing `PgArrayAggUdaf`'s specific `lexsort_to_indices` +
+`interleave` algorithm. Treat the existing row-wise `AggFunc::ArrayAgg` as
+correct-and-slower and move on; this is not on the critical path.
+
+A caution carried forward: that benchmark was initially broken in a way that
+flattered the result — it pulled one batch from the operator and compared its
+row count to the group count, asserting `8192 == 100000`, because the operator
+emits groups in output-sized batches. Any re-measurement must drain the
+operator.
+
+### 5.2 Geo: the real dependency is not DataFusion
+
+Checked, and the answer is clean:
+
+```
+$ sed -n '/^\[dependencies\]/,/^\[/p' crates/basin-geo/Cargo.toml
+basin-common, serde, serde_json, thiserror, geo, proj4rs
+```
+
+**Zero DataFusion, zero Arrow.** Same for `basin-trgm` (`basin-common`, serde
+only) and `basin-vector` (arrow-array/arrow-schema, no DataFusion).
+`geo_glue.rs`'s 3,820 lines are a trait shell over an independent crate; 26 of
+the 43 names are declared through one `simple_udf!` macro
+(`geo_glue.rs:2340`) whose body is `fn(&ScalarFunctionArgs) -> DFResult<ColumnarValue>`.
+Swapping that macro's expansion for a `basin-exec` signature re-hosts 26
+functions in one edit.
+
+**One real exception, and it is a design question rather than a translation.**
+`st_srid` and `st_transform` read `BASIN_SRID` out of DataFusion's per-call
+`ScalarFunctionArgs.arg_fields[].metadata()` (`geo_glue.rs:2009`, `:2032`;
+the producing side is `geo_glue.rs:495-502`). `basin-exec`'s evaluator has no
+equivalent — `grep -c metadata crates/basin-exec/src/eval.rs` is **0**. It sees
+`ArrayRef`s, not the source columns' `Field`s. Either `Expr` carries the SRID
+through the plan, or the geometry encoding carries it inline. Decide before
+porting, not during.
+
+### 5.3 WASM: not a function-porting problem
+
+`wasm_udf.rs` (1,782 lines) hosts *user* code. `session.rs:2965-2980` lists the
+project's `LANGUAGE wasm` functions from the catalog at session open and
+registers one `ScalarUDF` per definition; names are per-project and unbounded,
+which is why they appear in no count here. The module talks to `wasmtime`
+directly (`Engine`, `Store`, `StoreLimits`, epoch interruption, a compiled-module
+LRU) — DataFusion contributes only `ScalarUDFImpl`, `ColumnarValue` and the
+error type.
+
+The re-hosting question is therefore not "port a function" but **"what is the
+owned engine's extension point for a dynamically-registered, catalog-sourced
+scalar function?"** `basin-exec` dispatches scalar calls on a compile-time
+`match` over `pg_proc` OIDs (`eval.rs:1208`), which has no room for a name
+resolved at session open. That extension point does not exist and is a
+prerequisite for this family alone. It is also the only family where getting it
+wrong is a sandbox-escape question rather than a wrong-answer question.
+
+### 5.4 The session-context prerequisite (carried forward, still true)
+
+Advisory locks (6), auth (3), cron (2), net (2), `pg_cancel_backend`,
+`current_setting`/`set_config`, `statement_timestamp`/`transaction_timestamp`,
+and the sequence rewrite path all need something `eval.rs` does not have: a
+session context reachable from function resolution. `eval.rs` is
+scalar-expression-only — no session, no lock table, no cancellation channel,
+no HTTP client, and (per §5.2) not even the input columns' `Field` metadata.
+That plumbing is a bigger lift than porting any individual function's logic and
+is shared across ~18 names. It is the single design decision that unblocks the
+most entries.
+
+## 6. Registration collisions found while counting
+
+Two overlapping-name mechanisms, both silent, both able to make a port pick the
+wrong body:
+
+**23 names are registered twice under a `pg_catalog.`-qualified alias** —
+`pg_table_is_visible` and `pg_catalog.pg_table_is_visible`, etc., almost all in
+`pg_catalog_udf.rs`. These are the same implementation twice and collapse to
+one entry in the owned engine's `pg_proc` (schema qualification is resolution's
+job, not the function's).
+
+**18 names are registered from two different modules**, where DataFusion's
+`register_udf` overwrites by name and `session.rs`'s call order decides the
+winner:
+
+```
+age                     datetime_more_udf.rs  udf.rs
+decode                  string_more_udf.rs    udf.rs
+encode                  string_more_udf.rs    udf.rs
+format                  string_dt_udf.rs      string_more_udf.rs
+jsonb_agg               jsonb_udf.rs          pg_agg_udf.rs
+jsonb_insert            jsonb_modify_udf.rs   jsonb_udf.rs
+jsonb_object_agg        jsonb_udf.rs          pg_agg_udf.rs
+jsonb_path_match        jsonb_path_udf.rs     jsonb_udf.rs
+jsonb_path_query_array  jsonb_path_udf.rs     jsonb_udf.rs
+jsonb_path_query_first  jsonb_path_udf.rs     jsonb_udf.rs
+jsonb_pretty            jsonb_modify_udf.rs   jsonb_udf.rs
+jsonb_set               jsonb_modify_udf.rs   jsonb_udf.rs
+jsonb_strip_nulls       jsonb_modify_udf.rs   jsonb_udf.rs
+jsonb_typeof            jsonb_modify_udf.rs   jsonb_udf.rs
+to_char                 datetime_more_udf.rs  udf.rs
+to_date                 datetime_more_udf.rs  udf.rs
+to_number               pg_scalar_aliases.rs  udf.rs
+to_timestamp            datetime_more_udf.rs  udf.rs
+```
+
+Plus the 16 geo names shadowed *within* `geo_glue.rs` (wave-α POINT-only
+structs beaten by later general-geometry ones), documented in the previous
+revision and still true. **Porting rule: always take the version that wins the
+registration race**, never the one left behind. Porting the loser silently
+downgrades a function that works today — and in geo's case, the losers are
+still unit-tested by tests that instantiate them by hand, so those tests pass
+against code no query can reach.
+
+## 7. Traps that change how the work is done (carried forward, re-verified)
+
+These findings were established in the previous revision against a live
+PostgreSQL 18.2 and remain accurate; they are kept because they are the
+difference between porting a function and porting a bug.
 
 **Range predicates other than `range_eq` silently mishandle date/timestamp
-bounds.** `range_bound_f64` (`range_udf.rs:849`) parses a bound as `f64`;
-date and timestamp bounds are stored as JSON strings like `"2024-01-01"`,
-which fail that parse and become `None` — indistinguishable from a genuine
-infinite bound to every caller. Confirmed against Postgres 18.2:
-`range_overlaps` (`range_udf.rs:778`) reports **every** pair of
-daterange/tsrange/tstzrange values as overlapping regardless of their actual
-dates; `range_contains_range` (`range_udf.rs:873`) reports **containment
-always false** for the same three subtypes; `range_contains_elem`
-(`range_udf.rs:686`) returns `NULL` instead of a boolean; `range_adjacent` /
-`range_strictly_left` / `range_strictly_right` (`RangeRelationalUdf`,
-`range_udf.rs:977`) are **always false**; `range_merge` / `range_union` /
-`range_intersection` / `range_diff` (`RangeParts`, `range_udf.rs:1322`)
-silently rewrite a finite date bound to `(-infinity, +infinity)` rather than
-erroring. `range_eq` alone is unaffected — it's the only function the
-pre-parse rewriter hands a subtype argument, and its equality helper
-(`basin-common/src/types/range.rs:473`) has a string-comparison fallback
-none of the others do. See "Range" above for the full mechanism and psql
-evidence.
+bounds.** `range_bound_f64` (`range_udf.rs:849`) parses a bound as `f64`; date
+and timestamp bounds are stored as JSON strings like `"2024-01-01"`, which fail
+that parse and become `None` — indistinguishable from a genuine infinite bound.
+Consequences, all confirmed against PG 18.2: `range_overlaps` reports **every**
+pair of daterange/tsrange/tstzrange as overlapping; `range_contains_range` is
+**always false**; `range_contains_elem` returns **NULL** instead of a boolean;
+`range_strictly_left`/`right`/`adjacent` are **always false**;
+`range_merge`/`union`/`intersection`/`diff` silently rewrite finite date bounds
+to `(-infinity, +infinity)`. `range_eq` alone escapes, because it is the only
+predicate the pre-parse rewriter hands a subtype argument. Re-hosting this
+family correctly requires first deciding **how every predicate learns its
+subtype** — a smaller instance of the same missing-context problem as §5.4.
+Related: `isempty('(5,6)'::int4range)` is `t` in Postgres (discrete
+canonicalisation) and non-empty in Basin, for the same reason.
 
 **`jsonb_path_exists` and scalar-position `jsonb_path_query` implement a
-different, much weaker JSONPath than the other three JSONPath functions.**
+different, much weaker JSONPath than the other three.**
 `jsonb_path_query_first`, `jsonb_path_query_array` and `jsonb_path_match`
-resolve to `jsonb_path_udf.rs`'s real recursive-descent parser (wildcards,
-filters, recursive descent). `jsonb_path_exists` and plain `jsonb_path_query`
-(`jsonb_udf.rs:2719` and `2619`) are never re-registered by that module, so
-they keep `jsonb_udf.rs`'s original dot-split-only parser: no `[*]`, no
-`[?(...)]` filters, no `..key`, and no SRF row-expansion for `jsonb_path_query`
-in scalar position. Confirmed: `jsonb_path_exists('{"a":[1,2,3]}'::jsonb,
-'$.a[*] ? (@ > 2)')` is `t` in Postgres 18.2, `f` on Basin's live
-implementation. See "JSONB path functions" above.
+resolve to `jsonb_path_udf.rs`'s real recursive-descent parser (`[*]`, filters,
+`..key`). `jsonb_path_exists` and plain `jsonb_path_query` are never
+re-registered by that module and keep `jsonb_udf.rs`'s dot-split-only parser.
+Confirmed: `jsonb_path_exists('{"a":[1,2,3]}'::jsonb, '$.a[*] ? (@ > 2)')` is
+`t` in PG 18.2, `f` on Basin. Route both names through `jsonpath_eval` when
+re-hosting; do not port `JsonbPathQueryUdf`/`JsonbPathExistsUdf`.
 
-**The sequence UDFs are a red herring.** `nextval` / `currval` / `setval` /
-`lastval` in `seq_udf.rs` look like ordinary `ScalarUDFImpl`s but are dead-code
-tombstones that always error. The real logic is `rewrite_sequence_calls`, a
-**pre-parse SQL string rewriter** that resolves literal-argument sequence calls
-via an async catalog call before the parser runs — written that way precisely to
-dodge DataFusion's synchronous `invoke` being unable to call async catalog
-methods. Whoever re-hosts these must know the struct is not the target.
+**Several functions are fake stubs returning wrong answers today** — not
+simplified, wrong. `array_contains` (`@>`) checks `rhs.len() <= lhs.len()`
+instead of element containment; `arrays_overlap` (`&&`) checks "both non-empty";
+`timezone`/`at_time_zone` pass non-UTC zones through **unchanged**;
+`regexp_split_to_table` returns its input; `regexp_matches` reuses single-match
+logic; `websearch_to_tsquery` is a bare alias to `plainto_tsquery` with no
+websearch syntax. Re-hosting these mechanically carries the wrongness forward
+under an implementation that looks more trustworthy. **Fixing them is separable
+from the migration — they are wrong on `main` today.**
 
-**Some "UDFs" in `hypertable.rs` are not UDFs at all.** `create_hypertable`,
-`add_retention_policy`, `drop_chunks` and friends are `match_*` SQL-text pattern
-matchers that intercept whole statements and mutate a registry directly,
-bypassing the function-call machinery entirely. Only `time_bucket` is a real
-`ScalarUDFImpl`. The statement-interception pattern still needs a home in the
-owned engine, but it is not UDF work.
+**The sequence UDFs are a red herring.** `nextval`/`currval`/`setval`/`lastval`
+in `seq_udf.rs` are dead-code tombstones that always error. The real logic is
+`rewrite_sequence_calls`, a **pre-parse SQL string rewriter** that resolves
+literal-argument sequence calls via an async catalog call before the parser
+runs — written that way to dodge DataFusion's synchronous `invoke`. The struct
+is not the target.
 
-**`to_char` is registered three times.** `ToCharPgUdf` in `udf.rs`,
-`ToCharMoreUdf` in `datetime_more_udf.rs`, and `ToCharIntervalUdf` under the
-different name `to_char_interval`. DataFusion's `register_udf` overwrites by
-name, so **registration order decides which one wins** — and re-hosting must
-pick a canonical implementation rather than silently dropping the loser's logic.
-Worse, nothing visibly routes `to_char(interval, fmt)` to `to_char_interval`,
-and the winning `to_char` does not handle interval input at all.
+**Some "UDFs" in `hypertable.rs` are not UDFs.** `create_hypertable`,
+`add_retention_policy`, `drop_chunks` are `match_*` SQL-text pattern matchers
+that intercept whole statements. Only `time_bucket` is a real `ScalarUDFImpl`.
 
-**`statement_timestamp` / `transaction_timestamp` do not work today.** Their
-session state exists but no executor hook ticks it, so both fall back to
-`Utc::now()` per call and do not implement Postgres's stable-within-statement
-semantics. They are ENTANGLED because fixing them needs statement and
-transaction lifecycle events, not because the arithmetic is hard.
+**`to_char` is registered three times** — `udf.rs`, `datetime_more_udf.rs`, and
+`to_char_interval` under a different name. Registration order picks the winner,
+nothing visibly routes `to_char(interval, fmt)` to `to_char_interval`, and the
+winner does not handle interval input.
 
-**Interval maths uses a 30-day month in two places** — `date_bin` and
-`extract_epoch_from_interval` — with no leap-year awareness. Both self-flag it.
-A silent wrong answer if re-hosted without preserving or fixing the caveat.
+**`statement_timestamp`/`transaction_timestamp` do not work today** — session
+state exists but no executor hook ticks it, so both fall back to `Utc::now()`
+per call.
 
-**`net_http_get` / `net_http_post` call `block_on` inside a scalar function.**
-That is a blocking-in-async hazard to fix deliberately during re-hosting, not
-to copy forward.
+**Interval maths uses a 30-day month** in `date_bin` and
+`extract_epoch_from_interval`, with no leap-year awareness. Both self-flag it.
 
-**Wiring debt travels with some UDFs.** `substring_regex` is unreachable
-without a SQL-text rewrite turning `SUBSTRING(x FROM 'regex')` into a call,
-because DataFusion's native `SUBSTRING` will not take a bare regex second
-argument — and that rewrite is still a TODO. `trgm_glue.rs` carries ~250 lines
-of similar rewriters lowering `%`, `<%` and `<->`, with quote-aware scanning to
-disambiguate `%` from modulo and `<->` from pgvector's distance operator. None
-of that is UDF-body work, and all of it has to move with them.
+**`net_http_get`/`net_http_post` call `block_on` inside a scalar function.**
 
-**More honest stubs, in the same family.** `regexp_split_to_table` returns its
-input unchanged — real SETOF row-splitting is deferred. `regexp_matches` reuses
-single-match logic where Postgres returns every match. `websearch_to_tsquery` is
-a bare alias to `plainto_tsquery` with no websearch syntax at all: no quoted
-phrases, no `-exclude`, no `OR`. Each is documented in place, and each will look
-like a working function to anyone porting it.
+**Wiring debt travels with some UDFs.** `substring_regex` is unreachable without
+a SQL-text rewrite that is still a TODO. `trgm_glue.rs` carries ~250 lines of
+rewriters lowering `%`, `<%` and `<->` with quote-aware scanning. None of that
+is UDF-body work and all of it has to move.
 
-## What this changes about sequencing
+## 8. The other 1,017: function hosting is less than half of it
 
-The ENTANGLED count is not a porting backlog; it is one shared prerequisite
-wearing eighteen hats. Building the session-context abstraction first collapses
-most of it. Doing the TRIVIAL families first — the `pg_catalog` stubs, the
-date arithmetic — buys coverage cheaply while that design is settled.
+The 1,017 `datafusion` references are five different removal problems with
+different owners. Classified by walking each file's `impl <Trait> for` set:
 
-Fixing the fake stubs is separable from the migration entirely: they are wrong
-on `main` today.
+| Category | Refs | Files | What it is |
+|---|---:|---:|---|
+| **Function hosting** | **521** | **29** | `ScalarUDFImpl` / `AggregateUDFImpl` bodies and registration. This document. |
+| Session / context / driver | 118 | 6 | `session.rs` (46), `executor.rs` (33), `prepared.rs` (15), `lib.rs` (10), `lifecycle.rs` (7), `query_shape.rs` (7) |
+| Physical plan nodes + physical optimizer | 164 | 8 | `catalog_window_exec.rs` (27), `sort_streaming_limit.rs` (23), `hot_tombstone.rs` (22), `tombstone_cold_scan.rs` (16), `rtree_rowgroup_scan.rs` (12), `jsonb_posting_scan.rs` (12), `gin_rowgroup_scan.rs` (12) — → [03](./03-physical-operators.md) |
+| Table providers / scan | 74 | 7 | `vortex_listing_format.rs` (40), `realtime_catalog.rs` (13), `info_schema_provider.rs` (13), `project_usage_view.rs` (12), `hypertable_provider.rs` (11), `query_stats_export.rs` (11) — → [06](./06-scan-and-storage.md) |
+| Logical optimizer / analyzer rules | 59 | 5 | `any_all_rewrite.rs` (19), `citext_analyzer.rs` (13), `nullif_rewrite.rs` (10), `is_distinct_rewrite.rs` (10), `union_scan_collapse.rs` (7) — → [05](./05-optimizer-rules.md) |
+| Type conversion | 44 | 2 | `convert.rs` (39), `pg_colnames.rs` (5) — → [12](./12-pg-type-fidelity.md) |
+| Remainder | 37 | 10 | `pg_plan.rs` (13), `rls.rs` (11), and eight files with ≤3 refs each |
+
+(`vortex_listing_format.rs` and five scan files impl both `ExecutionPlan` and a
+provider trait and are counted once, under the plan-node row. `session.rs` is
+counted as context setup rather than provider work despite registering tables,
+because that is what its 46 references are.)
+
+**Function hosting is 51% of the reference count and involves none of the other
+four problems' owners.** Do not let a plan that says "1,017 references" imply
+that finishing the functions finishes the migration; do not let one that says
+"372 UDF sites" imply the functions are the whole 1,017 either.
+
+## 9. Proposed order
+
+Sized so each tranche is one agent-sitting. Ordered by *unblocking value per
+hour*, not by family size.
+
+**Tranche 0 — adjudicate the 12 (half a sitting).**
+Point `function_equivalence.rs` at the engine's implementations of the 12
+covered names as well as `basin-exec`'s. Delete the `lower`/`upper` range
+shadow (`range_udf.rs:503`) and give range bound accessors their own OIDs; add
+`length(bytea)` to `eval.rs`. Nothing else in the plan is safe until the
+overlap is known to be *equivalent*, not merely *present*. **This is the only
+tranche that can produce a regression on `main`, so it goes first.**
+
+**Tranche 1 — the 37 *scalar* orphans of §3's 49 (one sitting, maybe two).**
+`date_trunc`, `date_part`, `now`, `md5`, `lpad`/`rpad`, `initcap`, `repeat`,
+`concat_ws`, `overlay`, `starts_with`, `octet_length`, `bit_length`,
+`character_length`, `string_to_array`, `array_to_string`, `array_length`,
+`cardinality`, `random`, `to_hex`, `gcd`/`lcm`/`factorial`/`cot`. Individually
+trivial, all Postgres-standard, all with zero Basin code to consult, and all
+**hard blockers on deleting `Cargo.toml:149`**. This is the cheapest tranche in
+the whole program and the one with the largest blast radius if skipped.
+Explicitly *defer* the nine statistical aggregates (`stddev`, `stddev_pop`,
+`var_pop`, `corr`, `covar_pop`, `covar_samp`, `bool_and`, `bool_or`,
+`percentile_cont`) and the three window orphans (`ntile`, `cume_dist`,
+`percent_rank`) — they need §5.1's machinery and belong with Tranche 6. That
+is what turns 49 into 37.
+
+**Tranche 2 — string (19) + regex (1) (one sitting).**
+Entirely `pg_catalog`, zero entangled, pure text manipulation, and `eval.rs`
+already speaks raw `ArrayRef`/`RecordBatch` rather than `ColumnarValue`, so the
+shell swap is mechanical. Carries `substring_regex`'s wiring TODO with it.
+
+**Tranche 3 — the `pg_catalog`/system stubs (~26 of 47) (one sitting).**
+`pg_catalog_udf.rs`'s own module doc (lines 5-8) says it plainly: *"stub
+implementations that always return a plausible constant so psql's queries plan
+and execute without 'Invalid function' errors. Correctness is deliberately not
+a goal."* `pg_table_is_visible` is a `SimpleOidBoolUdf { value: true }`;
+`pg_get_userbyid` is a `SimpleOidTextUdf { value: "basin" }`. No session, no
+catalog, no async.
+The 23 `pg_catalog.`-qualified duplicates collapse to nothing. Leaves the
+~20 genuinely session-dependent system functions for Tranche 5.
+
+**Tranche 4 — geo (43) (one sitting for the macro block, one for the rest).**
+`basin-geo` is DataFusion-free; 26 of 43 names come from one macro. **Settle the
+SRID design (§5.2) before starting**, and take the general-geometry
+implementation wherever a name is shadowed. Large name count, small conceptual
+surface — the best names-per-hour in the inventory.
+
+**Tranche 5 — the session-context abstraction, then the ~18 it unblocks (two
+sittings, one design + one port).**
+Advisory locks (6), auth (3), cron (2), net (2), `pg_cancel_backend`,
+`current_setting`/`set_config`, `statement_timestamp`/`transaction_timestamp`,
+and the sequence rewrite path. **The design is the deliverable**; the eighteen
+ports are mechanical once it exists. This is also where the WASM extension
+point (§5.3) should be settled, since it is the same question — "how does a
+function reach something that is not its arguments?" — asked about a name
+resolved at session open instead of a value resolved per session.
+
+**Tranche 6 — aggregates (11 + 5 statistical + 3 window) (two sittings).**
+Needs an `Accumulator`-shaped extension point in `aggregate.rs` and frame
+machinery for `ntile`/`cume_dist`/`percent_rank`. Ordered-set aggregates
+(`percentile_disc`, `mode`, `percentile_cont`) are a further step beyond that.
+Do **not** re-attempt vectorised `array_agg` here (§5.1).
+
+**Tranche 7 — range (28) (one sitting, but decide the subtype question first).**
+Zero entangled, but every predicate must learn its own subtype before any of it
+is worth porting, or the §7 bugs come along for free. Reimplementing against
+`basin-common`'s `RangeValue` rather than the JSON-text-plus-`f64` encoding is
+probably cheaper than porting `range_udf.rs` and then fixing it.
+
+**Tranche 8 — jsonb/json (54) (three sittings).**
+Largest family and the largest file in the crate (`jsonb_udf.rs`, 7,524 lines).
+Retire the eight shadowed structs, route both weak JSONPath entry points
+through `jsonpath_eval`, and land the 11 operator-spelled names as
+`pg_operator` rows rather than functions.
+
+**Tranche 9 — FTS (17), datetime/interval (28), vector (7), trgm (3),
+crypto (6), inet (2), citext (7 → operators), sequences (4 → rewriter),
+tablesample + internal (6 → drop).**
+Independent of each other; parallelisable across agents once Tranche 5's
+abstraction exists.
+
+**Deferred indefinitely — WASM.** Blocked on Tranche 5's extension point, and
+the only family whose failure mode is a sandbox question rather than a wrong
+answer. It should not gate deleting `Cargo.toml:149`; a project with WASM
+functions can keep falling back until the extension point lands.
