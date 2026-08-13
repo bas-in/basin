@@ -1,0 +1,6 @@
+# Matrix benchmark run outputs are run-specific (timestamps, machine noise).
+# Commit a specific run explicitly if you want to track it.
+*.md
+# Cargo build transcript kept per run so a "which binary was this?" question
+# is answerable after the fact; never worth committing.
+.build_*.log
