@@ -27,8 +27,13 @@
 //! CTE's own column-alias list, `WITH x(a, b) AS ...` (see
 //! [`apply_column_alias_list`]) — a bare `VALUES` list in `FROM` (also
 //! subject to [`apply_column_alias_list`]), and window functions (`OVER
-//! (...)`, see [`apply_windows`]). Everything else — a named `WINDOW` clause
-//! referenced via `OVER <name>`, `LATERAL`, a genuine subquery (anything but
+//! (...)`, see [`apply_windows`]) — including a named `WINDOW w AS (...)`
+//! clause referenced by a bare `OVER w`, resolved by `lower::expr`'s
+//! `lower_window_def`. A set operation's own trailing `ORDER BY`/`LIMIT`
+//! (which apply to the whole result, under much stricter rules than an
+//! ordinary `SELECT`'s) are lowered by [`lower_set_op`] /
+//! [`lower_set_op_sort_key`]. Everything else — `OVER (w ...)` extending a
+//! named window, `LATERAL`, a genuine subquery (anything but
 //! a bare `VALUES` list) or set-returning function in `FROM`,
 //! `NATURAL`/`USING` joins, a data-modifying CTE, `DISTINCT ON` combined with
 //! `GROUP BY`/an aggregate, a set-returning function combined with `GROUP
@@ -376,11 +381,23 @@ impl ColumnResolver for ScopeResolver<'_> {
 }
 
 fn expr_ctx<'a>(res: &'a Resolvers<'a>, columns: &'a dyn ColumnResolver) -> LowerCtxOwned<'a> {
+    expr_ctx_windows(res, columns, &[])
+}
+
+/// [`expr_ctx`] for the one clause that may contain a window function and so
+/// needs the statement's `WINDOW` list in scope — the `SELECT` list (and,
+/// through it, `ORDER BY`, which is lowered against the same context).
+fn expr_ctx_windows<'a>(
+    res: &'a Resolvers<'a>,
+    columns: &'a dyn ColumnResolver,
+    named_windows: &'a [Node],
+) -> LowerCtxOwned<'a> {
     LowerCtxOwned {
         subqueries: res.subqueries(columns),
         columns,
         operators: res.operators,
         functions: res.functions,
+        named_windows,
     }
 }
 
@@ -392,6 +409,14 @@ struct LowerCtxOwned<'a> {
     columns: &'a dyn ColumnResolver,
     operators: &'a dyn OperatorResolver,
     functions: &'a dyn FunctionResolver,
+    /// The statement's `WINDOW w AS (...)` list — see
+    /// [`LowerCtx::named_windows`]. Empty for every clause that cannot
+    /// contain a window function in the first place (`WHERE`, a join
+    /// condition, `LIMIT`/`OFFSET`, `VALUES` — Postgres rejects a window
+    /// call in all four), which is why [`expr_ctx`] takes it explicitly
+    /// rather than reading it off a statement it would then have to be
+    /// handed anyway.
+    named_windows: &'a [Node],
 }
 
 impl<'a> LowerCtxOwned<'a> {
@@ -401,6 +426,7 @@ impl<'a> LowerCtxOwned<'a> {
             operators: self.operators,
             functions: self.functions,
             subqueries: &self.subqueries,
+            named_windows: self.named_windows,
         }
     }
 }
@@ -642,11 +668,14 @@ fn lower_select_stmt_body(
     res: &Resolvers,
     ctes: &[CteBinding],
 ) -> Result<(LogicalPlan, Schema), LowerError> {
-    if !stmt.window_clause.is_empty() {
-        return Err(LowerError::Unsupported(
-            "a named WINDOW clause (referenced via OVER <name>) is not yet lowered".into(),
-        ));
-    }
+    // `WINDOW w AS (...)` itself builds nothing: it only names a window
+    // definition for an `OVER w` in the SELECT list to reference, which
+    // `lower::expr`'s `lower_window_def` resolves out of
+    // `LowerCtx::named_windows` (threaded in below via `expr_ctx_windows`).
+    // The definitions are checked to be well-formed there, at the point of
+    // use — an unreferenced `WINDOW` entry is legal and simply never looked
+    // at, matching a live server.
+    let named_windows: &[Node] = &stmt.window_clause;
     if !stmt.locking_clause.is_empty() {
         return Err(LowerError::Unsupported(
             "FOR UPDATE / FOR SHARE / FOR KEY SHARE is not yet lowered".into(),
@@ -680,7 +709,7 @@ fn lower_select_stmt_body(
     let (base_plan, scope) = apply_where(from, stmt, res)?;
 
     let resolver = ScopeResolver::new(&scope, res.outer);
-    let lctx = expr_ctx(res, &resolver);
+    let lctx = expr_ctx_windows(res, &resolver, named_windows);
     let ctx = lctx.ctx();
 
     let group_exprs = lower_group_by(&stmt.group_clause, &ctx)?;
@@ -978,18 +1007,27 @@ fn apply_distinct(plan: LogicalPlan, is_distinct: bool) -> LogicalPlan {
     }
 }
 
+/// Lower `<select> UNION|INTERSECT|EXCEPT [ALL] <select> [ORDER BY ...]
+/// [LIMIT ...] [OFFSET ...]`.
+///
+/// `ORDER BY`/`LIMIT` written after a set operation belong to the WHOLE
+/// result, not to the last arm — the parser hangs them on the `SelectStmt`
+/// that carries the set operation itself (the arms are `larg`/`rarg`), which
+/// is why they are handled here rather than by
+/// [`lower_select_stmt_body`]'s ordinary path. An arm's own `ORDER
+/// BY`/`LIMIT`, which is legal only when the arm is parenthesized
+/// (`(SELECT ... ORDER BY x LIMIT 2) UNION ...`), stays a property of that
+/// arm and is lowered by the recursion into it, underneath the
+/// [`LogicalPlan::SetOp`].
+///
+/// See [`lower_set_op_sort_key`] for the (much stricter than an ordinary
+/// `SELECT`'s) rule on what a set operation's `ORDER BY` key may be.
 fn lower_set_op(
     stmt: &SelectStmt,
     op_kind: SetOperation,
     res: &Resolvers,
     ctes: &[CteBinding],
 ) -> Result<(LogicalPlan, Schema), LowerError> {
-    if !stmt.sort_clause.is_empty() || stmt.limit_count.is_some() || stmt.limit_offset.is_some() {
-        return Err(LowerError::Unsupported(
-            "ORDER BY / LIMIT directly on a UNION/INTERSECT/EXCEPT result is not yet lowered"
-                .into(),
-        ));
-    }
     let larg = stmt
         .larg
         .as_deref()
@@ -1012,15 +1050,166 @@ fn lower_set_op(
     // reused because that module cannot yet resolve a `Scan`'s schema at all
     // (no catalog — see its own module docs), which every real `FROM` clause
     // bottoms out at.
-    Ok((
-        LogicalPlan::SetOp {
-            left: Box::new(left),
-            right: Box::new(right),
-            op,
-            all: stmt.all,
-        },
-        left_schema,
-    ))
+    let set_op = LogicalPlan::SetOp {
+        left: Box::new(left),
+        right: Box::new(right),
+        op,
+        all: stmt.all,
+    };
+
+    // `ORDER BY` sits directly on the set operation's own output, so its keys
+    // are positions in `left_schema` and nothing below needs
+    // `materialize_order_by`'s extra-column trick: a set operation's key can
+    // never be an expression in the first place (see
+    // [`lower_set_op_sort_key`]), so it is already the bare
+    // `Expr::Column` position `basin-exec`'s `sort_keys` requires.
+    let keys = stmt
+        .sort_clause
+        .iter()
+        .map(|n| lower_set_op_sort_key(n, &left_schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sorted = if keys.is_empty() {
+        set_op
+    } else {
+        LogicalPlan::Sort {
+            input: Box::new(set_op),
+            keys,
+        }
+    };
+    // Above the `Sort`, as everywhere else: `... UNION ... ORDER BY x LIMIT 2`
+    // is the first two rows of the ordered result, not the ordering of an
+    // arbitrary two rows. Verified live that a trailing `LIMIT` is legal with
+    // no `ORDER BY` at all (`SELECT id FROM a UNION ALL SELECT id FROM b
+    // LIMIT 2`), which is why this is not gated on `keys` being non-empty.
+    Ok((apply_limit(sorted, stmt, res)?, left_schema))
+}
+
+/// Lower one `ORDER BY` entry of a set operation.
+///
+/// Postgres's rule here is far stricter than an ordinary `SELECT`'s (see
+/// [`lower_order_by_key`], which lowers a general expression against the
+/// query's `FROM` scope): a set operation has no `FROM` scope of its own —
+/// its arms do — so the only things a key may name are the set operation's
+/// OWN OUTPUT columns, by unqualified name or by 1-based position. Verified
+/// on a live PostgreSQL 18.2 server, over `a(id int, name text)` and
+/// `b(id int, name text)`:
+///
+/// - `SELECT id FROM a UNION SELECT id FROM b ORDER BY id` and `... ORDER BY
+///   1 DESC` both sort the whole result (not the right arm).
+/// - The name resolved is the SET OPERATION's output name, which is the LEFT
+///   arm's: `SELECT id AS k FROM a UNION SELECT id FROM b ORDER BY k` works,
+///   and `SELECT id AS k FROM a UNION SELECT id AS j FROM b ORDER BY j`
+///   fails — `ERROR: column "j" does not exist`, with a DETAIL noting the
+///   name exists in `"*SELECT* 2"` but "cannot be referenced from this part
+///   of the query".
+/// - Anything that is not a plain name or a plain integer is rejected
+///   outright, however trivially it would evaluate: `ORDER BY id + 1`,
+///   `ORDER BY upper(name)` and even `ORDER BY 1+0` all give
+///   `ERROR: invalid UNION/INTERSECT/EXCEPT ORDER BY clause` /
+///   `DETAIL: Only result column names can be used, not expressions or
+///   functions.` — matched below. (`1+0` is the same `A_Expr`-is-not-an-
+///   ordinal distinction [`lower_order_by_key`] documents; here it is not
+///   merely "not an ordinal" but a hard error.)
+/// - A QUALIFIED name is rejected differently, because the qualifier names a
+///   relation that is not in scope at this level at all: `ORDER BY a.id`
+///   gives `ERROR: missing FROM-clause entry for table "a"`.
+/// - An unknown bare name gives `ERROR: column "name" does not exist` even
+///   when that column exists in both arms' `FROM` clauses — it is not in the
+///   set operation's output.
+/// - An out-of-range position gives `ERROR: ORDER BY position 2 is not in
+///   select list`, and so does position `0` — the same wording (and the same
+///   1-based, `< 1`-inclusive bound) as the ordinary-`SELECT` ordinal path.
+/// - A name matching two output columns gives `ERROR: ORDER BY "k" is
+///   ambiguous` (`SELECT id AS k, name AS k FROM a UNION ... ORDER BY k`).
+///
+/// `ASC`/`DESC`/`NULLS FIRST`/`NULLS LAST` all apply normally, via the shared
+/// [`sort_by_direction`].
+fn lower_set_op_sort_key(node: &Node, schema: &Schema) -> Result<SortKey, LowerError> {
+    use pg_query::protobuf::a_const::Val;
+
+    let Some(NodeEnum::SortBy(sb)) = node.node.as_ref() else {
+        return Err(LowerError::Malformed("expected a SortBy node"));
+    };
+    let expr_node = sb
+        .node
+        .as_deref()
+        .ok_or(LowerError::Malformed("SortBy with no expression"))?;
+    let (descending, nulls_first) = sort_by_direction(sb)?;
+
+    let index: u16 = match expr_node.node.as_ref() {
+        // `ORDER BY <n>` — a 1-based ordinal into the set operation's output.
+        // Any OTHER constant is its own error, not the generic
+        // "expressions or functions" one: verified live, `ORDER BY 'x'` and
+        // `ORDER BY 1.0` both give `ERROR: non-integer constant in ORDER BY`.
+        Some(NodeEnum::AConst(ac)) => {
+            let Some(Val::Ival(i)) = ac.val.as_ref() else {
+                return Err(LowerError::Unsupported(
+                    "non-integer constant in ORDER BY".into(),
+                ));
+            };
+            let pos = i.ival;
+            if pos < 1 || pos as usize > schema.len() {
+                return Err(LowerError::Unsupported(format!(
+                    "ORDER BY position {pos} is not in select list"
+                )));
+            }
+            (pos - 1) as u16
+        }
+        // `ORDER BY <name>` — an unqualified output column name.
+        Some(NodeEnum::ColumnRef(cr)) => {
+            let parts = cr
+                .fields
+                .iter()
+                .map(|f| match f.node.as_ref() {
+                    Some(NodeEnum::String(s)) => Ok(s.sval.clone()),
+                    _ => Err(LowerError::Unsupported(
+                        "invalid UNION/INTERSECT/EXCEPT ORDER BY clause: only result column \
+                         names can be used, not expressions or functions"
+                            .into(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let [name] = parts.as_slice() else {
+                // Qualified (`a.id`) — the qualifier is a relation of an arm,
+                // which is not in scope for the set operation itself.
+                return Err(LowerError::UnknownName(format!(
+                    "missing FROM-clause entry for table \"{}\"",
+                    parts.first().map(String::as_str).unwrap_or("")
+                )));
+            };
+            let mut found = None;
+            for (i, (col, _)) in schema.iter().enumerate() {
+                if col == name {
+                    if found.is_some() {
+                        return Err(LowerError::UnknownName(format!(
+                            "ORDER BY \"{name}\" is ambiguous"
+                        )));
+                    }
+                    found = Some(i as u16);
+                }
+            }
+            found.ok_or_else(|| {
+                LowerError::UnknownName(format!("column \"{name}\" does not exist"))
+            })?
+        }
+        _ => {
+            return Err(LowerError::Unsupported(
+                "invalid UNION/INTERSECT/EXCEPT ORDER BY clause: only result column names can \
+                 be used, not expressions or functions"
+                    .into(),
+            ))
+        }
+    };
+
+    Ok(SortKey {
+        expr: Expr::Column(ColumnRef {
+            relation: 0,
+            index,
+            name: schema[index as usize].0.clone(),
+        }),
+        descending,
+        nulls_first,
+    })
 }
 
 fn lower_values(stmt: &SelectStmt, res: &Resolvers) -> Result<(LogicalPlan, Schema), LowerError> {
@@ -3562,6 +3751,217 @@ mod tests {
         assert_eq!(op, SetOpKind::Except);
     }
 
+    // --- 9b: ORDER BY / LIMIT on a set operation's own result ----------------
+    //
+    // Every rule asserted here was checked against a live PostgreSQL 18.2
+    // server first — see `lower_set_op_sort_key`'s own docs for the exact
+    // statements and the exact server responses.
+
+    /// The `Sort` must sit ABOVE the `SetOp`, not inside its right arm:
+    /// `ORDER BY` after a set operation orders the WHOLE result.
+    #[test]
+    fn union_order_by_an_output_name_sorts_above_the_set_op() {
+        let plan = lower("SELECT a FROM t UNION SELECT t_id FROM u ORDER BY a").unwrap();
+        let LogicalPlan::Sort { input, keys } = plan else {
+            panic!("expected a Sort above the SetOp, got {plan:?}");
+        };
+        assert!(matches!(*input, LogicalPlan::SetOp { .. }));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].expr, col(0, "a"));
+        assert!(!keys[0].descending);
+        assert!(!keys[0].nulls_first);
+    }
+
+    /// `ORDER BY <n>` is a 1-based position in the set operation's output,
+    /// and DESC flips the null default the same way it does anywhere else.
+    #[test]
+    fn union_order_by_a_position_resolves_against_the_output() {
+        let plan = lower("SELECT a, b FROM t UNION SELECT t_id, c FROM u ORDER BY 2 DESC").unwrap();
+        let LogicalPlan::Sort { keys, .. } = plan else {
+            panic!("expected Sort");
+        };
+        assert_eq!(keys[0].expr, col(1, "b"));
+        assert!(keys[0].descending);
+        assert!(keys[0].nulls_first);
+    }
+
+    /// The name resolved is the SET OPERATION's own output name — which is
+    /// the LEFT arm's, alias included.
+    #[test]
+    fn union_order_by_resolves_the_left_arms_alias() {
+        let plan = lower("SELECT a AS k FROM t UNION SELECT t_id FROM u ORDER BY k").unwrap();
+        let LogicalPlan::Sort { keys, .. } = plan else {
+            panic!("expected Sort");
+        };
+        assert_eq!(keys[0].expr, col(0, "k"));
+    }
+
+    /// ... and the RIGHT arm's alias is not in scope at all.
+    #[test]
+    fn union_order_by_a_right_arm_alias_does_not_resolve() {
+        let err = lower("SELECT a AS k FROM t UNION SELECT t_id AS j FROM u ORDER BY j").unwrap_err();
+        let LowerError::UnknownName(msg) = err else {
+            panic!("expected UnknownName, got {err:?}");
+        };
+        assert_eq!(msg, "column \"j\" does not exist");
+    }
+
+    /// A column that exists in both arms' FROM clauses but not in the set
+    /// operation's OUTPUT is still not a legal key.
+    #[test]
+    fn union_order_by_a_non_output_column_does_not_resolve() {
+        let err = lower("SELECT a FROM t UNION SELECT t_id FROM u ORDER BY b").unwrap_err();
+        assert!(matches!(err, LowerError::UnknownName(_)), "got {err:?}");
+    }
+
+    /// Only names and positions — never an expression, however trivially it
+    /// would evaluate.
+    #[test]
+    fn union_order_by_an_expression_is_refused() {
+        for sql in [
+            "SELECT a FROM t UNION SELECT t_id FROM u ORDER BY a + 1",
+            "SELECT a FROM t UNION SELECT t_id FROM u ORDER BY upper(b)",
+            "SELECT a FROM t UNION SELECT t_id FROM u ORDER BY 1 + 0",
+        ] {
+            let err = lower(sql).unwrap_err();
+            let LowerError::Unsupported(msg) = err else {
+                panic!("expected Unsupported for `{sql}`, got {err:?}");
+            };
+            assert!(
+                msg.starts_with("invalid UNION/INTERSECT/EXCEPT ORDER BY clause"),
+                "unexpected message for `{sql}`: {msg}"
+            );
+        }
+    }
+
+    /// A non-integer constant gets its own, different message — matching the
+    /// live server, which distinguishes the two.
+    #[test]
+    fn union_order_by_a_non_integer_constant_is_refused() {
+        let err = lower("SELECT a FROM t UNION SELECT t_id FROM u ORDER BY 'x'").unwrap_err();
+        assert_eq!(
+            err,
+            LowerError::Unsupported("non-integer constant in ORDER BY".into())
+        );
+    }
+
+    /// A qualified key names a relation belonging to an ARM, which the set
+    /// operation itself cannot see.
+    #[test]
+    fn union_order_by_a_qualified_name_is_refused() {
+        let err = lower("SELECT a FROM t UNION SELECT t_id FROM u ORDER BY t.a").unwrap_err();
+        let LowerError::UnknownName(msg) = err else {
+            panic!("expected UnknownName, got {err:?}");
+        };
+        assert_eq!(msg, "missing FROM-clause entry for table \"t\"");
+    }
+
+    #[test]
+    fn union_order_by_an_out_of_range_position_is_refused() {
+        for (sql, want) in [
+            (
+                "SELECT a FROM t UNION SELECT t_id FROM u ORDER BY 2",
+                "ORDER BY position 2 is not in select list",
+            ),
+            (
+                "SELECT a FROM t UNION SELECT t_id FROM u ORDER BY 0",
+                "ORDER BY position 0 is not in select list",
+            ),
+        ] {
+            let err = lower(sql).unwrap_err();
+            assert_eq!(err, LowerError::Unsupported(want.into()), "for `{sql}`");
+        }
+    }
+
+    #[test]
+    fn union_order_by_an_ambiguous_output_name_is_refused() {
+        let err = lower("SELECT a AS k, b AS k FROM t UNION SELECT t_id, c FROM u ORDER BY k")
+            .unwrap_err();
+        let LowerError::UnknownName(msg) = err else {
+            panic!("expected UnknownName, got {err:?}");
+        };
+        assert_eq!(msg, "ORDER BY \"k\" is ambiguous");
+    }
+
+    /// `LIMIT` after a set operation bounds the ORDERED result, so it must
+    /// sit above the `Sort`, not below it.
+    #[test]
+    fn union_limit_sits_above_the_sort_which_sits_above_the_set_op() {
+        let plan =
+            lower("SELECT a FROM t UNION ALL SELECT t_id FROM u ORDER BY a LIMIT 3").unwrap();
+        let LogicalPlan::Limit { input, fetch, .. } = plan else {
+            panic!("expected Limit at the root, got {plan:?}");
+        };
+        assert_eq!(fetch, Some(int_lit(3)));
+        let LogicalPlan::Sort { input, .. } = *input else {
+            panic!("expected Sort under the Limit");
+        };
+        assert!(matches!(*input, LogicalPlan::SetOp { all: true, .. }));
+    }
+
+    /// A trailing `LIMIT` with no `ORDER BY` is legal, and must not
+    /// gratuitously introduce a `Sort`.
+    #[test]
+    fn union_limit_without_an_order_by_wraps_the_set_op_directly() {
+        let plan = lower("SELECT a FROM t UNION ALL SELECT t_id FROM u LIMIT 2").unwrap();
+        let LogicalPlan::Limit { input, .. } = plan else {
+            panic!("expected Limit, got {plan:?}");
+        };
+        assert!(matches!(*input, LogicalPlan::SetOp { .. }));
+    }
+
+    #[test]
+    fn intersect_and_except_take_the_same_order_by_path() {
+        for sql in [
+            "SELECT a FROM t INTERSECT SELECT t_id FROM u ORDER BY 1",
+            "SELECT a FROM t EXCEPT SELECT t_id FROM u ORDER BY a DESC",
+        ] {
+            let plan = lower(sql).unwrap();
+            let LogicalPlan::Sort { input, keys } = plan else {
+                panic!("expected Sort for `{sql}`");
+            };
+            assert_eq!(keys[0].expr, col(0, "a"));
+            assert!(matches!(*input, LogicalPlan::SetOp { .. }));
+        }
+    }
+
+    /// An arm's OWN `ORDER BY`/`LIMIT` (legal only parenthesized) stays a
+    /// property of that arm, underneath the `SetOp` — it is not hoisted to
+    /// the whole result. This shape already lowered before set-operation-level
+    /// `ORDER BY` existed; it is asserted here so that the two cannot be
+    /// confused for one another.
+    #[test]
+    fn a_parenthesized_arms_own_order_by_stays_inside_that_arm() {
+        let plan = lower(
+            "(SELECT a FROM t ORDER BY a LIMIT 2) UNION (SELECT t_id FROM u ORDER BY t_id LIMIT 2)",
+        )
+        .unwrap();
+        let LogicalPlan::SetOp { left, right, .. } = plan else {
+            panic!("expected a bare SetOp at the root, got {plan:?}");
+        };
+        assert!(matches!(*left, LogicalPlan::Limit { .. }));
+        assert!(matches!(*right, LogicalPlan::Limit { .. }));
+    }
+
+    /// A three-arm chain parses as `SetOp(SetOp(a, b), c)` with the `ORDER
+    /// BY` on the outermost node, and the output names it resolves against
+    /// are still the LEFTMOST arm's.
+    #[test]
+    fn order_by_on_a_chained_set_op_resolves_against_the_leftmost_arm() {
+        let plan = lower(
+            "SELECT a FROM t UNION SELECT t_id FROM u UNION SELECT id FROM t ORDER BY a",
+        )
+        .unwrap();
+        let LogicalPlan::Sort { input, keys } = plan else {
+            panic!("expected Sort, got {plan:?}");
+        };
+        assert_eq!(keys[0].expr, col(0, "a"));
+        let LogicalPlan::SetOp { left, .. } = *input else {
+            panic!("expected SetOp under the Sort");
+        };
+        assert!(matches!(*left, LogicalPlan::SetOp { .. }));
+    }
+
     // --- 10: Window functions -> Window (+ inserted Sort), between input and Project ---
 
     #[test]
@@ -3690,10 +4090,66 @@ mod tests {
         assert!(msg.contains("WHERE"), "message should mention WHERE: {msg}");
     }
 
+    /// `OVER w` is exactly the named definition spelled out inline —
+    /// verified live (see `lower::expr`'s `lower_window_def` docs) — so the
+    /// two forms must lower to the identical plan.
     #[test]
-    fn a_named_window_clause_is_unsupported() {
-        let err = lower("SELECT rank() OVER w FROM t WINDOW w AS (ORDER BY a)").unwrap_err();
-        assert!(matches!(err, LowerError::Unsupported(_)));
+    fn a_named_window_clause_lowers_the_same_as_writing_it_inline() {
+        let named = lower("SELECT rank() OVER w FROM t WINDOW w AS (PARTITION BY a ORDER BY b)")
+            .expect("a named WINDOW clause lowers");
+        let inline = lower("SELECT rank() OVER (PARTITION BY a ORDER BY b) FROM t")
+            .expect("the inline form lowers");
+        assert_eq!(named, inline);
+    }
+
+    /// Two calls may share one named window; each lowers to its own
+    /// `Expr::Window`, so nothing here depends on the name surviving.
+    #[test]
+    fn one_named_window_may_be_referenced_by_several_calls() {
+        let plan = lower("SELECT rank() OVER w, count(*) OVER w FROM t WINDOW w AS (ORDER BY a)")
+            .expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(exprs.len(), 2);
+        let LogicalPlan::Window { windows, .. } = *input else {
+            panic!("expected Window under the Project");
+        };
+        assert_eq!(windows.len(), 2);
+    }
+
+    /// An unreferenced `WINDOW` entry is legal and simply never resolved —
+    /// so it must not make an otherwise-ordinary query fail.
+    #[test]
+    fn an_unreferenced_named_window_is_ignored() {
+        let plan = lower("SELECT id FROM t WINDOW w AS (ORDER BY a)").expect("lowers");
+        let inline = lower("SELECT id FROM t").expect("lowers");
+        assert_eq!(plan, inline);
+    }
+
+    #[test]
+    fn over_an_undefined_window_name_is_an_unknown_name() {
+        let err = lower("SELECT rank() OVER nope FROM t WINDOW w AS (ORDER BY a)").unwrap_err();
+        let LowerError::UnknownName(msg) = err else {
+            panic!("expected UnknownName, got {err:?}");
+        };
+        assert_eq!(msg, "window \"nope\" does not exist");
+    }
+
+    /// `OVER (w ...)` — copying a named window and adding to it — is a
+    /// different (and legal, live) construct with its own merge rules, and
+    /// is still refused rather than silently treated as a bare `OVER w`.
+    #[test]
+    fn extending_a_named_window_with_extra_clauses_is_still_unsupported() {
+        let err = lower(
+            "SELECT rank() OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t WINDOW w AS (ORDER BY a)",
+        )
+        .unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("named WINDOW"), "unexpected message: {msg}");
     }
 
     // --- 11: Set-returning functions -> ProjectSet --------------------------

@@ -161,6 +161,9 @@ impl<'a> LowerCtxOwned<'a> {
             operators: self.operators,
             functions: self.functions,
             subqueries: &self.subqueries,
+            // No DML clause may contain a window function, so there is never
+            // an `OVER w` here to resolve — see `LowerCtx::named_windows`.
+            named_windows: &[],
         }
     }
 }

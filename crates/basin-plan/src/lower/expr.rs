@@ -111,6 +111,16 @@ pub struct LowerCtx<'a> {
     pub operators: &'a dyn OperatorResolver,
     pub functions: &'a dyn FunctionResolver,
     pub subqueries: &'a dyn SubqueryLowerer,
+    /// The statement's own `WINDOW w AS (...)` list — `SelectStmt`'s
+    /// `window_clause` exactly as the parser produced it (a list of `Node`s
+    /// each wrapping a `WindowDef`) — which is what an `OVER w` reference
+    /// resolves against (see [`lower_window_def`]). Empty for a statement
+    /// with no `WINDOW` clause, and for every context that cannot contain a
+    /// window function at all (`WHERE`, a join condition, `LIMIT`,
+    /// `VALUES`, DML). Carried on the context rather than looked up
+    /// separately because `OVER w` is seen deep inside expression lowering,
+    /// arbitrarily far below the `SelectStmt` that owns the definition.
+    pub named_windows: &'a [Node],
 }
 
 /// Lower one `pg_query` expression node into an [`Expr`].
@@ -1142,15 +1152,67 @@ fn lower_func_call(fc: &FuncCall, ctx: &LowerCtx) -> Result<Expr, LowerError> {
     Ok(Expr::ScalarFn { func, args })
 }
 
-/// Lower a window definition's `PARTITION BY`, `ORDER BY`, and frame clause.
+/// Lower the window a call is computed over.
+///
+/// `WindowDef` carries a referenced window's name in one of two DIFFERENT
+/// fields, and which one it is decides what the reference means — a
+/// distinction that comes straight from Postgres's own `gram.y` and is not
+/// guessable from the field names:
+///
+/// - `OVER w` — a bare name — parses as `name = "w"`, `refname = ""`, with
+///   no clauses of its own (`over_clause: OVER ColId` sets exactly that).
+///   This is a plain reference: the window IS the named definition. Verified
+///   live on a PostgreSQL 18.2 server that `SELECT a, sum(a) OVER w FROM t
+///   WINDOW w AS (ORDER BY a)` is exactly `SELECT a, sum(a) OVER (ORDER BY
+///   a) FROM t`, and that one name may be referenced by several calls
+///   (`sum(a) OVER w, count(*) OVER w`) — which needs nothing special here,
+///   since each reference lowers to its own `Expr::Window`.
+/// - `OVER (w ROWS ...)` parses the other way round — `name = ""`, `refname
+///   = "w"` — and means COPY that window and add to this. It is legal (live,
+///   the `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` form above runs)
+///   and deliberately still refused: merging has its own rules (the
+///   referencing spec may not repeat `PARTITION BY`, may add `ORDER BY` only
+///   if the referenced window has none, and the referenced window may not
+///   itself carry a frame), and refusing is honest where guessing would
+///   silently drop a clause.
+///
+/// An entry of the `WINDOW` clause itself also carries its own name in
+/// `name`, which is why resolution hands the definition to
+/// [`lower_window_spec`] — the half that reads only `PARTITION BY`/`ORDER
+/// BY`/frame — rather than recursing here, where its `name` would be read
+/// back as a reference to itself.
 fn lower_window_def(
     w: &pg_query::protobuf::WindowDef,
     ctx: &LowerCtx,
 ) -> Result<(Vec<Expr>, Vec<SortKey>, crate::expr::WindowFrame), LowerError> {
+    if !w.name.is_empty() {
+        let named = ctx
+            .named_windows
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(NodeEnum::WindowDef(d)) => Some(d.as_ref()),
+                _ => None,
+            })
+            .find(|d| d.name == w.name)
+            .ok_or_else(|| {
+                LowerError::UnknownName(format!("window \"{}\" does not exist", w.name))
+            })?;
+        return lower_window_spec(named, ctx);
+    }
+    lower_window_spec(w, ctx)
+}
+
+/// A window specification's own `PARTITION BY`, `ORDER BY` and frame —
+/// everything except the name/reference handling [`lower_window_def`] does.
+fn lower_window_spec(
+    w: &pg_query::protobuf::WindowDef,
+    ctx: &LowerCtx,
+) -> Result<(Vec<Expr>, Vec<SortKey>, crate::expr::WindowFrame), LowerError> {
     if !w.refname.is_empty() {
-        return Err(LowerError::Unsupported(
-            "OVER referencing a named WINDOW clause is not yet lowered".into(),
-        ));
+        return Err(LowerError::Unsupported(format!(
+            "OVER ({} ...), which copies a named WINDOW and adds to it, is not yet lowered",
+            w.refname
+        )));
     }
     let partition_by = w
         .partition_clause
@@ -1543,6 +1605,7 @@ mod tests {
             operators,
             functions: &MockFunctions,
             subqueries: &MockSubqueries,
+            named_windows: &[],
         }
     }
 
