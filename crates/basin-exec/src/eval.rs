@@ -137,6 +137,75 @@
 //!    An OID this table does not recognize is reported as `ExecError::Internal`
 //!    naming the OID, precisely so the bridge above this crate can fall back
 //!    to DataFusion for it instead of guessing.
+//!
+//! # The float8 policy: IEEE-754 first, domain second, range last
+//!
+//! Every `double precision` math function in this file follows one order of
+//! operations, and the order is the whole policy. It was read off a live
+//! PostgreSQL 18.2 (`PG_DIFF_TEST_DSN`), function by function, not recalled
+//! from the C source:
+//!
+//! 1. **IEEE-754 special cases first.** `NaN` and `±Infinity` inputs are
+//!    answered *before* any domain guard runs. `asin('NaN')` is `NaN`, not
+//!    "input is out of range" — even though `NaN` is trivially "outside
+//!    `[-1, 1]`", because every comparison against `NaN` is false and
+//!    Postgres's own guard (`arg < -1.0 || arg > 1.0`) therefore never fires
+//!    for it. Likewise `power('NaN', 0) = 1` and `power(1, 'NaN') = 1` (the
+//!    POSIX rule) are decided before `power`'s two domain errors, so
+//!    `power(0, 'NaN')` is `NaN` rather than "zero raised to a negative
+//!    power". Getting this order backwards is the single defect that produced
+//!    most of the float8 divergences this section was written to close.
+//! 2. **Domain guards second**, on the values that survive step 1 — `sqrt` of
+//!    a negative, `ln`/`log` of a non-positive, `asin`/`acos` outside
+//!    `[-1, 1]`, `power`'s zero-to-a-negative-power and negative-base
+//!    -to-a-non-integer-power. `sin`/`cos`/`tan` are domain guards too, in
+//!    the other direction: a *finite* argument is always in domain, and an
+//!    infinite one is the error (`sin('Infinity')` raises 22003 "input is out
+//!    of range", it does not return `NaN` the way libm does).
+//!
+//!    "Integer exponent" in `power`'s guard is `exponent.floor() ==
+//!    exponent`, Postgres's own `floor(arg2) != arg2` test — deliberately NOT
+//!    `exponent.fract() != 0.0`, which is the same thing for finite values
+//!    but wrong for `±Infinity`: `f64::fract` of an infinity is `NaN`, so a
+//!    `fract`-based guard reports every infinite exponent as non-integral and
+//!    rejects `power(-1, 'Infinity')`, which Postgres answers `1`.
+//! 3. **Range-check the result last.** libm returns `±Infinity` on overflow
+//!    and `0` on underflow; Postgres raises SQLSTATE 22003 for both, "value
+//!    out of range: overflow" / "value out of range: underflow". That is
+//!    [`check_float8_result`], a transcription of Postgres's own
+//!    `check_float8_val(val, inf_is_valid, zero_is_valid)`, and the two
+//!    validity flags are the part worth stating precisely:
+//!
+//!    - An infinite *result* is an error unless an *input* was already
+//!      infinite. `exp('Infinity')` is `Infinity`; `exp(1.8e308)` is an
+//!      overflow error even though both produce the same bits.
+//!    - A *zero* result is an error unless zero was already an achievable
+//!      answer for that input — which is function-specific, and is the place
+//!      this is easy to get wrong. Verified live: `exp(-745)` is `5e-324`
+//!      but `exp(-746)` is an underflow *error*, not `0`; `radians(4.9e-324)`
+//!      is an underflow error while `radians(0)` is a perfectly good `0`.
+//!      For `power` the rule confirmed live is three-part — a zero result is
+//!      legitimate when the base is zero (`power(0, 5) = 0`), when the base
+//!      is infinite (`power('Infinity', -2) = 0`), or when the exponent is
+//!      infinite (`power(0.5, 'Infinity') = 0`) — and an underflow error
+//!      otherwise (`power(0.5, 1.8e308)`, `power(2, -1e300)`).
+//!
+//! `sqrt`, `cbrt`, `ln` and `log` deliberately carry no step-3 check. Real
+//! Postgres runs one on them, but it is provably unreachable for those four:
+//! each is monotone and range-contracting, so its result can only be
+//! infinite or zero when the input already was (`sqrt(1.8e308)` is
+//! `1.3e154`, `cbrt` smaller still, `ln`'s only zero is `ln(1)` which
+//! Postgres explicitly permits). A dead branch is worse documentation than
+//! this paragraph.
+//!
+//! One honest gap: [`ExecError`] has no variant for "numeric value out of
+//! range" that carries a message, so all of these — the 22003s and the
+//! 2201E/2201F domain errors alike — are raised as
+//! [`ExecError::TypeMismatch`] carrying Postgres's exact message text. That
+//! is the convention the float8 errors in this file already used before this
+//! policy existed, kept rather than split. When a SQLSTATE mapping layer
+//! lands it has to classify this whole family together; the message strings
+//! are exact so that it can.
 
 use std::sync::Arc;
 
@@ -416,11 +485,7 @@ fn eval_literal(datum: &PlanDatum, ty: PgType, len: usize) -> Result<ArrayRef, E
     // that reaches evaluation with no context at all — the same rule those
     // three already fall back to when every candidate is unknown.
     if ty.is_unknown() {
-        return eval_untyped_literal(
-            &Expr::Literal(datum.clone(), ty),
-            &DataType::Utf8,
-            len,
-        );
+        return eval_untyped_literal(&Expr::Literal(datum.clone(), ty), &DataType::Utf8, len);
     }
     let arrow_ty = physical(ty).map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 
@@ -1222,10 +1287,7 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
         }
         OID_LN_FLOAT8 => float8_unary_checked(&a(0)?, pg_ln_f64),
         OID_LOG_FLOAT8 => float8_unary_checked(&a(0)?, pg_log10_f64),
-        OID_EXP_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::exp,
-        ))),
+        OID_EXP_FLOAT8 => float8_unary_checked(&a(0)?, pg_exp_f64),
         OID_TRUNC_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
             downcast_array::<Float64Array>(&a(0)?, "double precision")?,
             f64::trunc,
@@ -1236,14 +1298,8 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
             let ndigits = a(1)?;
             decimal_trunc_per_row(&val, &ndigits)
         }
-        OID_DEGREES_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::to_degrees,
-        ))),
-        OID_RADIANS_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::to_radians,
-        ))),
+        OID_DEGREES_FLOAT8 => float8_unary_checked(&a(0)?, pg_degrees_f64),
+        OID_RADIANS_FLOAT8 => float8_unary_checked(&a(0)?, pg_radians_f64),
         OID_PI => Ok(Arc::new(Float64Array::from(vec![
             std::f64::consts::PI;
             batch.num_rows()
@@ -1274,18 +1330,9 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
                     .map_err(|e| map_arrow(e, "atan2"))?,
             ))
         }
-        OID_COS_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::cos,
-        ))),
-        OID_SIN_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::sin,
-        ))),
-        OID_TAN_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::tan,
-        ))),
+        OID_COS_FLOAT8 => float8_unary_checked(&a(0)?, |x| pg_trig_of_radians(x, f64::cos)),
+        OID_SIN_FLOAT8 => float8_unary_checked(&a(0)?, |x| pg_trig_of_radians(x, f64::sin)),
+        OID_TAN_FLOAT8 => float8_unary_checked(&a(0)?, |x| pg_trig_of_radians(x, f64::tan)),
 
         other => Err(ExecError::Internal(format!(
             "scalar function oid {other} is not implemented in eval yet — the bridge should \
@@ -1832,18 +1879,60 @@ fn decimal_floor(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
 //
 // Every closure below is `f64 -> Result<f64, ExecError>` rather than the
 // infallible `f64 -> f64` the simpler functions above use directly with
-// `arity::unary` — `sqrt`/`ln`/`log`/`asin`/`acos` all have real domains
-// narrower than "every finite f64", and Postgres ERRORS outside them rather
-// than returning `NaN`/`-inf` the way the underlying libm call would. Using
-// `try_unary` (via [`float8_unary_checked`]) is what turns that into a
-// catchable [`ExecError`] instead of a silently wrong numeric answer reaching
-// the client.
+// `arity::unary`. Two separate reasons, and the module docs' "The float8
+// policy" section states the order they apply in:
+//
+//   - Domain: `sqrt`/`ln`/`log`/`asin`/`acos`/`power` have real domains
+//     narrower than "every finite f64", and Postgres ERRORS outside them
+//     rather than returning `NaN`/`-inf` the way the underlying libm call
+//     would. `sin`/`cos`/`tan` are the mirror image — infinite input is the
+//     error, finite input is always in domain.
+//   - Range: `exp`/`degrees`/`radians`/`power` can push a perfectly in-domain
+//     input off the end of the f64 range, and Postgres raises 22003 rather
+//     than handing back the `±Infinity`/`0` libm produces. That check is
+//     [`check_float8_result`], applied to the result and never to the input.
+//
+// Routing all of it through the fallible [`float8_unary_checked`] /
+// [`float8_binary_checked`] shape is what turns both into a catchable
+// [`ExecError`] instead of a silently wrong numeric answer reaching the
+// client.
+
+/// Postgres's `check_float8_val(val, inf_is_valid, zero_is_valid)`, the range
+/// check every float8 function applies to its *result* — see the module
+/// docs' "The float8 policy" section for why the two validity flags are
+/// per-function rather than constant, and for the live-verified evidence
+/// behind each caller's choice.
+///
+/// Both failures are SQLSTATE 22003 in Postgres with these exact message
+/// strings; see the module docs for why they ride [`ExecError::TypeMismatch`]
+/// for now.
+fn check_float8_result(
+    result: f64,
+    inf_is_valid: bool,
+    zero_is_valid: bool,
+) -> Result<f64, ExecError> {
+    if result.is_infinite() && !inf_is_valid {
+        return Err(ExecError::TypeMismatch(
+            "value out of range: overflow".to_string(),
+        ));
+    }
+    // `result == 0.0` is true for `-0.0` as well, which is what Postgres's C
+    // comparison does too — an underflow that lands on negative zero is still
+    // an underflow.
+    if result == 0.0 && !zero_is_valid {
+        return Err(ExecError::TypeMismatch(
+            "value out of range: underflow".to_string(),
+        ));
+    }
+    Ok(result)
+}
 
 /// Apply a fallible `f64 -> f64` closure elementwise, NULL-in/NULL-out (the
 /// null slot is never passed to `f`, same guarantee [`arity::try_unary`]
 /// gives every other decimal path in this file — see the module docs' point
-/// 7). Shared by every float8 math function below that has a real domain
-/// restriction (`sqrt`, `ln`, `log`, `asin`, `acos`).
+/// 7). Shared by every float8 math function below that can fail at all —
+/// on domain (`sqrt`, `ln`, `log`, `asin`, `acos`, `sin`, `cos`, `tan`) or on
+/// range (`exp`, `degrees`, `radians`).
 fn float8_unary_checked(
     arr: &ArrayRef,
     f: impl Fn(f64) -> Result<f64, ExecError>,
@@ -1861,9 +1950,10 @@ fn float8_unary_checked(
 }
 
 /// [`float8_unary_checked`]'s two-argument counterpart, for `power(float8,
-/// float8)` — the one float8 math function here whose domain restriction
-/// depends on both arguments together (negative base, non-integer exponent),
-/// not on one argument in isolation.
+/// float8)` — the one float8 math function here whose domain restriction and
+/// range check both depend on the two arguments together (negative base with
+/// a non-integer exponent; an infinity in *either* argument legitimising an
+/// infinite or zero result), not on one argument in isolation.
 fn float8_binary_checked(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
@@ -1942,24 +2032,117 @@ fn reject_nonpositive_log_argument(x: f64) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// `power(double precision, double precision)`. `power(0, 0) = 1` needs no
-/// special case — confirmed live, and `0f64.powf(0.0) == 1.0` in Rust too
-/// (IEEE 754's own rule, not a Postgres-specific one). The one real domain
-/// restriction: a negative base raised to a non-integer exponent is a
-/// complex number, and Postgres errors rather than returning `NaN` the way
-/// `f64::powf` does on its own. Verified live: `SELECT power(-2::float8,
-/// 0.5::float8)` raises `ERROR: 2201F: a negative number raised to a
-/// non-integer power yields a complex result` (SQLSTATE 2201F, the same code
-/// `sqrt`'s domain error uses). `power(-2, 2)` and `power(-2, 3)` (integer
-/// exponents) are fine and must NOT hit this check — `exponent.fract() !=
-/// 0.0` is exactly Postgres's own "is the exponent integral" test.
+/// `power(double precision, double precision)`. The one function here that
+/// exercises all three phases of the module docs' float8 policy, so it is
+/// written as three explicitly labelled blocks. Every claim below was read
+/// off a live PostgreSQL 18.2 by evaluating the full 12x12 matrix of
+/// `{0, -0, 1, -1, 0.5, -0.5, DBL_MIN, DBL_MAX, ±Inf, NaN, subnormal}`
+/// against itself, not from the C source.
+///
+/// Phase 1, IEEE-754/POSIX special cases, *before* the domain guards:
+/// `power('NaN', 0) = 1` and `power(1, 'NaN') = 1`, every other `NaN`-touching
+/// pair is `NaN` — including `power(0, 'NaN')`, which is why this block has to
+/// come first: the zero-base guard below would otherwise claim it.
+///
+/// Phase 2, domain guards:
+/// - `power(0, negative) `raises `ERROR: 2201F: zero raised to a negative
+///   power is undefined` (confirmed for `-0.0` as the base and for
+///   `-Infinity` as the exponent), where `f64::powf` returns `Infinity`.
+/// - a negative base raised to a non-integer exponent is a complex number:
+///   `ERROR: 2201F: a negative number raised to a non-integer power yields a
+///   complex result`. "Integer exponent" is `exponent.floor() == exponent`,
+///   Postgres's own `floor(arg2) != arg2` — NOT `exponent.fract() != 0.0`,
+///   which misclassifies `±Infinity` (see the module docs). `power(-2, 3)`
+///   and `power(-1, 'Infinity')` must both survive this guard; live Postgres
+///   answers `-8` and `1`.
+///
+/// Phase 3, range check: `power(0, 0) = 1` still needs no special case, but
+/// `power(0.5, DBL_MAX)` (libm `0`) and `power(0.5, DBL_MIN)` (libm
+/// `Infinity`) are both 22003 errors. A zero or infinite result is only
+/// legitimate when an infinity or a zero base put it there — see
+/// [`check_float8_result`] and the three-part rule in the module docs.
 fn pg_power_f64(base: f64, exponent: f64) -> Result<f64, ExecError> {
-    if base < 0.0 && exponent.fract() != 0.0 {
+    // Phase 1 — IEEE-754 special cases.
+    if base.is_nan() {
+        // `exponent == 0.0` is deliberately not `exponent.abs() == 0.0`:
+        // `-0.0 == 0.0` already, and `power('NaN', -0.0)` is 1 live.
+        return Ok(if exponent == 0.0 { 1.0 } else { f64::NAN });
+    }
+    if exponent.is_nan() {
+        return Ok(if base == 1.0 { 1.0 } else { f64::NAN });
+    }
+
+    // Phase 2 — domain guards.
+    if base == 0.0 && exponent < 0.0 {
+        return Err(ExecError::TypeMismatch(
+            "zero raised to a negative power is undefined".to_string(),
+        ));
+    }
+    if base < 0.0 && exponent.floor() != exponent {
         return Err(ExecError::TypeMismatch(
             "a negative number raised to a non-integer power yields a complex result".to_string(),
         ));
     }
-    Ok(base.powf(exponent))
+
+    // Phase 3 — range check the finite computation.
+    let infinite_input = base.is_infinite() || exponent.is_infinite();
+    check_float8_result(
+        base.powf(exponent),
+        infinite_input,
+        infinite_input || base == 0.0,
+    )
+}
+
+/// `exp(double precision)`. No domain restriction at all — the whole reason
+/// this is not `arity::unary(f64::exp)` is phase 3. Verified live:
+/// `exp('Infinity')` is `Infinity` and `exp('-Infinity')` is `0`, but
+/// `exp(1.8e308)` raises `ERROR: 22003: value out of range: overflow` and
+/// `exp(-1.8e308)` raises the matching underflow — the same bit patterns,
+/// legitimate only because the *input* was infinite. The underflow boundary
+/// is sharp and was checked either side of it: `exp(-745)` is `5e-324`,
+/// `exp(-746)` is an error rather than `0`.
+fn pg_exp_f64(x: f64) -> Result<f64, ExecError> {
+    check_float8_result(x.exp(), x.is_infinite(), x.is_infinite())
+}
+
+/// `degrees(double precision)`: radians to degrees, a scale-up, so only
+/// overflow is reachable in practice. Verified live: `degrees('Infinity')` is
+/// `Infinity` but `degrees(1.797e308)` raises `ERROR: 22003: value out of
+/// range: overflow`, and `degrees(0)` is a legitimate `0` (as is
+/// `degrees(-0.0)`, which stays `-0`).
+fn pg_degrees_f64(x: f64) -> Result<f64, ExecError> {
+    check_float8_result(x.to_degrees(), x.is_infinite(), x == 0.0)
+}
+
+/// `radians(double precision)`: degrees to radians, a scale-down, so it is
+/// underflow that bites. Verified live: `radians(4.9e-324)` — the smallest
+/// subnormal — raises `ERROR: 22003: value out of range: underflow`, while
+/// `radians(0)` is `0` and `radians(1.11e-308)` is a perfectly good
+/// `1.94e-310`. Kept symmetric with [`pg_degrees_f64`] rather than
+/// underflow-only, because Postgres's `float8_mul` checks both directions.
+fn pg_radians_f64(x: f64) -> Result<f64, ExecError> {
+    check_float8_result(x.to_radians(), x.is_infinite(), x == 0.0)
+}
+
+/// `sin`/`cos`/`tan(double precision)`, which share one shape: `NaN` passes
+/// straight through, an infinite argument is a hard error, and every finite
+/// argument is in domain. Verified live: `sin('NaN')` is `NaN` but
+/// `sin('Infinity')` raises `ERROR: 22003: input is out of range` — the
+/// libm answer for an infinite argument is `NaN`, and returning that would
+/// silently claim Postgres computed something.
+///
+/// No phase-3 check: `sin`/`cos` are bounded by construction and `tan`'s
+/// worst case is finite (`tan(pi()/2)` is `1.633123935319537e+16` live, not
+/// an infinity, because `pi()/2` is not exactly a pole in binary floating
+/// point).
+fn pg_trig_of_radians(x: f64, f: impl Fn(f64) -> f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x.is_infinite() {
+        return Err(ExecError::TypeMismatch("input is out of range".to_string()));
+    }
+    Ok(f(x))
 }
 
 /// `asin(double precision)`. Verified live: `SELECT asin(2::float8)` raises
@@ -1968,18 +2151,35 @@ fn pg_power_f64(base: f64, exponent: f64) -> Result<f64, ExecError> {
 /// `ln`/`sqrt`/`power` domain errors above, not the same one reused.
 /// `f64::asin` outside `[-1, 1]` silently returns `NaN`, which is why this
 /// needs the checked path rather than `arity::unary(f64::asin)`.
+///
+/// `asin('NaN')` is `NaN`, not an error — the phase-1/phase-2 ordering from
+/// the module docs, and the reason [`reject_out_of_trig_domain`] is never
+/// reached with a `NaN`. Postgres gets the same answer without an explicit
+/// branch, since its `arg < -1.0 || arg > 1.0` is false for `NaN`; the
+/// branch is written out here because this file's guard is phrased as a
+/// range `contains`, which *would* reject it.
 fn pg_asin_f64(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
     reject_out_of_trig_domain(x)?;
     Ok(x.asin())
 }
 
 /// `acos(double precision)`. See [`pg_asin_f64`] — same domain `[-1, 1]`,
-/// same SQLSTATE 22003 "input is out of range" on a live PostgreSQL 18.
+/// same `NaN`-before-domain ordering, same SQLSTATE 22003 "input is out of
+/// range" on a live PostgreSQL 18.
 fn pg_acos_f64(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
     reject_out_of_trig_domain(x)?;
     Ok(x.acos())
 }
 
+/// Shared `[-1, 1]` domain guard for `asin`/`acos`. Callers must have handled
+/// `NaN` before calling: `(-1.0..=1.0).contains(&NaN)` is false, so this
+/// would report a `NaN` as out of range where Postgres returns it unchanged.
 fn reject_out_of_trig_domain(x: f64) -> Result<(), ExecError> {
     if !(-1.0..=1.0).contains(&x) {
         return Err(ExecError::TypeMismatch("input is out of range".to_string()));
@@ -3867,7 +4067,11 @@ mod tests {
     fn log_float8_one_arg_is_base_10_not_natural_log() {
         let batch = one_row();
         let log_result = eval(&sf(OID_LOG_FLOAT8, vec![lit_f64(100.0)]), &batch).unwrap();
-        assert_eq!(f64_array(&log_result).value(0), 2.0, "log(100) must be 2 (base 10)");
+        assert_eq!(
+            f64_array(&log_result).value(0),
+            2.0,
+            "log(100) must be 2 (base 10)"
+        );
 
         let ln_result = eval(&sf(OID_LN_FLOAT8, vec![lit_f64(100.0)]), &batch).unwrap();
         assert!(
@@ -3979,7 +4183,11 @@ mod tests {
         let batch = batch_f64(vec![Some(1.0), Some(2.0), Some(3.0)]);
         let result = eval(&sf(OID_PI, vec![]), &batch).unwrap();
         let arr = f64_array(&result);
-        assert_eq!(arr.len(), 3, "pi() is niladic but must still fill every row");
+        assert_eq!(
+            arr.len(),
+            3,
+            "pi() is niladic but must still fill every row"
+        );
         for i in 0..3 {
             assert_eq!(arr.value(i), std::f64::consts::PI);
         }
@@ -3996,7 +4204,11 @@ mod tests {
         assert_eq!(arr.value(0), -1.0);
         assert_eq!(arr.value(1), 0.0);
         assert_eq!(arr.value(2), 1.0);
-        assert_eq!(arr.value(3), 0.0, "sign(-0.0) must be 0, not -1 (f64::signum's answer)");
+        assert_eq!(
+            arr.value(3),
+            0.0,
+            "sign(-0.0) must be 0, not -1 (f64::signum's answer)"
+        );
         assert!(arr.is_null(4));
     }
 
@@ -4052,6 +4264,224 @@ mod tests {
         assert!(f64_array(&null_sin).is_null(0));
     }
 
+    // ── The float8 policy (see the module docs' "IEEE-754 first, domain
+    // second, range last"). Every expectation below was read off a live
+    // PostgreSQL 18.2, not from the C source. ─────────────────────────────
+
+    /// Phase 1 before phase 2: `asin('NaN')`/`acos('NaN')` are `NaN` live,
+    /// NOT "input is out of range" — even though `NaN` is not inside
+    /// `[-1, 1]` by this file's `contains` phrasing of the guard. Ordering
+    /// the guard ahead of the special case is exactly the defect this pins.
+    #[test]
+    fn asin_and_acos_of_nan_are_nan_not_a_domain_error() {
+        let batch = one_row();
+        for oid in [OID_ASIN_FLOAT8, OID_ACOS_FLOAT8] {
+            let r = eval(&sf(oid, vec![lit_f64(f64::NAN)]), &batch).unwrap();
+            assert!(
+                f64_array(&r).value(0).is_nan(),
+                "oid {oid} of NaN must be NaN, not an out-of-range error"
+            );
+        }
+    }
+
+    /// The mirror image for `sin`/`cos`/`tan`: `NaN` passes through, but an
+    /// infinite argument is `ERROR: 22003: input is out of range` live —
+    /// libm's `NaN` answer would be a silently invented result.
+    #[test]
+    fn trig_of_infinity_errors_while_nan_passes_through() {
+        let batch = one_row();
+        for oid in [OID_SIN_FLOAT8, OID_COS_FLOAT8, OID_TAN_FLOAT8] {
+            let nan = eval(&sf(oid, vec![lit_f64(f64::NAN)]), &batch).unwrap();
+            assert!(f64_array(&nan).value(0).is_nan(), "oid {oid} of NaN is NaN");
+
+            for inf in [f64::INFINITY, f64::NEG_INFINITY] {
+                let err = eval(&sf(oid, vec![lit_f64(inf)]), &batch).unwrap_err();
+                assert_type_mismatch_contains(err, "input is out of range");
+            }
+        }
+    }
+
+    /// Phase 3 for `exp`: an infinite input legitimises an infinite or zero
+    /// result, a finite one does not. The underflow boundary is checked
+    /// either side — `exp(-745)` is `5e-324` live, `exp(-746)` is an error.
+    #[test]
+    fn exp_range_checks_the_result_but_lets_infinite_input_through() {
+        let batch = one_row();
+        let inf = eval(&sf(OID_EXP_FLOAT8, vec![lit_f64(f64::INFINITY)]), &batch).unwrap();
+        assert_eq!(f64_array(&inf).value(0), f64::INFINITY);
+        let neg_inf = eval(
+            &sf(OID_EXP_FLOAT8, vec![lit_f64(f64::NEG_INFINITY)]),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(f64_array(&neg_inf).value(0), 0.0, "exp(-Infinity) = 0 live");
+
+        let over = eval(&sf(OID_EXP_FLOAT8, vec![lit_f64(f64::MAX)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(over, "value out of range: overflow");
+        let under = eval(&sf(OID_EXP_FLOAT8, vec![lit_f64(f64::MIN)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(under, "value out of range: underflow");
+
+        let just_inside = eval(&sf(OID_EXP_FLOAT8, vec![lit_f64(-745.0)]), &batch).unwrap();
+        assert_ne!(
+            f64_array(&just_inside).value(0),
+            0.0,
+            "exp(-745) is 5e-324 live, a real subnormal, not an underflow"
+        );
+        let just_outside = eval(&sf(OID_EXP_FLOAT8, vec![lit_f64(-746.0)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(just_outside, "value out of range: underflow");
+    }
+
+    /// `degrees` scales up, so overflow is the reachable end; `radians`
+    /// scales down, so underflow is. Both let an infinite input through and
+    /// both treat a zero *input* as licence for a zero result.
+    #[test]
+    fn degrees_overflows_and_radians_underflows_but_zero_and_infinity_are_fine() {
+        let batch = one_row();
+
+        let deg_over = eval(&sf(OID_DEGREES_FLOAT8, vec![lit_f64(f64::MAX)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(deg_over, "value out of range: overflow");
+        let deg_inf = eval(
+            &sf(OID_DEGREES_FLOAT8, vec![lit_f64(f64::INFINITY)]),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(f64_array(&deg_inf).value(0), f64::INFINITY);
+        let deg_zero = eval(&sf(OID_DEGREES_FLOAT8, vec![lit_f64(0.0)]), &batch).unwrap();
+        assert_eq!(f64_array(&deg_zero).value(0), 0.0);
+
+        // 4.9e-324 is the smallest positive subnormal; scaling it by
+        // pi/180 lands on zero, which live Postgres calls an underflow.
+        let rad_under = eval(&sf(OID_RADIANS_FLOAT8, vec![lit_f64(5e-324)]), &batch).unwrap_err();
+        assert_type_mismatch_contains(rad_under, "value out of range: underflow");
+        let rad_zero = eval(&sf(OID_RADIANS_FLOAT8, vec![lit_f64(0.0)]), &batch).unwrap();
+        assert_eq!(
+            f64_array(&rad_zero).value(0),
+            0.0,
+            "radians(0) = 0 is a genuine zero, not an underflow"
+        );
+    }
+
+    /// `power`'s phase 1. `power('NaN', 0) = 1` and `power(1, 'NaN') = 1`
+    /// (POSIX), everything else touching `NaN` is `NaN` — including
+    /// `power(0, 'NaN')`, which the zero-base domain guard would otherwise
+    /// claim, and `power(-1, 'NaN')`, which the negative-base guard would.
+    #[test]
+    fn power_nan_rules_run_before_the_domain_guards() {
+        let batch = one_row();
+        let val = |b: f64, e: f64| {
+            let r = eval(&sf(OID_POWER_FLOAT8, vec![lit_f64(b), lit_f64(e)]), &batch)
+                .unwrap_or_else(|e| panic!("power({b}, {e}) must not error: {e}"));
+            f64_array(&r).value(0)
+        };
+        assert_eq!(val(f64::NAN, 0.0), 1.0);
+        assert_eq!(val(f64::NAN, -0.0), 1.0);
+        assert_eq!(val(1.0, f64::NAN), 1.0);
+        assert!(val(f64::NAN, f64::NAN).is_nan());
+        assert!(
+            val(0.0, f64::NAN).is_nan(),
+            "not 'zero to a negative power'"
+        );
+        assert!(
+            val(-1.0, f64::NAN).is_nan(),
+            "not 'a complex result' — NaN is decided first"
+        );
+    }
+
+    /// `power`'s phase 2. `power(0, negative)` is its own SQLSTATE (2201F,
+    /// "zero raised to a negative power is undefined"), where `f64::powf`
+    /// hands back `Infinity`. True for `-0.0` as the base and for
+    /// `-Infinity` as the exponent, both confirmed live.
+    #[test]
+    fn power_zero_to_a_negative_power_errors_rather_than_returning_infinity() {
+        let batch = one_row();
+        for (b, e) in [
+            (0.0, -1.0),
+            (0.0, -0.5),
+            (0.0, f64::NEG_INFINITY),
+            (-0.0, -1.0),
+            (-0.0, f64::MIN),
+        ] {
+            let err =
+                eval(&sf(OID_POWER_FLOAT8, vec![lit_f64(b), lit_f64(e)]), &batch).unwrap_err();
+            assert_type_mismatch_contains(err, "zero raised to a negative power is undefined");
+        }
+        // `power(0, 0)` and `power(0, positive)` are untouched by the guard.
+        let ok = eval(
+            &sf(OID_POWER_FLOAT8, vec![lit_f64(0.0), lit_f64(0.0)]),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(f64_array(&ok).value(0), 1.0);
+    }
+
+    /// `power`'s "is the exponent integral" test must be `floor(e) == e`, not
+    /// `e.fract() == 0.0`: `f64::fract` of an infinity is `NaN`, so a
+    /// `fract`-based guard rejects every infinite exponent as non-integral.
+    /// Live Postgres answers all four of these without erroring.
+    #[test]
+    fn power_negative_base_with_an_infinite_exponent_is_not_a_complex_result() {
+        let batch = one_row();
+        let val = |b: f64, e: f64| {
+            let r = eval(&sf(OID_POWER_FLOAT8, vec![lit_f64(b), lit_f64(e)]), &batch)
+                .unwrap_or_else(|err| panic!("power({b}, {e}) must not error: {err}"));
+            f64_array(&r).value(0)
+        };
+        assert_eq!(val(-1.0, f64::INFINITY), 1.0);
+        assert_eq!(val(-1.0, f64::NEG_INFINITY), 1.0);
+        assert_eq!(val(-0.5, f64::INFINITY), 0.0);
+        assert_eq!(val(-0.5, f64::NEG_INFINITY), f64::INFINITY);
+
+        // A finite non-integer exponent on a negative base still errors.
+        let err = eval(
+            &sf(OID_POWER_FLOAT8, vec![lit_f64(-2.0), lit_f64(0.5)]),
+            &batch,
+        )
+        .unwrap_err();
+        assert_type_mismatch_contains(
+            err,
+            "a negative number raised to a non-integer power yields a complex result",
+        );
+    }
+
+    /// `power`'s phase 3, and the three-part zero rule the module docs spell
+    /// out: an infinite or zero result is legitimate only when an infinite
+    /// input or a zero base put it there.
+    #[test]
+    fn power_range_checks_the_result_unless_an_input_was_infinite_or_zero() {
+        let batch = one_row();
+        let call =
+            |b: f64, e: f64| eval(&sf(OID_POWER_FLOAT8, vec![lit_f64(b), lit_f64(e)]), &batch);
+
+        for (b, e) in [(0.5, f64::MIN), (f64::MIN, f64::MAX), (-2.0, 1e300)] {
+            assert_type_mismatch_contains(call(b, e).unwrap_err(), "value out of range: overflow");
+        }
+        for (b, e) in [(0.5, f64::MAX), (f64::MAX, f64::MIN), (2.0, -1e300)] {
+            assert_type_mismatch_contains(call(b, e).unwrap_err(), "value out of range: underflow");
+        }
+
+        // Same bit patterns, all legitimate live: infinite base, infinite
+        // exponent, and a zero base respectively.
+        assert_eq!(
+            f64_array(&call(f64::INFINITY, f64::MIN).unwrap()).value(0),
+            0.0,
+            "power('Infinity', -DBL_MAX) = 0 live — the base was infinite"
+        );
+        assert_eq!(
+            f64_array(&call(0.5, f64::INFINITY).unwrap()).value(0),
+            0.0,
+            "power(0.5, 'Infinity') = 0 live — the exponent was infinite"
+        );
+        assert_eq!(
+            f64_array(&call(0.0, 5.0).unwrap()).value(0),
+            0.0,
+            "power(0, 5) = 0 live — a zero base makes zero an achievable answer"
+        );
+        assert_eq!(
+            f64_array(&call(f64::INFINITY, 2.0).unwrap()).value(0),
+            f64::INFINITY
+        );
+    }
+
     /// `ceiling` is the SQL-standard-named alias of `ceil` — same behaviour,
     /// genuinely different `pg_proc` oid per the module docs — for both
     /// `numeric` and `float8`.
@@ -4062,8 +4492,7 @@ mod tests {
         assert_eq!(f64_array(&ceiling_f).value(0), 5.0);
 
         let numeric_batch = decimal_batch("x", vec![Some(-41)], 3, 1); // -4.1
-        let ceiling_n =
-            eval(&sf(OID_CEILING_NUMERIC, vec![col(0, "x")]), &numeric_batch).unwrap();
+        let ceiling_n = eval(&sf(OID_CEILING_NUMERIC, vec![col(0, "x")]), &numeric_batch).unwrap();
         assert_eq!(decimal_array(&ceiling_n).value(0), -40); // -4.0
     }
 
@@ -4075,7 +4504,11 @@ mod tests {
         let result = eval(&sf(OID_TRUNC_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
         let arr = f64_array(&result);
         assert_eq!(arr.value(0), 3.0);
-        assert_eq!(arr.value(1), -3.0, "trunc(-3.7) must be -3, not -4 (floor's answer)");
+        assert_eq!(
+            arr.value(1),
+            -3.0,
+            "trunc(-3.7) must be -3, not -4 (floor's answer)"
+        );
         assert!(arr.is_null(2));
     }
 
