@@ -4078,7 +4078,7 @@ pub(crate) async fn exec_update(
             &table,
             table.as_str(),
             &meta.pk_columns,
-            &replacement_batches,
+            &replacement_groups,
             &replaced_paths,
         )
         .await?;
@@ -5966,21 +5966,68 @@ async fn read_and_apply_assignments_mixed(
 /// Force-flush any in-RAM tail rows in the shard before we list data files.
 /// Without this, a DELETE / UPDATE issued shortly after an INSERT through
 /// the shard owner would silently skip rows that are still in the WAL.
-/// PK enforcement on UPDATE. Build the "existing PK set" from data
-/// files NOT in `replaced_paths` and validate the post-SET batches
-/// against that plus their own intra-batch duplicates.
+/// PK enforcement on UPDATE, row at a time, the way PostgreSQL does it.
+///
+/// # Why not a set comparison
+///
+/// The obvious check — "the final key set must have no duplicates and must not
+/// collide with the keys in files this statement is not rewriting" — accepts
+/// statements PostgreSQL rejects. Measured on live PG 18.2, table `w2(id
+/// BIGINT PRIMARY KEY, …)` holding `{1, 2}`:
+///
+/// ```text
+/// UPDATE w2 SET id = id + 1 WHERE id IN (1,2);
+/// ERROR:  23505: duplicate key value violates unique constraint "w2_pkey"
+/// DETAIL:  Key (id)=(2) already exists.
+/// ```
+///
+/// The final set `{2, 3}` is perfectly well-formed. PG still refuses, because a
+/// plain (non-deferred) unique index is checked as each row's new version is
+/// written: when row `1` becomes `2`, row `2` is still sitting there with key
+/// `2`. The mirror statement `SET id = id - 1` on the same table answers
+/// `UPDATE 2` and leaves `{0, 1}`, because each new key is already free by the
+/// time it is written.
+///
+/// So the rule is not about the final state at all — it is: walk the rows in
+/// physical order, and for each one drop its old key from the live set, then
+/// require its new key not to be in that set. This function implements exactly
+/// that, and it reproduces every case measured against the live server: the
+/// `+1` shift errors, the `-1` shift succeeds, `SET id = id` is not a
+/// self-conflict, a swap (`SET id = 3 - id`) errors, an UPDATE onto a key held
+/// by an untouched row errors, and a zero-row UPDATE never gets here.
+///
+/// # It is order-dependent, and so is PostgreSQL
+///
+/// "Physical order" means Basin's: files in `replacement_groups` order, rows in
+/// file order. PostgreSQL's means its heap's, and the answer genuinely changes
+/// with it — the same `SET id = id + 1` on rows *stored* as `2, 1` instead of
+/// `1, 2` answers `UPDATE 2` on live PG rather than erroring, because by the
+/// time row `1` is rewritten the old `2` is already gone. This function is
+/// therefore a port of PostgreSQL's *rule*, not a promise to reproduce
+/// PostgreSQL's *answer* for a given heap layout — no such promise is
+/// available while the two systems lay rows out differently.
+///
+/// # Alignment
+///
+/// `replacement_groups` pairs each rewritten file's path with its post-SET
+/// batches, which carry **every** row of that file (updated and untouched
+/// alike, in order — guaranteed by the row-conservation tripwires in
+/// `apply_update_to_file`). Re-reading the old file therefore yields old keys
+/// positionally aligned with the new ones. If that alignment does not hold the
+/// function says so by falling back to the weaker set check rather than
+/// inventing a violation.
 async fn check_update_pk(
     sess: &ProjectSession,
     table: &TableName,
     table_name_str: &str,
     pk_columns: &[String],
-    batches: &[RecordBatch],
+    replacement_groups: &[(String, Vec<RecordBatch>)],
     replaced_paths: &[String],
 ) -> Result<()> {
     if pk_columns.is_empty() {
         return Ok(());
     }
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     let storage = &sess.engine.config().storage;
     let project = &sess.project;
     let replaced: HashSet<&str> = replaced_paths.iter().map(|s| s.as_str()).collect();
@@ -5989,11 +6036,17 @@ async fn check_update_pk(
     // files that the catalog has already removed; treat the catalog as
     // truth so a stale on-disk Parquet doesn't reintroduce phantom PKs.
     let data_files = filter_to_live_data_files(sess, table, data_files).await?;
-    let mut existing: HashSet<Vec<String>> = HashSet::new();
+
+    // Every key the table holds right now — INCLUDING the files this statement
+    // is rewriting, whose rows have not moved yet. That inclusion is the whole
+    // point: it is what makes the `+1` shift above collide.
+    let mut live: HashSet<Vec<String>> = HashSet::new();
+    // Old keys of the rewritten files, in row order, so each post-SET row can
+    // be paired with the key it is replacing.
+    let mut old_keys_by_path: HashMap<String, Vec<Option<Vec<String>>>> = HashMap::new();
     for f in &data_files {
-        if replaced.contains(f.path.as_ref()) {
-            continue;
-        }
+        let is_replaced = replaced.contains(f.path.as_ref());
+        let mut per_file: Vec<Option<Vec<String>>> = Vec::new();
         let mut stream = storage.read_file(project, &f.path).await?;
         while let Some(rb) = stream.next().await {
             let rb = rb?;
@@ -6006,36 +6059,77 @@ async fn check_update_pk(
                 })
                 .collect::<Result<Vec<_>>>()?;
             for row in 0..rb.num_rows() {
-                if let Some(k) = crate::constraints::pk_tuple_for_row(&rb, &idx, row)? {
-                    existing.insert(k);
+                let k = crate::constraints::pk_tuple_for_row(&rb, &idx, row)?;
+                if let Some(k) = &k {
+                    live.insert(k.clone());
+                }
+                if is_replaced {
+                    per_file.push(k);
                 }
             }
         }
+        if is_replaced {
+            old_keys_by_path.insert(f.path.as_ref().to_string(), per_file);
+        }
     }
-    let mut seen: HashSet<Vec<String>> = HashSet::new();
-    for b in batches {
-        let idx: Vec<usize> = pk_columns
-            .iter()
-            .map(|c| {
-                b.schema().index_of(c).map_err(|_| {
-                    BasinError::internal(format!("PK column {c:?} missing from update batch"))
+
+    let dup = |k: &[String]| {
+        BasinError::UniqueViolation(format!(
+            "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+             Key ({})=({}) already exists.",
+            pk_columns.join(", "),
+            k.join(", ")
+        ))
+    };
+
+    for (path, batches) in replacement_groups {
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // `None` = we could not line the old keys up with the new rows (the old
+        // file vanished from the listing, or decoded to a different row count).
+        // Then we cannot say which key each row is vacating, so we do not
+        // remove anything from `live` — except that this would flag every
+        // unchanged row as colliding with itself, so drop to the weaker
+        // final-state check for this file instead.
+        let olds = match old_keys_by_path.get(path) {
+            Some(v) if v.len() == total_rows => Some(v),
+            _ => None,
+        };
+        let mut row_ix = 0usize;
+        for b in batches {
+            let idx: Vec<usize> = pk_columns
+                .iter()
+                .map(|c| {
+                    b.schema().index_of(c).map_err(|_| {
+                        BasinError::internal(format!("PK column {c:?} missing from update batch"))
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for row in 0..b.num_rows() {
-            let Some(k) = crate::constraints::pk_tuple_for_row(b, &idx, row)? else {
-                return Err(BasinError::CheckViolation(format!(
-                    "null value in column violates not-null constraint on PRIMARY KEY of \
-                     \"{table_name_str}\""
-                )));
-            };
-            if existing.contains(&k) || !seen.insert(k.clone()) {
-                return Err(BasinError::UniqueViolation(format!(
-                    "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
-                     Key ({})=({}) already exists.",
-                    pk_columns.join(", "),
-                    k.join(", ")
-                )));
+                .collect::<Result<Vec<_>>>()?;
+            for row in 0..b.num_rows() {
+                let Some(k) = crate::constraints::pk_tuple_for_row(b, &idx, row)? else {
+                    return Err(BasinError::CheckViolation(format!(
+                        "null value in column violates not-null constraint on PRIMARY KEY of \
+                         \"{table_name_str}\""
+                    )));
+                };
+                match olds {
+                    Some(olds) => {
+                        if let Some(old) = &olds[row_ix] {
+                            live.remove(old);
+                        }
+                        if !live.insert(k.clone()) {
+                            return Err(dup(&k));
+                        }
+                    }
+                    None => {
+                        // Weaker fallback: the row's own old key is unknown, so
+                        // only a key this statement did not already place can
+                        // be judged. Matches the pre-existing behaviour.
+                        if !live.insert(k.clone()) {
+                            return Err(dup(&k));
+                        }
+                    }
+                }
+                row_ix += 1;
             }
         }
     }
@@ -7353,10 +7447,55 @@ async fn apply_assignments(
                 crate::dml::enforce_charlen_array(field, merged)?
             }
         };
+        // NOT NULL on the post-SET image. Only the assigned columns need it —
+        // an unassigned column keeps `original`, which was already checked when
+        // it was written. Same scoping rationale as the charlen check above.
+        if assignment.is_some() {
+            enforce_not_null_on_assigned(schema.field(col_idx), &new_col, mask)?;
+        }
         new_columns.push(new_col);
     }
     RecordBatch::try_new(schema, new_columns)
         .map_err(|e| BasinError::internal(format!("rebuild batch after SET: {e}")))
+}
+
+/// Reject an `UPDATE` that writes NULL into a `NOT NULL` column.
+///
+/// Before this existed, the write path had no NOT NULL check on UPDATE at all
+/// (`dml::check_null_allowed` is reachable only from the INSERT literal path).
+/// The NULL did not actually reach storage — `RecordBatch::try_new` at the end
+/// of [`apply_assignments`] rejects a null in a non-nullable field — but it
+/// surfaced as `BasinError::internal("rebuild batch after SET: Invalid
+/// argument error: Column 'name' is declared as non-nullable but contains null
+/// values")`, i.e. an internal error rather than the constraint violation this
+/// is. Live PostgreSQL 18.2:
+///
+/// ```text
+/// ERROR:  23502: null value in column "name" of relation "nn"
+///         violates not-null constraint
+/// ```
+///
+/// Checked against `mask`, not the whole column: the cold copy-on-write path
+/// rewrites every row of a file, so `col` also carries rows the `WHERE` never
+/// matched. A pre-existing NULL in one of those (possible after an
+/// `ALTER … SET NOT NULL` that never validated) is not this statement's fault,
+/// and PostgreSQL would not fail the statement for it either.
+fn enforce_not_null_on_assigned(field: &Field, col: &ArrayRef, mask: &BooleanArray) -> Result<()> {
+    // `mask.len() != col.len()` is defensive only; every caller passes a mask
+    // built over the same batch. Falling through leaves the arrow-side check
+    // as the backstop rather than risking a bogus violation.
+    if field.is_nullable() || col.null_count() == 0 || mask.len() != col.len() {
+        return Ok(());
+    }
+    for i in 0..col.len() {
+        if col.is_null(i) && !mask.is_null(i) && mask.value(i) {
+            return Err(BasinError::not_null_violation(format!(
+                "null value in column \"{}\" violates not-null constraint",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Blend two arrays: take `new_col` at rows where `mask` is true, `orig`
