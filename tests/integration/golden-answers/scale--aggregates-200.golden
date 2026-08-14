@@ -94,11 +94,8 @@ QUERY 0013
 AREA Aggregates@200
 SQL SELECT stddev_pop(v), var_pop(v) FROM big
 ORDER sorted
-STATUS rows
-COL stddev_pop	Float64	null
-COL var_pop	Float64	null
-NROWS 1
-ROW 14.482804548987279	209.7516276041666
+STATUS excluded
+EXCLUDED non-deterministic: two consecutive in-process runs of this statement disagreed
 END
 
 QUERY 0014

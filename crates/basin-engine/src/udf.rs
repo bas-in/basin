@@ -3590,9 +3590,27 @@ impl ScalarUDFImpl for PowerFloat64Udf {
         for i in 0..n {
             if base.is_null(i) || exp.is_null(i) {
                 out.append_null();
-            } else {
-                out.append_value(base.value(i).powf(exp.value(i)));
+                continue;
             }
+            let (b, e) = (base.value(i), exp.value(i));
+            // PostgreSQL raises on the two domain errors rather than handing
+            // back an IEEE special. Verified on 18.2:
+            //   SELECT power(-2, 0.5) -> ERROR: a negative number raised to a
+            //                            non-integer power yields a complex result
+            //   SELECT power(0, -1)   -> ERROR: zero raised to a negative power
+            //                            is undefined
+            // `powf` answers NaN and inf respectively, and both were reaching
+            // clients as if they were values. The messages are copied verbatim
+            // so a caller matching on PG's text still matches.
+            if b < 0.0 && e.is_finite() && e.fract() != 0.0 {
+                return exec_err!(
+                    "a negative number raised to a non-integer power yields a complex result"
+                );
+            }
+            if b == 0.0 && e < 0.0 {
+                return exec_err!("zero raised to a negative power is undefined");
+            }
+            out.append_value(b.powf(e));
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }

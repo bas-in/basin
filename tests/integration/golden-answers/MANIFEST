@@ -7,8 +7,8 @@
 #
 recorded_by       golden_answers.rs (tests/integration/tests)
 engine            incumbent (BASIN_OWNED_ENGINE unset)
-commit            fb9cf2113a03f25fa7f8360258787da4147f2e7b
+commit            037b73337e548962a4e3973566a34e14cef5ecbd
 statements        440
 files             45
 per_suite         {"base": 246, "catalog": 26, "errors": 34, "rls": 25, "scale": 49, "storage": 60}
-per_status        {"error": 32, "excluded": 17, "rows": 330, "tag": 61}
+per_status        {"error": 32, "excluded": 18, "rows": 329, "tag": 61}

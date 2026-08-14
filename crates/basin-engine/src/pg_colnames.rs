@@ -379,10 +379,17 @@ fn pg_expr_display_name(e: &Expr) -> Option<String> {
 ///   - **Operator-only rewrite targets** -- functions that exist in Basin's
 ///     planned `Expr` tree *only* because an operator was rewritten into
 ///     them (`json_get`/`json_get_text` for `->`/`->>`, `json_path_extract`/
-///     `json_path_extract_text` for `#>`/`#>>`, `list_has_all` for
-///     `@>`/`<@` on arrays -- confirmed at the source, `pg_operators.rs:978-981`
-///     and `udf.rs:4345-4356`) -- these map to `None` (`?column?`),
-///     Postgres's actual rule for the operator forms that produce them.
+///     `json_path_extract_text` for `#>`/`#>>`, `array_contains` for
+///     `@>`/`<@` on arrays and `arrays_overlap` for `&&` -- confirmed at the
+///     source, `pg_operators::rewrite_array_op_once` and `udf.rs:4345-4356`)
+///     -- these map to `None` (`?column?`), Postgres's actual rule for the
+///     operator forms that produce them. Measured on 18.2: `SELECT ARRAY[1,2]
+///     @> ARRAY[1]`, `SELECT ARRAY[1,2] && ARRAY[1]` and `SELECT
+///     '{"a":1}'::jsonb @> '{"a":1}'::jsonb` all name their column `?column?`.
+///     `list_has_all` stays listed even though `@>`/`<@` no longer route to
+///     it: DataFusion's builtin is still reachable under that name, and it
+///     reached clients as an operator target for long enough that dropping the
+///     entry would silently change the name back.
 ///   - **`strpos`** -- the mirror image. Basin implements the *function*
 ///     syntax `POSITION(substr IN str)` by planning to a call literally
 ///     named `strpos` (DataFusion's own SQL-to-`Expr` lowering for
@@ -411,7 +418,9 @@ fn pg_scalar_function_display_name(name: &str) -> Option<String> {
         | "json_get_text"
         | "json_path_extract"
         | "json_path_extract_text"
-        | "list_has_all" => None,
+        | "list_has_all"
+        | "array_contains"
+        | "arrays_overlap" => None,
         // NOT handled here, deliberately: `strpos`. Basin rewrites
         // `POSITION(x IN y)` to `strpos`, and Postgres names that column
         // `position` — but it names a directly-written `strpos(y, x)` call

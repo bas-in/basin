@@ -45,7 +45,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, ListArray,
     StringArray, StringBuilder, TimestampMicrosecondBuilder,
 };
-use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, IntervalUnit, TimeUnit};
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
@@ -188,11 +188,10 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
         ),
     }));
 
-    // ── make_interval — stub returning 0 interval for now ────────────────────
-    // PG: make_interval(years=0, months=0, weeks=0, days=0, hours=0, mins=0, secs=0.0)
-    // DataFusion has no native make_interval; register a stub that accepts
-    // up to 7 Int64/Float64 args and returns 0 ns as text (sufficient for
-    // ORM startup probes that only check the function resolves).
+    // ── make_interval(years, months, weeks, days, hours, mins, secs) ─────────
+    // PG: every argument defaults to 0. DataFusion has no native
+    // make_interval; this returns a real Interval(MonthDayNano) — see
+    // MakeIntervalUdf for the field mapping and the measured PG values.
     ctx.register_udf(ScalarUDF::from(MakeIntervalUdf {
         signature: Signature::one_of(
             (0usize..=7)
@@ -905,9 +904,34 @@ fn split_at_top_level_commas(s: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// make_interval — stub, always returns "0 seconds" as text (ORM probe only)
+// make_interval(years, months, weeks, days, hours, mins, secs) → interval
 // ---------------------------------------------------------------------------
 
+/// `make_interval(…)` — PG's positional interval constructor.
+///
+/// This used to return **text**, and text built by collapsing the calendar
+/// fields into a day count: years as 365 days, months as 30. Both the type and
+/// the arithmetic were wrong. Measured on PostgreSQL 18.2 against what Basin
+/// answered:
+///
+/// | call                          | PG                                | old Basin                |
+/// |-------------------------------|-----------------------------------|--------------------------|
+/// | `make_interval(hours => 1)`   | `01:00:00`                        | `'3600 seconds'` (text)  |
+/// | `make_interval(years => 1)`   | `1 year`                          | `'365 days'` (text)      |
+/// | `make_interval(1,2,3,4,5,6,7)`| `1 year 2 mons 25 days 05:06:07`  | `'450 days 18367 seconds'` |
+///
+/// PostgreSQL's interval is a *three-field* value — months, days, microseconds
+/// — kept separate precisely so that "1 month" stays a calendar month rather
+/// than becoming 30 days. Arrow's `IntervalMonthDayNano` is the same three
+/// fields, so the mapping is exact and needs no approximation at all:
+///
+/// * `months` = `years * 12 + months`
+/// * `days`   = `weeks * 7 + days`   (a week *is* exactly 7 days in PG too)
+/// * `nanos`  = `(hours * 3600 + mins * 60 + secs) * 1e9`
+///
+/// The registered signature takes `Int64` arguments, so a fractional `secs`
+/// (`make_interval(secs => 7.5)`) truncates rather than carrying the `.5` PG
+/// keeps. That is inherited from the existing signature, not introduced here.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct MakeIntervalUdf {
     signature: Signature,
@@ -924,20 +948,19 @@ impl ScalarUDFImpl for MakeIntervalUdf {
         &self.signature
     }
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
+        Ok(DataType::Interval(IntervalUnit::MonthDayNano))
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // Positional order: years, months, weeks, days, hours, mins, secs.
-        // Each arg is Int64 (named-arg rewriter converts to positional ints).
-        // Returns an ISO-8601-style interval text that DataFusion can parse
-        // (e.g. "1 year 30 days 0 seconds").
+        // Omitted trailing arguments default to 0, as in PG.
         let get_i64 = |idx: usize| -> i64 {
             if idx >= args.args.len() {
                 return 0;
             }
             match &args.args[idx] {
                 ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => *v,
+                ColumnarValue::Scalar(ScalarValue::Int32(Some(v))) => *v as i64,
                 ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => *v as i64,
                 _ => 0,
             }
@@ -950,26 +973,23 @@ impl ScalarUDFImpl for MakeIntervalUdf {
         let mins = get_i64(5);
         let secs = get_i64(6);
 
-        // Convert to total seconds for a simple interval text representation.
-        let total_days = years * 365 + months * 30 + weeks * 7 + days;
-        let total_secs = hours * 3600 + mins * 60 + secs;
+        let total_months = years.saturating_mul(12).saturating_add(months);
+        let total_days = weeks.saturating_mul(7).saturating_add(days);
+        let total_nanos = hours
+            .saturating_mul(3_600)
+            .saturating_add(mins.saturating_mul(60))
+            .saturating_add(secs)
+            .saturating_mul(1_000_000_000);
 
-        let interval_text = if total_days == 0 && total_secs == 0 {
-            "0 seconds".to_string()
-        } else {
-            let mut parts = Vec::new();
-            if total_days != 0 {
-                parts.push(format!("{total_days} days"));
-            }
-            if total_secs != 0 {
-                parts.push(format!("{total_secs} seconds"));
-            }
-            parts.join(" ")
+        let (Ok(months_i32), Ok(days_i32)) =
+            (i32::try_from(total_months), i32::try_from(total_days))
+        else {
+            return exec_err!("make_interval: interval field out of range");
         };
 
-        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-            interval_text,
-        ))))
+        Ok(ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(
+            Some(IntervalMonthDayNano::new(months_i32, days_i32, total_nanos)),
+        )))
     }
 }
 

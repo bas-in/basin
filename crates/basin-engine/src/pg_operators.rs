@@ -30,8 +30,8 @@
 //! ### Array containment / overlap
 //! | PG operator | Rewrites to (array heuristic)            |
 //! |-------------|------------------------------------------|
-//! | `@>`        | `list_has_all(lhs, rhs)`                 |
-//! | `<@`        | `list_has_all(rhs, lhs)`                 |
+//! | `@>`        | `array_contains(lhs, rhs)`               |
+//! | `<@`        | `array_contains(rhs, lhs)`               |
 //! | `&&`        | `arrays_overlap(lhs, rhs)`               |
 //!
 //! The heuristic fires only when at least one operand textually starts with
@@ -268,14 +268,27 @@ fn find_and_after(lower: &str, start: usize) -> Option<usize> {
 /// Rewrite array containment / overlap operators for array-typed operands.
 ///
 /// Operators translated:
-/// - `A @> B`  → `list_has_all(A, B)`     (A contains all elements of B)
-/// - `A <@ B`  → `list_has_all(B, A)`     (A contained in B)
+/// - `A @> B`  → `array_contains(A, B)`   (A contains all elements of B)
+/// - `A <@ B`  → `array_contains(B, A)`   (A contained in B)
 /// - `A && B`  → `arrays_overlap(A, B)`   (A and B share at least one element)
 ///
-/// `list_has_all` (alias `array_has_all`) has signature (array, array) in
-/// DataFusion 53 and is the correct mapping.  The former `array_contains` /
-/// `array_has` has signature (array, element) — passing two arrays triggers
-/// a type-coercion error in most engine configurations.
+/// All three targets are Basin's own PG-semantics UDFs (`datetime_extras`),
+/// not DataFusion builtins. The `@>` / `<@` pair used to route to DataFusion's
+/// `list_has_all` instead, which disagrees with PostgreSQL on NULL elements:
+/// `list_has_all(ARRAY[1,2,NULL], ARRAY[NULL])` is true, and PG's
+/// `ARRAY[1,2,NULL] @> ARRAY[NULL]` is **false** — a NULL element is never
+/// contained, not even by itself. `array_contains` gets that right (see its
+/// measured-against-18.2 table in `datetime_extras`), so the operators route
+/// there; `&&` already did.
+///
+/// This does not compete with JSONB containment. `udf::rewrite_json_operators`
+/// runs earlier in the executor's rewrite chain and has already turned
+/// `jsonb @> literal` into `jsonb_contains(…)` and `jsonb <@ literal` into
+/// `jsonb_contained_by(…)` by the time this pass sees the SQL — it also strips
+/// the `::jsonb` cast, so the `'{…}'::` arm of [`looks_like_array`] cannot
+/// match a JSONB operand that is still spelled as one. Verified by running
+/// both families through a live session; the jsonb cases come back named
+/// `jsonb_contains` / `jsonb_contained_by`, never `array_contains`.
 ///
 /// Only fires when at least one operand looks like an array (starts with
 /// `ARRAY[` or contains `::` followed by a type ending in `[]`). Leaves
@@ -970,15 +983,14 @@ fn rewrite_array_op_once(sql: String, op: &str, _placeholder: bool) -> String {
         }
 
         let replacement = match op {
-            // `A @> B` — A contains all elements of B.
-            // DataFusion's `array_contains` (= `array_has`) has signature
-            // (array, element) — passing two arrays triggers a coercion
-            // error in most configs.  `list_has_all(A, B)` has signature
-            // (array, array) and is the correct mapping.
-            "@>" => format!("list_has_all({lhs}, {rhs})"),
+            // `A @> B` — A contains all elements of B. Basin's own
+            // `array_contains`, which takes (array, array) and matches PG on
+            // NULL elements, set semantics and flattening; NOT DataFusion's
+            // `array_contains`/`array_has`, which registration order shadows.
+            "@>" => format!("array_contains({lhs}, {rhs})"),
             // `A <@ B` — A is contained in B (all elements of A exist in B).
-            // Equivalent to `list_has_all(B, A)`.
-            "<@" => format!("list_has_all({rhs}, {lhs})"),
+            // Equivalent to `array_contains(B, A)`.
+            "<@" => format!("array_contains({rhs}, {lhs})"),
             "&&" => format!("arrays_overlap({lhs}, {rhs})"),
             _ => unreachable!(),
         };
@@ -1016,6 +1028,94 @@ fn find_array_op_outside_strings(s: &str, op: &str) -> Option<usize> {
     None
 }
 
+/// Byte offset of the `::` starting a **type-cast suffix** that ends at `end`,
+/// if there is one — `::int[]`, `::varchar(50)[]`, `::text[][]`.
+///
+/// This exists because the `]`-branch of [`array_extract_left`] cannot tell a
+/// type subscript from an array literal by looking at the closing bracket. For
+/// `ARRAY[]::int[]` it walked back to the `[` of `int[`, found the preceding
+/// word was `int` rather than `array`, and handed back the two characters
+/// `[]` as the entire left operand. Measured consequences before this: the
+/// `<@` form was a parse error, and `ARRAY[1,2] @> ARRAY[]::int[]` came back as
+/// the list `[1]` instead of the boolean `t`.
+///
+/// Only a *type* subscript qualifies: the bracket group must be empty or all
+/// digits (`int[]`, `int[3]`). `ARRAY[1,2]` has `1,2` inside, so a literal is
+/// never mistaken for a cast. Returns `None` unless the whole shape
+/// `:: name [(n)] []…` is present, in which case the caller's existing
+/// branches handle the operand unchanged.
+fn cast_suffix_start(s: &str, end: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = end;
+
+    // One or more trailing `[]` / `[3]` type subscripts (`int[][]`).
+    let mut saw_subscript = false;
+    loop {
+        let mut j = i;
+        while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        if j == 0 || bytes[j - 1] != b']' {
+            break;
+        }
+        let mut k = j - 1;
+        let mut type_subscript = true;
+        loop {
+            if k == 0 {
+                return None;
+            }
+            k -= 1;
+            match bytes[k] {
+                b'[' => break,
+                b'0'..=b'9' | b' ' => {}
+                _ => type_subscript = false,
+            }
+        }
+        if !type_subscript {
+            break;
+        }
+        i = k;
+        saw_subscript = true;
+    }
+    if !saw_subscript {
+        return None;
+    }
+
+    // Optional precision/scale on the type name — `varchar(50)`, `numeric(9,2)`.
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i > 0 && bytes[i - 1] == b')' {
+        let mut depth = 1i32;
+        i -= 1;
+        while i > 0 && depth > 0 {
+            i -= 1;
+            match bytes[i] {
+                b')' => depth += 1,
+                b'(' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+    }
+
+    // The type name itself, then the `::` that introduces it.
+    let name_end = i;
+    while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        i -= 1;
+    }
+    if i == name_end {
+        return None;
+    }
+    if i >= 2 && bytes[i - 1] == b':' && bytes[i - 2] == b':' {
+        Some(i - 2)
+    } else {
+        None
+    }
+}
+
 fn array_extract_left(s: &str, end: usize) -> (usize, usize) {
     let bytes = s.as_bytes();
     let mut i = end;
@@ -1025,6 +1125,13 @@ fn array_extract_left(s: &str, end: usize) -> (usize, usize) {
     let operand_end = i;
     if i == 0 {
         return (0, operand_end);
+    }
+    // `X::int[]` — find where `X` starts and keep the cast attached to it.
+    // Strictly decreasing (`cast_suffix_start` consumes at least `::t[]`), so
+    // the recursion terminates even on `x::int[]::int[]`.
+    if let Some(cast_start) = cast_suffix_start(s, operand_end) {
+        let (base_start, _) = array_extract_left(s, cast_start);
+        return (base_start, operand_end);
     }
     let last = bytes[i - 1];
     if last == b'\'' {
@@ -1173,6 +1280,21 @@ fn array_extract_right(s: &str, start: usize) -> (usize, usize) {
                     b']' => depth -= 1,
                     _ => {}
                 }
+                i += 1;
+            }
+        }
+        // `ARRAY[]::int[]` — the cast is part of the operand. Without this the
+        // operand stopped at `ARRAY[]` and the trailing `::int[]` was left
+        // outside the rewrite, so `ARRAY[1,2] @> ARRAY[]::int[]` became
+        // `array_contains(…, ARRAY[])::int[]` — a list, not the boolean PG
+        // answers `t`. Same shape the parenthesized branch below already
+        // handled; the type name may carry parens (`varchar(50)`).
+        if i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
+            i += 2;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || matches!(bytes[i], b'_' | b'[' | b']' | b'(' | b')'))
+            {
                 i += 1;
             }
         }
@@ -8298,21 +8420,74 @@ mod tests {
 
     #[test]
     fn array_contains_rewrite() {
-        // @> rewrites to list_has_all(lhs, rhs) — (array, array) signature.
+        // @> rewrites to array_contains(lhs, rhs) — Basin's PG-semantics UDF,
+        // not DataFusion's `list_has_all`, which answers true for
+        // `list_has_all(ARRAY[1,2,NULL], ARRAY[NULL])` where PG answers false.
         let sql = "SELECT ARRAY[1,2,3] @> ARRAY[1,2]";
         let out = rewrite_array_operators(sql);
-        assert!(out.contains("list_has_all("), "got: {out}");
+        assert!(out.contains("array_contains("), "got: {out}");
+        assert!(!out.contains("list_has_all("), "got: {out}");
         assert!(out.contains("ARRAY[1,2,3], ARRAY[1,2]"), "got: {out}");
     }
 
     #[test]
     fn array_contained_by_rewrite() {
-        // <@ rewrites to list_has_all(rhs, lhs) — haystack is rhs, needle-set is lhs.
+        // <@ rewrites to array_contains(rhs, lhs) — haystack is rhs, needle-set is lhs.
         let sql = "SELECT ARRAY[1,2] <@ ARRAY[1,2,3]";
         let out = rewrite_array_operators(sql);
-        assert!(out.contains("list_has_all("), "got: {out}");
-        // rhs comes first in the call: list_has_all(ARRAY[1,2,3], ARRAY[1,2])
+        assert!(out.contains("array_contains("), "got: {out}");
+        assert!(!out.contains("list_has_all("), "got: {out}");
+        // rhs comes first in the call: array_contains(ARRAY[1,2,3], ARRAY[1,2])
         assert!(out.contains("ARRAY[1,2,3], ARRAY[1,2]"), "got: {out}");
+    }
+
+    /// A `::type[]` cast is part of the operand, not a separate token.
+    ///
+    /// `array_extract_left` used to walk back from the final `]` to the `[` of
+    /// `int[`, see that the preceding word was `int` rather than `array`, and
+    /// hand back the two characters `[]` as the whole left operand.
+    /// `array_extract_right` had the mirror gap: it stopped after `ARRAY[]`
+    /// and left `::int[]` outside the rewritten call.
+    #[test]
+    fn array_op_keeps_type_cast_with_its_operand() {
+        // Left operand carrying the cast — used to slice down to `[]`.
+        let out = rewrite_array_operators("SELECT ARRAY[]::int[] <@ ARRAY[1,2]");
+        assert!(
+            out.contains("array_contains(ARRAY[1,2], ARRAY[]::int[])"),
+            "got: {out}"
+        );
+
+        // Right operand carrying the cast — the cast used to escape the call
+        // and apply to its boolean result instead.
+        let out = rewrite_array_operators("SELECT ARRAY[1,2] @> ARRAY[]::int[]");
+        assert!(
+            out.contains("array_contains(ARRAY[1,2], ARRAY[]::int[])"),
+            "got: {out}"
+        );
+
+        // A parenthesized constructor with a parameterised element type, on
+        // the left this time (the right-hand shape was already handled).
+        let out = rewrite_array_operators("SELECT (ARRAY['a','b'])::varchar(50)[] && ARRAY['b']");
+        assert!(
+            out.contains("arrays_overlap((ARRAY['a','b'])::varchar(50)[], ARRAY['b'])"),
+            "got: {out}"
+        );
+
+        // And a plain column with an element-type cast.
+        let out = rewrite_array_operators("SELECT * FROM t WHERE tags::text[] && ARRAY['a']");
+        assert!(
+            out.contains("arrays_overlap(tags::text[], ARRAY['a'])"),
+            "got: {out}"
+        );
+    }
+
+    /// An array *literal* is not a type subscript: `ARRAY[3]` must keep
+    /// working, and single-element/digit-only contents must not be mistaken
+    /// for the `int[3]` cast form.
+    #[test]
+    fn array_op_single_element_literal_is_not_a_cast() {
+        let out = rewrite_array_operators("SELECT ARRAY[3] @> ARRAY[3]");
+        assert!(out.contains("array_contains(ARRAY[3], ARRAY[3])"), "got: {out}");
     }
 
     #[test]

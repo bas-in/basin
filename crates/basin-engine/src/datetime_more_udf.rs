@@ -37,8 +37,9 @@
 //! `origin`.  Formula: `origin + floor((source - origin) / stride) * stride`.
 //! Stride must be positive; result type mirrors the source type.  Supports
 //! `Interval(MonthDayNano)`, `Interval(DayTime)`, `Interval(YearMonth)` strides.
-//! **Limitation:** month/year-based strides use an approximate 30-day/month,
-//! 365-day/year conversion — sufficient for bucketing but not calendar-exact.
+//! A stride carrying months or years is **rejected**, with PostgreSQL's own
+//! message: months are not a fixed width, so the buckets would not tile. This
+//! used to substitute 30-day months and answer anyway.
 //!
 //! ### clock_timestamp() → timestamptz
 //! Returns the real wall-clock instant at call time (calls `Utc::now()`
@@ -48,16 +49,19 @@
 //!
 //! ### statement_timestamp() → timestamptz
 //! Returns the timestamp captured at the start of the current SQL statement.
-//! The caller (executor) must call [`tick_statement_ts`] once before each
+//! `executor::execute` calls [`tick_statement_ts`] at the top of every
 //! statement; within the statement every call to this UDF returns the same
-//! value.  Reset to `None` between statements so the first call within a new
-//! statement sees the freshly-snapped time.
+//! value.
 //!
 //! ### transaction_timestamp() → timestamptz
-//! Returns the timestamp captured at `BEGIN`.  `tick_txn_ts` is called once
-//! on the first statement of a transaction (or at `BEGIN`); cleared on
+//! Returns the timestamp captured at `BEGIN`.  `executor::execute` calls
+//! [`tick_txn_ts`] on the `BEGIN` statement and [`clear_txn_ts`] on
 //! `COMMIT` / `ROLLBACK`.  Outside an explicit transaction, falls back to the
-//! current statement timestamp.
+//! current statement timestamp — PostgreSQL's autocommit semantics, where
+//! each statement is its own transaction.
+//!
+//! Both are registered per session by [`register_datetime_session_udfs`],
+//! against the `DateTimeSessionState` that session's `SessionState` owns.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -86,14 +90,16 @@ use datafusion::prelude::SessionContext;
 /// `Arc` clone is captured by the per-session UDFs registered in
 /// [`register_datetime_more_udfs`].
 ///
-/// * `statement_ts` — set by the executor before each statement via
-///   [`tick_statement_ts`]. Cleared (set back to `None`) after the
-///   statement completes so stale values don't bleed into the next query.
+/// * `statement_ts` — set by the executor at the top of every statement via
+///   [`tick_statement_ts`], from `executor::execute`. Every read within one
+///   statement therefore sees the same value.
 ///
 /// * `txn_ts` — set once at `BEGIN` via [`tick_txn_ts`] and held until
 ///   `COMMIT` / `ROLLBACK` clears it via [`clear_txn_ts`].  Outside an
 ///   explicit transaction this is `None`; in that case
-///   `transaction_timestamp()` falls back to `statement_ts`.
+///   `transaction_timestamp()` falls back to `statement_ts`, which is
+///   PostgreSQL's autocommit behaviour (each statement is its own
+///   transaction, so `now()` advances per statement).
 #[derive(Debug, Default)]
 pub(crate) struct DateTimeSessionState {
     /// Microseconds since UNIX epoch captured at statement-start time.
@@ -128,20 +134,17 @@ pub(crate) fn clear_txn_ts(dt: &DateTimeSessionState) {
 // Registration
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Register all extended date/time UDFs on `ctx`.
+/// Register the *stateless* extended date/time UDFs on `ctx`.
 ///
-/// Called once per session-open from `session::open()`.
-///
-/// Self-contained timestamp anchoring: this function owns a fresh
-/// [`DateTimeSessionState`] arc that is captured by the per-session
-/// `statement_timestamp` / `transaction_timestamp` stubs. Because no
-/// executor hook currently calls [`tick_statement_ts`] / [`tick_txn_ts`]
-/// (PG-precise intra-transaction clock anchoring is tracked separately as
-/// #151), those stubs fall back to a fresh `Utc::now()` per invocation —
-/// a sane current timestamp sufficient for compilation and unit tests.
+/// Called once per engine, from `session::build_stateless_udf_cache`, and the
+/// result is shared by every session — which is precisely why
+/// `statement_timestamp` / `transaction_timestamp` are **not** registered
+/// here. They read per-session state; registering them against an
+/// engine-wide `DateTimeSessionState` would make one session's `BEGIN` move
+/// another session's `now()`. See [`register_datetime_session_udfs`], which
+/// session-open calls with that session's own state and which overrides (by
+/// name) the stateless stubs `pg_scalar_aliases` registers.
 pub(crate) fn register_datetime_more_udfs(ctx: &SessionContext) {
-    let dt = Arc::new(DateTimeSessionState::default());
-    let dt = &dt;
     // age(ts1, ts2) → interval — overrides stateless-cache version.
     ctx.register_udf(ScalarUDF::from(AgeMoreUdf {
         signature: Signature::any(2, Volatility::Immutable),
@@ -167,20 +170,48 @@ pub(crate) fn register_datetime_more_udfs(ctx: &SessionContext) {
         signature: Signature::any(3, Volatility::Immutable),
     }));
 
-    // clock_timestamp() → real-time — overrides NowStubUdf.
+    // clock_timestamp() → real-time — overrides NowStubUdf. Stateless by
+    // definition: it snaps the wall clock on every invocation.
     ctx.register_udf(ScalarUDF::from(ClockTimestampUdf {
         signature: Signature::nullary(Volatility::Volatile),
     }));
+}
 
+/// Register the two *session*-anchored timestamp UDFs on `ctx`, reading `dt`.
+///
+/// Called from `session::open()` with that session's
+/// [`SessionState::datetime`](crate::session::SessionState::datetime), the
+/// same arc the executor's statement/transaction hooks tick. Registration is
+/// by name, so these replace the stateless `pg_scalar_aliases` stubs for this
+/// session only.
+pub(crate) fn register_datetime_session_udfs(ctx: &SessionContext, dt: Arc<DateTimeSessionState>) {
     // statement_timestamp() → stable per statement.
     ctx.register_udf(ScalarUDF::from(StmtTimestampUdf {
-        dt: Arc::clone(dt),
+        dt: Arc::clone(&dt),
         signature: Signature::nullary(Volatility::Stable),
     }));
 
     // transaction_timestamp() → stable per transaction.
     ctx.register_udf(ScalarUDF::from(TxnTimestampUdf {
-        dt: Arc::clone(dt),
+        dt: Arc::clone(&dt),
+        name: "transaction_timestamp",
+        signature: Signature::nullary(Volatility::Stable),
+    }));
+
+    // now() IS transaction_timestamp() — PostgreSQL says so, and a live 18.2
+    // agrees to the microsecond: inside one `BEGIN`, `SELECT now(),
+    // transaction_timestamp()` returns two byte-identical values, and both
+    // are unchanged by a second statement in the same block while
+    // `statement_timestamp()` has moved on.
+    //
+    // This overrides DataFusion's built-in `now()`, which is stable only
+    // within ONE query — that is `statement_timestamp()` semantics wearing
+    // `now()`'s name, and it is wrong for exactly the case the name exists to
+    // serve: two statements in one transaction disagreeing about when "now"
+    // is. `CURRENT_TIMESTAMP` follows, because the parser lowers it to `now`.
+    ctx.register_udf(ScalarUDF::from(TxnTimestampUdf {
+        dt,
+        name: "now",
         signature: Signature::nullary(Volatility::Stable),
     }));
 }
@@ -304,15 +335,24 @@ fn row_to_micros(arr: &ArrayRef, i: usize) -> DFResult<Option<i64>> {
 }
 
 /// Convert an `IntervalMonthDayNano` to microseconds.
-/// Month/year components use approximate 30-day months (PG `date_bin` only
-/// supports fixed-size strides so calendar-exact behaviour is outside scope).
-fn interval_to_micros(iv: IntervalMonthDayNano) -> i64 {
+///
+/// A non-zero month component is an error, not an approximation. PostgreSQL
+/// rejects it outright — `date_bin('1 month', …)` on 18.2 is
+/// `ERROR: timestamps cannot be binned into intervals containing months or
+/// years` — because a month is not a fixed number of microseconds, so the
+/// buckets would not tile. Basin used to substitute 30-day months and answer
+/// anyway: `date_bin('1 month', '2020-03-15', '2020-01-01')` came back
+/// `2020-03-01`, which looks like a calendar month boundary and is one only by
+/// coincidence of that origin. The next bucket would have started on
+/// 2020-03-31. Refusing is the honest answer and matches PG's text.
+fn interval_to_micros(iv: IntervalMonthDayNano) -> DFResult<i64> {
     const US_PER_DAY: i64 = 86_400 * 1_000_000;
-    // Approximate: 30 days per month.
-    let month_us = iv.months as i64 * 30 * US_PER_DAY;
+    if iv.months != 0 {
+        return exec_err!("timestamps cannot be binned into intervals containing months or years");
+    }
     let day_us = iv.days as i64 * US_PER_DAY;
     let ns_us = iv.nanoseconds / 1_000;
-    month_us + day_us + ns_us
+    Ok(day_us + ns_us)
 }
 
 /// Extract an interval from a scalar/array arg as microseconds.
@@ -327,7 +367,7 @@ fn interval_arg_to_micros(args: &[ColumnarValue], idx: usize, n: usize) -> DFRes
             if a.is_null(0) {
                 return exec_err!("date_bin: stride must not be null");
             }
-            Ok(interval_to_micros(a.value(0)))
+            interval_to_micros(a.value(0))
         }
         DataType::Interval(IntervalUnit::DayTime) => {
             use datafusion::arrow::array::IntervalDayTimeArray;
@@ -349,8 +389,14 @@ fn interval_arg_to_micros(args: &[ColumnarValue], idx: usize, n: usize) -> DFRes
             if a.is_null(0) {
                 return exec_err!("date_bin: stride must not be null");
             }
-            let months = a.value(0) as i64;
-            Ok(months * 30 * 86_400 * 1_000_000)
+            // A YearMonth interval is *only* months, so any non-zero stride
+            // here is the month/year case PostgreSQL rejects.
+            if a.value(0) != 0 {
+                return exec_err!(
+                    "timestamps cannot be binned into intervals containing months or years"
+                );
+            }
+            Ok(0)
         }
         other => exec_err!("date_bin: unsupported stride type {other:?}"),
     }
@@ -1042,19 +1088,26 @@ impl ScalarUDFImpl for StmtTimestampUdf {
 #[derive(Debug)]
 struct TxnTimestampUdf {
     dt: Arc<DateTimeSessionState>,
+    /// The name this registration answers to — `transaction_timestamp` or
+    /// `now`. They are the *same function* in PostgreSQL, and registering one
+    /// implementation twice is what keeps them from drifting apart.
+    name: &'static str,
     signature: Signature,
 }
 
 // See `StmtTimestampUdf` — identity-based eq/hash for DynEq/DynHash.
 impl PartialEq for TxnTimestampUdf {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.dt, &other.dt) && self.signature == other.signature
+        Arc::ptr_eq(&self.dt, &other.dt)
+            && self.name == other.name
+            && self.signature == other.signature
     }
 }
 impl Eq for TxnTimestampUdf {}
 impl std::hash::Hash for TxnTimestampUdf {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         (Arc::as_ptr(&self.dt) as usize).hash(state);
+        self.name.hash(state);
         self.signature.hash(state);
     }
 }
@@ -1064,7 +1117,7 @@ impl ScalarUDFImpl for TxnTimestampUdf {
         self
     }
     fn name(&self) -> &str {
-        "transaction_timestamp"
+        self.name
     }
     fn signature(&self) -> &Signature {
         &self.signature

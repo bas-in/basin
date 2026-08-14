@@ -64,13 +64,14 @@ pub(crate) fn register_datetime_extras(ctx: &SessionContext) {
         aliases: vec!["list_dims".to_string()],
     }));
 
-    // array_lower(arr, dim) -> Int64  — stub returning 1 (all PG arrays are 1-indexed)
+    // array_lower(arr, dim) -> Int64  — 1 on every dimension the array has,
+    // NULL for a dimension it does not (see ArrayBoundUdf's measured table).
     ctx.register_udf(ScalarUDF::from(ArrayBoundUdf {
         name: "array_lower",
         lower: true,
         signature: Signature::any(2, Volatility::Immutable),
     }));
-    // array_upper(arr, dim) -> Int64  — returns the length of the requested dimension
+    // array_upper(arr, dim) -> Int64  — extent of the requested dimension
     ctx.register_udf(ScalarUDF::from(ArrayBoundUdf {
         name: "array_upper",
         lower: false,
@@ -334,9 +335,90 @@ fn dims_of_array(arr: &dyn Array) -> DFResult<ColumnarValue> {
 
 // ── array_lower / array_upper ────────────────────────────────────────────────
 
+/// Number of dimensions of one array *value*, PG-style.
+///
+/// PostgreSQL derives dimensionality from the value, not from a declared type:
+/// an empty array has **zero** dimensions no matter what it was cast to, which
+/// is why `array_upper(ARRAY[]::int[], 1)` is NULL and not 0. Arrow keeps the
+/// nesting in the type, so walk the value: descend while the current level is a
+/// list and non-empty.
+fn array_ndims(value: &dyn Array) -> usize {
+    let mut level: ArrayRef = match nested_child(value, 0) {
+        Some(child) => child,
+        None => return 0,
+    };
+    let mut n = 1usize;
+    loop {
+        match nested_child(level.as_ref(), 0) {
+            Some(child) => {
+                n += 1;
+                level = child;
+            }
+            None => return n,
+        }
+    }
+}
+
+/// Row `i` of `arr` as a nested array value, or `None` when `arr` is not a list
+/// type, the row is NULL, or the row is empty (a dimension with no extent is
+/// not a dimension — see [`array_ndims`]).
+fn nested_child(arr: &dyn Array, i: usize) -> Option<ArrayRef> {
+    if i >= arr.len() || arr.is_null(i) {
+        return None;
+    }
+    let child = match arr.data_type() {
+        DataType::List(_) => arr.as_any().downcast_ref::<ListArray>()?.value(i),
+        DataType::LargeList(_) => arr.as_any().downcast_ref::<LargeListArray>()?.value(i),
+        DataType::FixedSizeList(_, _) => {
+            arr.as_any().downcast_ref::<FixedSizeListArray>()?.value(i)
+        }
+        _ => return None,
+    };
+    if child.is_empty() {
+        return None;
+    }
+    Some(child)
+}
+
+/// Extent of dimension `dim` (1-based) of one array value, or `None` when the
+/// value has fewer dimensions than that. PG arrays are rectangular, so the
+/// extent of an inner dimension is read off its first sub-array.
+fn array_dim_len(value: &dyn Array, dim: i64) -> Option<usize> {
+    if dim < 1 {
+        return None;
+    }
+    let mut level: ArrayRef = nested_child(value, 0)?;
+    for _ in 1..dim {
+        level = nested_child(level.as_ref(), 0)?;
+    }
+    Some(level.len())
+}
+
 /// `array_lower(arr, dim)` / `array_upper(arr, dim)` — PG array bound accessors.
-/// In PG all arrays are 1-indexed so lower is always 1. Upper returns the
-/// number of elements in the requested dimension (only dim=1 is supported).
+///
+/// Both used to ignore `dim` entirely: `lower` answered a flat `1` and `upper`
+/// the outer length, for every dimension number. Correct for `dim = 1` on a 1-D
+/// array and wrong everywhere else. Measured on PostgreSQL 18.2:
+///
+/// | case                                    | PG     | old Basin |
+/// |-----------------------------------------|--------|-----------|
+/// | `array_lower(ARRAY[1,2,3], 1)`          | `1`    | `1`       |
+/// | `array_lower(ARRAY[1,2,3], 2)`          | `NULL` | `1`       |
+/// | `array_upper(ARRAY[1,2,3], 1)`          | `3`    | `3`       |
+/// | `array_upper(ARRAY[1,2,3], 2)`          | `NULL` | `3`       |
+/// | `array_upper(ARRAY[1,2,3], 0)`          | `NULL` | `3`       |
+/// | `array_upper(ARRAY[1,2,3], -1)`         | `NULL` | `3`       |
+/// | `array_upper(ARRAY[[1,2,3],[4,5,6]], 1)`| `2`    | `2`       |
+/// | `array_upper(ARRAY[[1,2,3],[4,5,6]], 2)`| `3`    | `2`       |
+/// | `array_upper(ARRAY[[1,2,3],[4,5,6]], 3)`| `NULL` | `2`       |
+/// | `array_upper(ARRAY[]::int[], 1)`        | `NULL` | `0`       |
+/// | `array_lower(ARRAY[]::int[], 1)`        | `NULL` | `1`       |
+/// | `array_upper(NULL::int[], 1)`           | `NULL` | `NULL`    |
+/// | `array_upper(ARRAY[1,2,3], NULL)`       | `NULL` | `3`       |
+///
+/// The empty-array row is the one that reads oddly: an empty array has zero
+/// dimensions in PostgreSQL, so *both* bounds are NULL rather than an empty
+/// range. `array_ndims` reproduces that by treating an empty level as absent.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ArrayBoundUdf {
     name: &'static str,
@@ -367,28 +449,59 @@ impl ScalarUDFImpl for ArrayBoundUdf {
             ColumnarValue::Scalar(_) => 1,
         };
         let arr = args[0].clone().into_array(n)?;
+        let dims = args[1].clone().into_array(n)?;
+        let dims = int_dim_values(&dims, self.name)?;
         let mut out = Int64Builder::with_capacity(n);
         for i in 0..n {
-            if arr.is_null(i) {
+            // Strict in both arguments: `array_upper(ARRAY[1,2,3], NULL)` is
+            // NULL, as is any bound of a NULL array.
+            let (Some(dim), false) = (dims[i], arr.is_null(i)) else {
+                out.append_null();
+                continue;
+            };
+            // Out of range (including dim < 1) has no bound at all.
+            if dim < 1 || dim as usize > array_ndims(arr.as_ref()) {
                 out.append_null();
                 continue;
             }
             if self.lower {
-                // lower is always 1 for PG arrays (1-indexed).
+                // Every PG array is 1-indexed on every dimension it has.
                 out.append_value(1);
             } else {
-                // upper = number of elements in the outermost list.
-                if let Some(list) = arr.as_any().downcast_ref::<ListArray>() {
-                    let v = list.value(i);
-                    out.append_value(v.len() as i64);
-                } else {
-                    // Not a list array (e.g. scalar or wrong type) — return NULL.
-                    out.append_null();
+                match array_dim_len(arr.as_ref(), dim) {
+                    Some(len) => out.append_value(len as i64),
+                    None => out.append_null(),
                 }
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
+}
+
+/// The `dim` argument of `array_lower`/`array_upper`/`generate_subscripts` as
+/// `i64`s. The UDFs take `Signature::any`, so DataFusion applies no coercion
+/// and the literal can arrive as any integer width.
+fn int_dim_values(arr: &ArrayRef, fn_name: &str) -> DFResult<Vec<Option<i64>>> {
+    let n = arr.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if arr.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let v = ScalarValue::try_from_array(arr, i)?;
+        let as_i64 = match v.cast_to(&DataType::Int64) {
+            Ok(ScalarValue::Int64(v)) => v,
+            _ => {
+                return exec_err!(
+                    "{fn_name}: dimension must be an integer, got {:?}",
+                    arr.data_type()
+                )
+            }
+        };
+        out.push(as_i64);
+    }
+    Ok(out)
 }
 
 // ── generate_subscripts ───────────────────────────────────────────────────────

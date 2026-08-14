@@ -134,7 +134,7 @@ STATUS rows
 COL pg_typeof	Utf8	null
 COL pg_typeof	Utf8	null
 NROWS 1
-ROW unknown	unknown
+ROW bigint	text
 END
 
 QUERY 0019

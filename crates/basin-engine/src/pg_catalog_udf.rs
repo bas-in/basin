@@ -18,9 +18,11 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Int64Array, StringArray, StringBuilder,
+};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::Result as DFResult;
+use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
@@ -301,12 +303,10 @@ fn register_all(ctx: &SessionContext) {
     // (BUG #138). See `crates/basin-engine/src/advisory_lock.rs`.
 
     // ----------- pg_typeof -----------
-    // Returns the type of the argument as a text string.  Best-effort: we
-    // cannot easily introspect Arrow types here so return "unknown".
+    // Names the argument's type from its Arrow type. Falls back to PG's own
+    // `unknown` for types with no PG spelling (see PgTypeofUdf).
     let sig_any = Signature::variadic_any(Volatility::Stable);
-    ctx.register_udf(ScalarUDF::from(SimpleConstTextUdf {
-        name: "pg_typeof".into(),
-        value: "unknown".into(),
+    ctx.register_udf(ScalarUDF::from(PgTypeofUdf {
         signature: sig_any.clone(),
     }));
 
@@ -319,9 +319,7 @@ fn register_all(ctx: &SessionContext) {
         ],
         Volatility::Immutable,
     );
-    ctx.register_udf(ScalarUDF::from(SimpleConstTextUdf {
-        name: "pg_size_pretty".into(),
-        value: "0 bytes".into(),
+    ctx.register_udf(ScalarUDF::from(PgSizePrettyUdf {
         signature: sig_size,
     }));
 
@@ -991,8 +989,198 @@ impl ScalarUDFImpl for PgGetSerialSequenceUdf {
 // registered per-session in session::open.)
 
 // ---------------------------------------------------------------------------
+// pg_typeof(any) -> text
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL's `regtype` spelling for an Arrow type, or `None` when Basin has
+/// no PG name for it.
+///
+/// These are the *display* names `pg_typeof` prints, not the short
+/// `pg_type.typname` spellings `pg_colnames::pg_cast_type_name` uses for cast
+/// column names — PostgreSQL prints `double precision`, not `float8`, and
+/// `timestamp without time zone`, not `timestamp`. Every entry below was read
+/// off a live 18.2 session.
+fn pg_typeof_name(dt: &DataType) -> Option<String> {
+    let name = match dt {
+        DataType::Int8 | DataType::Int16 | DataType::UInt8 => "smallint",
+        DataType::Int32 | DataType::UInt16 => "integer",
+        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => "bigint",
+        DataType::Float32 => "real",
+        DataType::Float64 => "double precision",
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "text",
+        DataType::Boolean => "boolean",
+        DataType::Date32 | DataType::Date64 => "date",
+        DataType::Time32(_) | DataType::Time64(_) => "time without time zone",
+        DataType::Timestamp(_, Some(_)) => "timestamp with time zone",
+        DataType::Timestamp(_, None) => "timestamp without time zone",
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "numeric",
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytea",
+        DataType::Interval(_) => "interval",
+        // PG spells an array type as the element type plus `[]`, and its
+        // arrays are single-typed however deeply nested:
+        // `pg_typeof(ARRAY[[1,2],[3,4]])` is `integer[]`, not `integer[][]`.
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            let mut inner = f.data_type();
+            while let DataType::List(g) | DataType::LargeList(g) | DataType::FixedSizeList(g, _) =
+                inner
+            {
+                inner = g.data_type();
+            }
+            return pg_typeof_name(inner).map(|e| format!("{e}[]"));
+        }
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+/// `pg_typeof(x)` — the name of `x`'s type.
+///
+/// This answered the constant `"unknown"` for every argument. `unknown` is a
+/// real PostgreSQL type, which is what made the stub so quiet: introspection
+/// code that branches on `pg_typeof` saw a legitimate-looking answer rather
+/// than a failure. Basin does know the type — it is the argument's Arrow type,
+/// available on the `ColumnarValue` — so name it.
+///
+/// **Known divergence, not a bug in this function:** Basin plans an unadorned
+/// integer literal as `Int64`, so `pg_typeof(1)` says `bigint` where PostgreSQL
+/// says `integer`. The literal's width is decided long before this UDF runs;
+/// `pg_typeof(1::int)` and `pg_typeof(col)` on a real `integer` column are both
+/// right. The same offset applies to any function keyed on literal width.
+///
+/// `unknown` survives as the fallback for Arrow types with no PG spelling,
+/// which is also what PostgreSQL answers for `pg_typeof(NULL)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PgTypeofUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for PgTypeofUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "pg_typeof"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        if args.len() != 1 {
+            return exec_err!("pg_typeof expects 1 argument, got {}", args.len());
+        }
+        // The *type* is what is asked for, so a NULL value still names its
+        // type: `pg_typeof(NULL::int)` is `integer` on PG, not NULL.
+        let name = pg_typeof_name(&args[0].data_type()).unwrap_or_else(|| "unknown".to_string());
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pg_size_pretty(bigint) -> text
+// ---------------------------------------------------------------------------
+
+/// `pg_size_pretty(n)` — a byte count in the largest unit that keeps it short.
+///
+/// This was the constant string `"0 bytes"` for every input, which is a
+/// plausible answer for exactly one of them. PostgreSQL's rule (`pg_size_pretty`
+/// in `dbsize.c`) is: while the magnitude is at least `10 * 1024` in the current
+/// unit, divide by 1024 with **half-up rounding away from zero** and step to the
+/// next unit. So the switch happens at 10 kB, not 1 kB, and `1048576` prints as
+/// `1024 kB` rather than `1 MB`. Measured on 18.2:
+///
+/// | n                  | PG          |
+/// |--------------------|-------------|
+/// | `0`                | `0 bytes`   |
+/// | `1023`             | `1023 bytes`|
+/// | `10239`            | `10239 bytes` |
+/// | `10240`            | `10 kB`     |
+/// | `1048576`          | `1024 kB`   |
+/// | `10485760`         | `10 MB`     |
+/// | `123456789`        | `118 MB`    |
+/// | `1073741824`       | `1024 MB`   |
+/// | `-1024`            | `-1024 bytes` |
+/// | `1125899906842624` | `1024 TB`   |
+///
+/// Note `-1024`: the threshold is on the magnitude, and the sign rides along.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PgSizePrettyUdf {
+    signature: Signature,
+}
+
+/// Format `bytes` the way PostgreSQL's `pg_size_pretty` does.
+fn pg_size_pretty_text(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["kB", "MB", "GB", "TB", "PB"];
+    // i64::MIN has no positive counterpart; widen so the loop below can work
+    // on the magnitude without overflowing.
+    let mut size = bytes as i128;
+    for unit in UNITS {
+        if size.abs() < 10 * 1024 {
+            return format!("{size} bytes");
+        }
+        // Half-up, away from zero — PG's `(size + 512) / 1024` for positives,
+        // mirrored for negatives.
+        size = if size >= 0 {
+            (size + 512) / 1024
+        } else {
+            (size - 512) / 1024
+        };
+        if size.abs() < 10 * 1024 {
+            return format!("{size} {unit}");
+        }
+    }
+    // Ran out of units: PG stops at PB and prints whatever is left there.
+    format!("{size} PB")
+}
+
+impl ScalarUDFImpl for PgSizePrettyUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "pg_size_pretty"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        if args.len() != 1 {
+            return exec_err!("pg_size_pretty expects 1 argument, got {}", args.len());
+        }
+        let n = num_rows(args);
+        let arr = args[0].clone().into_array(n)?;
+        let mut out = StringBuilder::with_capacity(n, n * 8);
+        for i in 0..n {
+            if arr.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            let v = ScalarValue::try_from_array(&arr, i)?;
+            match v.cast_to(&DataType::Int64) {
+                Ok(ScalarValue::Int64(Some(bytes))) => out.append_value(pg_size_pretty_text(bytes)),
+                _ => {
+                    return exec_err!(
+                        "pg_size_pretty: expected an integer byte count, got {:?}",
+                        arr.data_type()
+                    )
+                }
+            }
+        }
+        let arr: ArrayRef = Arc::new(out.finish());
+        Ok(ColumnarValue::Array(arr))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SimpleConstTextUdf — (any args) -> text constant
-// Used for: pg_typeof, pg_size_pretty, current_user, session_user
+// Used for: pg_typeof, current_user, session_user
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

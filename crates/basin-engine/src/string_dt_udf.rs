@@ -37,7 +37,9 @@ use std::any::Any;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, ListArray, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder, Int32Array, Int64Array, ListArray,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
@@ -231,7 +233,7 @@ pub(crate) fn register_string_dt_udfs(ctx: &SessionContext) {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
 
-    // ---- isfinite(timestamp) → bool ---- (always true in v0.1)
+    // ---- isfinite(timestamp | timestamptz | date) → bool ----
     ctx.register_udf(ScalarUDF::from(IsFiniteUdf {
         signature: Signature::one_of(
             vec![
@@ -1120,9 +1122,33 @@ impl ScalarUDFImpl for ConvertToUdf {
 }
 
 // ---------------------------------------------------------------------------
-// isfinite → bool (always true in v0.1; infinity timestamps deferred)
+// isfinite(timestamp | timestamptz | date) → bool
 // ---------------------------------------------------------------------------
 
+/// `isfinite(x)` — false for the two infinity sentinels, true otherwise.
+///
+/// This was hardcoded `true`, and Basin genuinely materialises infinities:
+/// `datetime_extras::rewrite_infinity_timestamp_casts` turns
+/// `'infinity'::timestamp` into `cast_infinity_timestamp('infinity')`, whose
+/// UDF stores `i64::MAX` µs (and `i64::MIN` for `-infinity`) — PostgreSQL's own
+/// internal sentinels. So `SELECT isfinite('infinity'::timestamp)` came back
+/// `t` where PostgreSQL 18.2 answers `f`, on a path Basin can actually reach.
+///
+/// The sentinel is the *extremal value for the column's own unit*, not a fixed
+/// microsecond count: a `Timestamp(Nanosecond, _)` infinity is `i64::MAX`
+/// nanoseconds. Comparing against `i64::MAX`/`i64::MIN` per array is therefore
+/// unit-independent. No real timestamp lands on either bound — `i64::MAX` µs is
+/// year 294247 and `i64::MAX` ns is year 2262, but Arrow cannot represent a
+/// value one tick beyond them either, so nothing legitimate is being shadowed
+/// that was not already saturating.
+///
+/// `Date32` is accepted by the signature but has no infinity encoding in Basin
+/// (`cast_infinity_timestamp` only produces timestamps), so every date is
+/// finite — which is also what PostgreSQL says for every date that is not
+/// literally `'infinity'::date`, a spelling Basin does not currently
+/// materialise at all.
+///
+/// NULL in, NULL out, as PostgreSQL: `isfinite(NULL::timestamp)` is NULL.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct IsFiniteUdf {
     signature: Signature,
@@ -1145,8 +1171,48 @@ impl ScalarUDFImpl for IsFiniteUdf {
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
+        if args.len() != 1 {
+            return exec_err!("isfinite expects 1 argument, got {}", args.len());
+        }
         let n = num_rows(args);
-        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true; n]));
+        let arr = args[0].clone().into_array(n)?;
+
+        // Every accepted timestamp unit is a distinct Arrow array type over the
+        // same i64 tick, so read the ticks out once and decide uniformly.
+        let ticks: Option<Vec<i64>> = match arr.data_type() {
+            DataType::Timestamp(TimeUnit::Second, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .map(|a| a.values().to_vec()),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .map(|a| a.values().to_vec()),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .map(|a| a.values().to_vec()),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .map(|a| a.values().to_vec()),
+            _ => None,
+        };
+
+        let mut out = BooleanBuilder::with_capacity(n);
+        for i in 0..n {
+            if arr.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            match &ticks {
+                Some(t) => out.append_value(t[i] != i64::MAX && t[i] != i64::MIN),
+                // Date32 (and anything else the signature lets through):
+                // no infinity representation, so always finite.
+                None => out.append_value(true),
+            }
+        }
+        let arr: ArrayRef = Arc::new(out.finish());
         Ok(ColumnarValue::Array(arr))
     }
 }
