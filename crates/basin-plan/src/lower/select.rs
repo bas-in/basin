@@ -21,7 +21,11 @@
 //! `FROM` (single table, comma-list, explicit `JOIN ... ON`), the `SELECT`
 //! list (including `*` expansion and set-returning functions such as
 //! `generate_series`/`unnest`, see [`apply_project_set`]), `WHERE`, `GROUP
-//! BY` / `HAVING`, `ORDER BY`, `LIMIT` / `OFFSET`, `VALUES`, a `FROM`-less
+//! BY` / `HAVING` — including `ROLLUP` / `CUBE` / `GROUPING SETS`, which
+//! [`lower_group_by`] expands and [`build_grouping_sets_union`] turns into a
+//! `UNION ALL` of ordinary aggregates rather than a `grouping_sets`-bearing
+//! [`LogicalPlan::Aggregate`], for the reason spelled out there —
+//! `ORDER BY`, `LIMIT` / `OFFSET`, `VALUES`, a `FROM`-less
 //! `SELECT`, `UNION` / `INTERSECT` / `EXCEPT`, `DISTINCT` and `DISTINCT ON`
 //! (see [`materialize_distinct_on`]), `WITH` / `WITH RECURSIVE` — including a
 //! CTE's own column-alias list, `WITH x(a, b) AS ...` (see
@@ -87,8 +91,8 @@
 //! cannot express.
 
 use pg_query::protobuf::{
-    node::Node as NodeEnum, AExprKind, BoolExprType, JoinType, LimitOption, Node, SelectStmt,
-    SetOperation, SortByDir, SortByNulls,
+    node::Node as NodeEnum, AExprKind, BoolExprType, GroupingSetKind, JoinType, LimitOption, Node,
+    SelectStmt, SetOperation, SortByDir, SortByNulls,
 };
 
 use basin_pgtype::PgType;
@@ -100,7 +104,7 @@ use crate::lower::expr::{
 };
 use crate::lower::LowerError;
 use crate::{
-    ColId, ColumnRef, CteId, Expr, FrameBound, JoinKind, LogicalPlan, Schema, SetOpKind,
+    ColId, ColumnRef, CteId, Datum, Expr, FrameBound, JoinKind, LogicalPlan, Schema, SetOpKind,
     SnapshotId, SortKey, TableId, WindowFrame,
 };
 
@@ -942,7 +946,7 @@ fn lower_select_stmt_body(
     let lctx = expr_ctx_windows(res, &resolver, named_windows);
     let ctx = lctx.ctx();
 
-    let group_exprs = lower_group_by(&stmt.group_clause, &ctx)?;
+    let (group_exprs, grouping_sets) = lower_group_by(&stmt.group_clause, &ctx)?;
     let raw_target = lower_target_list(&stmt.target_list, &scope, &ctx)?;
     let having_expr = stmt
         .having_clause
@@ -967,7 +971,12 @@ fn lower_select_stmt_body(
     // `PgType::UNKNOWN` rather than a guess.
     let out_schema = select_output_schema(&raw_target, &scope);
 
+    // `grouping_sets.is_some()` is its own term rather than being folded into
+    // the `group_exprs` check: `GROUP BY GROUPING SETS (())` and `GROUP BY ()`
+    // name no grouping expressions at all, yet are still aggregate queries —
+    // they produce exactly one row, the grand total.
     let has_agg = !group_exprs.is_empty()
+        || grouping_sets.is_some()
         || having_expr.is_some()
         || raw_target.iter().any(|(e, _)| e.contains_aggregate());
 
@@ -1052,11 +1061,18 @@ fn lower_select_stmt_body(
 
         let base_plan = materialize_agg_inputs(base_plan, &scope, &mut aggs);
         let agg_width = group_exprs.len() + aggs.len();
-        let agg_plan = LogicalPlan::Aggregate {
-            input: Box::new(base_plan),
-            group: group_exprs,
-            aggs,
-            grouping_sets: None,
+        let agg_plan = match &grouping_sets {
+            // `ROLLUP` / `CUBE` / `GROUPING SETS` become a `UNION ALL` of
+            // ordinary aggregates rather than a `grouping_sets`-bearing
+            // `Aggregate` — see [`build_grouping_sets_union`] for why that is
+            // the shape that actually runs.
+            Some(sets) => build_grouping_sets_union(base_plan, group_exprs, aggs, sets, &ctx),
+            None => LogicalPlan::Aggregate {
+                input: Box::new(base_plan),
+                group: group_exprs,
+                aggs,
+                grouping_sets: None,
+            },
         };
         let having_applied = match having {
             Some(predicate) => LogicalPlan::Filter {
@@ -2723,24 +2739,415 @@ fn and_together(exprs: Vec<Expr>, ctx: &LowerCtx) -> Result<Option<Expr>, LowerE
 
 // ─── GROUP BY / HAVING / SELECT list ───────────────────────────────────────
 
-fn lower_group_by(group_clause: &[Node], ctx: &LowerCtx) -> Result<Vec<Expr>, LowerError> {
-    group_clause
+/// One grouping set, as positions into the flattened grouping-expression list
+/// `lower_group_by` returns alongside it.
+type GroupingSetIndices = Vec<u16>;
+
+/// PostgreSQL 18.2 refuses `CUBE` past 12 elements ("CUBE is limited to 12
+/// elements", measured live). The same ceiling is applied to `ROLLUP`, whose
+/// expansion is linear rather than exponential but whose combination with
+/// other clause items is not.
+const MAX_CUBE_ELEMENTS: usize = 12;
+
+/// PostgreSQL caps a clause's total grouping sets at 4096. The cap matters
+/// here for a reason it does not have on a real server: this lowering emits
+/// one `Aggregate` branch PER SET, so an unbounded product would build an
+/// unbounded plan rather than merely a slow one.
+const MAX_GROUPING_SETS: usize = 4096;
+
+/// Lower a `GROUP BY` clause.
+///
+/// Returns the flattened, de-duplicated list of grouping expressions and —
+/// only when `ROLLUP` / `CUBE` / `GROUPING SETS` was written — the grouping
+/// sets those expand to, as index lists into that flat list. A plain `GROUP
+/// BY a, b` returns `None` for the second element: it is a single implicit
+/// set, and saying so keeps every plain aggregate plan byte-for-byte what it
+/// was before grouping sets existed.
+///
+/// The flat list's ORDER is the output column order of the aggregate, which
+/// is what [`rewrite_post_agg`] rewrites the SELECT list, `HAVING` and `ORDER
+/// BY` against — once, against the full list, regardless of how many sets
+/// there are. That is what lets [`build_grouping_sets_union`] vary the plan
+/// underneath without anything above it knowing.
+fn lower_group_by(
+    group_clause: &[Node],
+    ctx: &LowerCtx,
+) -> Result<(Vec<Expr>, Option<Vec<GroupingSetIndices>>), LowerError> {
+    let uses_sets = group_clause
         .iter()
-        .map(|n| {
-            if matches!(n.node.as_ref(), Some(NodeEnum::GroupingSet(_))) {
-                return Err(LowerError::Unsupported(
-                    "ROLLUP / CUBE / GROUPING SETS are not yet lowered".into(),
-                ));
+        .any(|n| matches!(n.node.as_ref(), Some(NodeEnum::GroupingSet(_))));
+
+    if !uses_sets {
+        let exprs = group_clause
+            .iter()
+            .map(|n| lower_group_expr(n, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok((exprs, None));
+    }
+
+    // Each top-level clause item contributes a FACTOR — a list of alternative
+    // grouping sets — and the clause's sets are the CARTESIAN PRODUCT of the
+    // factors, each combination concatenated. Measured on PostgreSQL 18.2
+    // rather than recalled: `GROUP BY a, ROLLUP (b)` returns the 6 rows of
+    // `(a,b)` plus `(a)`, and `GROUP BY GROUPING SETS ((a),()), GROUPING SETS
+    // ((b),())` returns the same 10 rows as `CUBE (a,b)` — i.e. all four of
+    // `(a,b)`, `(a)`, `(b)`, `()`. A plain expression is just a factor with
+    // one alternative, which is why mixing the two forms needs no special
+    // case here.
+    let mut exprs: Vec<Expr> = Vec::new();
+    let mut sets: Vec<GroupingSetIndices> = vec![Vec::new()];
+    for item in group_clause {
+        let factor = expand_grouping_element(item, &mut exprs, ctx)?;
+        if sets.len().saturating_mul(factor.len()) > MAX_GROUPING_SETS {
+            return Err(LowerError::Unsupported(format!(
+                "GROUP BY expands to more than {MAX_GROUPING_SETS} grouping sets"
+            )));
+        }
+        let mut next = Vec::with_capacity(sets.len() * factor.len());
+        for base in &sets {
+            for alt in &factor {
+                let mut combined = base.clone();
+                merge_indices(&mut combined, alt);
+                next.push(combined);
             }
-            let e = lower_expr(n, ctx)?;
-            if contains_window(&e) {
-                return Err(LowerError::Unsupported(
-                    "window functions are not allowed in GROUP BY".into(),
-                ));
+        }
+        sets = next;
+    }
+
+    // Unreachable through the grammar — PostgreSQL rejects a `GROUPING SETS
+    // ()` with no sets at all as a syntax error, so `pg_query` never hands
+    // one over. Checked anyway so that `build_grouping_sets_union` can rely
+    // on having at least one branch to build instead of panicking on an
+    // empty fold.
+    if sets.is_empty() {
+        return Err(LowerError::Malformed(
+            "GROUP BY expanded to no grouping sets at all",
+        ));
+    }
+
+    Ok((exprs, Some(sets)))
+}
+
+/// Append `extra`'s positions to `set`, skipping any already present.
+///
+/// Grouping by the same expression twice within ONE set is grouping by it
+/// once (`GROUP BY a, ROLLUP (a)` has a set that mentions `a` from both
+/// items). This deliberately does NOT deduplicate whole SETS against each
+/// other: PostgreSQL emits `GROUPING SETS ((a),(a))` twice — measured, 4 rows
+/// over the 2-group fixture — and the union built below reproduces that only
+/// because duplicates survive to here.
+fn merge_indices(set: &mut GroupingSetIndices, extra: &[u16]) {
+    for i in extra {
+        if !set.contains(i) {
+            set.push(*i);
+        }
+    }
+}
+
+/// Lower one ordinary (non-grouping-set) `GROUP BY` expression.
+fn lower_group_expr(node: &Node, ctx: &LowerCtx) -> Result<Expr, LowerError> {
+    let e = lower_expr(node, ctx)?;
+    if contains_window(&e) {
+        return Err(LowerError::Unsupported(
+            "window functions are not allowed in GROUP BY".into(),
+        ));
+    }
+    Ok(e)
+}
+
+/// Intern a grouping expression into `exprs`, returning its position. Equal
+/// expressions share a position, so `CUBE (a, a)` grows one output column and
+/// not two.
+fn intern_group_expr(
+    node: &Node,
+    exprs: &mut Vec<Expr>,
+    ctx: &LowerCtx,
+) -> Result<u16, LowerError> {
+    let e = lower_group_expr(node, ctx)?;
+    if let Some(pos) = exprs.iter().position(|x| *x == e) {
+        return Ok(pos as u16);
+    }
+    if exprs.len() >= u16::MAX as usize {
+        return Err(LowerError::Unsupported(
+            "too many GROUP BY expressions".into(),
+        ));
+    }
+    exprs.push(e);
+    Ok((exprs.len() - 1) as u16)
+}
+
+/// Expand one `GROUP BY` element into the alternative grouping sets it stands
+/// for, interning its expressions into `exprs`.
+fn expand_grouping_element(
+    node: &Node,
+    exprs: &mut Vec<Expr>,
+    ctx: &LowerCtx,
+) -> Result<Vec<GroupingSetIndices>, LowerError> {
+    let Some(NodeEnum::GroupingSet(gs)) = node.node.as_ref() else {
+        // An ordinary expression, or a parenthesised group — either way, one
+        // set. See [`intern_term`] for why the group is not an `Expr::RowLit`.
+        return Ok(vec![intern_term(node, exprs, ctx)?]);
+    };
+    match GroupingSetKind::try_from(gs.kind).unwrap_or(GroupingSetKind::Undefined) {
+        // `()` — one set, holding nothing. Over an empty table this still
+        // emits a row (measured: `GROUP BY GROUPING SETS (())` on an empty
+        // table returns one row, `count` 0 and `sum` NULL), which the union
+        // below gets for free from an aggregate with no group keys.
+        GroupingSetKind::GroupingSetEmpty => Ok(vec![Vec::new()]),
+        // A parenthesised group — `((a, b))` inside `GROUPING SETS` — is ONE
+        // set holding all of its columns.
+        GroupingSetKind::GroupingSetSimple => {
+            let mut one = Vec::new();
+            merge_indices(&mut one, &grouping_term(&gs.content, exprs, ctx)?);
+            Ok(vec![one])
+        }
+        // `ROLLUP (a, b)` -> `(a,b)`, `(a)`, `()`: every prefix of the term
+        // list, longest first.
+        GroupingSetKind::GroupingSetRollup => {
+            let terms = grouping_terms(&gs.content, exprs, ctx)?;
+            if terms.len() > MAX_CUBE_ELEMENTS {
+                return Err(LowerError::Unsupported(format!(
+                    "ROLLUP is limited to {MAX_CUBE_ELEMENTS} elements"
+                )));
             }
-            Ok(e)
+            Ok((0..=terms.len())
+                .rev()
+                .map(|take| {
+                    let mut set = Vec::new();
+                    for t in &terms[..take] {
+                        merge_indices(&mut set, t);
+                    }
+                    set
+                })
+                .collect())
+        }
+        // `CUBE (a, b)` -> all four subsets.
+        GroupingSetKind::GroupingSetCube => {
+            let terms = grouping_terms(&gs.content, exprs, ctx)?;
+            if terms.len() > MAX_CUBE_ELEMENTS {
+                return Err(LowerError::Unsupported(format!(
+                    "CUBE is limited to {MAX_CUBE_ELEMENTS} elements"
+                )));
+            }
+            // Descending mask order so the all-columns set comes first and the
+            // grand total last, matching `ROLLUP`'s longest-first shape. Row
+            // order is not guaranteed by PostgreSQL without an `ORDER BY`
+            // (measured: the grand total came back FIRST under a
+            // `MixedAggregate`), so this is for plan readability, not
+            // compatibility.
+            Ok((0..(1usize << terms.len()))
+                .rev()
+                .map(|mask| {
+                    let mut set = Vec::new();
+                    for (bit, t) in terms.iter().enumerate() {
+                        if mask & (1 << bit) != 0 {
+                            merge_indices(&mut set, t);
+                        }
+                    }
+                    set
+                })
+                .collect())
+        }
+        // `GROUPING SETS (...)` — each element expands on its own terms and
+        // the results concatenate, so a nested `ROLLUP` inside is handled by
+        // the same recursion.
+        GroupingSetKind::GroupingSetSets => {
+            let mut out = Vec::new();
+            for c in &gs.content {
+                out.extend(expand_grouping_element(c, exprs, ctx)?);
+            }
+            Ok(out)
+        }
+        GroupingSetKind::Undefined => {
+            Err(LowerError::Malformed("GROUP BY grouping set with no kind"))
+        }
+    }
+}
+
+/// The term list of a `ROLLUP`/`CUBE`: each element is either a plain
+/// expression or a parenthesised group that counts as ONE element
+/// (`ROLLUP ((a, b), c)` has two elements, not three).
+fn grouping_terms(
+    content: &[Node],
+    exprs: &mut Vec<Expr>,
+    ctx: &LowerCtx,
+) -> Result<Vec<GroupingSetIndices>, LowerError> {
+    content
+        .iter()
+        .map(|c| match c.node.as_ref() {
+            // `ROLLUP (a, GROUPING SETS (b))` and friends. PostgreSQL's own
+            // grammar rejects `ROLLUP (a, ROLLUP (b))` outright (it parses the
+            // inner one as a function call and fails to resolve it), so this
+            // is reachable only for the forms it does accept and has no
+            // expansion here yet.
+            Some(NodeEnum::GroupingSet(_)) => Err(LowerError::Unsupported(
+                "a nested ROLLUP / CUBE / GROUPING SETS inside ROLLUP or CUBE is not yet lowered"
+                    .into(),
+            )),
+            _ => intern_term(c, exprs, ctx),
         })
         .collect()
+}
+
+/// Intern one *term* — one element of a `ROLLUP`/`CUBE` list, or one member of
+/// a `GROUPING SETS` list — into the positions it covers.
+///
+/// The subtlety is the parenthesised group. `ROLLUP ((a, b), c)` has TWO
+/// elements, not three (measured: `ROLLUP ((a,b))` returns 5 rows — the sets
+/// `(a,b)` and `()` — rather than the 7 that `ROLLUP (a,b)` gives). The raw
+/// parse tree does NOT mark `(a, b)` as a `GroupingSetSimple`; that node only
+/// appears after PostgreSQL's own parse analysis. `pg_query` hands over a
+/// **`RowExpr`**, which `lower::expr` would happily lower to an
+/// `Expr::RowLit` — a single opaque row value. Grouping by that row value is
+/// not grouping by its columns: the SELECT list's `a` would then match no
+/// grouping expression and be rejected with "column \"a\" must appear in the
+/// GROUP BY clause", which is exactly what happened before this flattened it.
+fn intern_term(
+    node: &Node,
+    exprs: &mut Vec<Expr>,
+    ctx: &LowerCtx,
+) -> Result<GroupingSetIndices, LowerError> {
+    match node.node.as_ref() {
+        Some(NodeEnum::RowExpr(row)) => grouping_term(&row.args, exprs, ctx),
+        Some(NodeEnum::GroupingSet(gs))
+            if GroupingSetKind::try_from(gs.kind).unwrap_or(GroupingSetKind::Undefined)
+                == GroupingSetKind::GroupingSetSimple =>
+        {
+            grouping_term(&gs.content, exprs, ctx)
+        }
+        _ => Ok(vec![intern_group_expr(node, exprs, ctx)?]),
+    }
+}
+
+/// Flatten one parenthesised group's members into the positions it holds.
+fn grouping_term(
+    content: &[Node],
+    exprs: &mut Vec<Expr>,
+    ctx: &LowerCtx,
+) -> Result<GroupingSetIndices, LowerError> {
+    let mut out = Vec::new();
+    for c in content {
+        let term = intern_term(c, exprs, ctx)?;
+        merge_indices(&mut out, &term);
+    }
+    Ok(out)
+}
+
+/// Build the aggregate for a query whose `GROUP BY` used `ROLLUP` / `CUBE` /
+/// `GROUPING SETS`, as a `UNION ALL` of ordinary aggregates.
+///
+/// # Why a union rather than the `grouping_sets` field
+///
+/// [`LogicalPlan::Aggregate`] has a `grouping_sets` field, and filling it in
+/// is the obvious lowering. It is also a worse one *today*: `basin-exec`
+/// refuses a non-`None` `grouping_sets` outright (`build.rs`), so filling it
+/// in would convert an honest lowering-time `Unsupported` into a runtime
+/// `BuildError` — the engine trying and failing — with no query gaining an
+/// answer. `basin-exec` already builds `LogicalPlan::SetOp` and
+/// `LogicalPlan::Project`, so the union shape RUNS.
+///
+/// # The shape
+///
+/// One branch per grouping set. Each branch aggregates over the same input by
+/// that set's subset of the grouping keys, then projects back out to the full
+/// `group.len() + aggs.len()` width, substituting a typed `NULL` for every
+/// grouping column the set left out:
+///
+/// ```text
+/// SetOp UNION ALL
+///   Project [c0, NULL::text, c1]        <- set (a): pads b
+///     Aggregate group=[a] aggs=[count]
+///   Project [NULL::int, NULL::text, c0] <- set (): pads both
+///     Aggregate group=[] aggs=[count]
+/// ```
+///
+/// Every branch therefore has the identical width and column meaning the
+/// single `Aggregate` would have had, which is precisely why `HAVING`, the
+/// window rewrite, `ORDER BY` and the final projection above this need no
+/// changes at all.
+///
+/// # Why the padded NULL is correct rather than a shortcut
+///
+/// The grand-total row genuinely has NULL in every grouped column, and that
+/// NULL is genuinely indistinguishable from a real NULL in the data —
+/// measured on 18.2, `ROLLUP (a,b)` over a row with a real NULL `b` returns
+/// both `y|NULL|8` (real) and `y|NULL|12` (padding). Being unable to tell
+/// them apart is the reason `GROUPING()` exists, not a defect of this
+/// lowering.
+///
+/// # Why aggregates stay correct
+///
+/// Each branch is an INDEPENDENT aggregate over the WHOLE input, so a
+/// rolled-up group's aggregate sees every row in that group rather than a sum
+/// of sub-aggregates. The cost is that the input is scanned once per set.
+///
+/// # Why `HAVING` above this is safe
+///
+/// `opt::pushdown` treats `LogicalPlan::SetOp` as an opaque barrier, so a
+/// `HAVING` filter sitting above the union is never pushed into a branch.
+/// That is load-bearing: pushed through a branch's padding `Project` a
+/// grouping-key predicate would fold against a constant NULL, and pushed
+/// below that branch's `Aggregate` it would delete the single row an empty
+/// grouping set must still emit over an empty input.
+fn build_grouping_sets_union(
+    input: LogicalPlan,
+    group: Vec<Expr>,
+    aggs: Vec<Expr>,
+    sets: &[GroupingSetIndices],
+    ctx: &LowerCtx,
+) -> LogicalPlan {
+    debug_assert!(!sets.is_empty(), "a GROUP BY always has at least one set");
+
+    let null_for =
+        |i: usize| -> Expr { Expr::Literal(Datum::Null, best_effort_type(&group[i], ctx.columns)) };
+
+    let branch = |set: &GroupingSetIndices| -> LogicalPlan {
+        let branch_group: Vec<Expr> = set.iter().map(|i| group[*i as usize].clone()).collect();
+        // Column `j` of the full grouping list is at `position(j)` in this
+        // branch's aggregate output; anything not in the set is padded.
+        let mut exprs: Vec<(Expr, String)> = (0..group.len())
+            .map(|j| {
+                let name = default_alias(&group[j]);
+                let e = match set.iter().position(|i| *i as usize == j) {
+                    Some(pos) => Expr::Column(ColumnRef {
+                        relation: 0,
+                        index: pos as u16,
+                        name: name.clone(),
+                    }),
+                    None => null_for(j),
+                };
+                (e, name)
+            })
+            .collect();
+        for k in 0..aggs.len() {
+            exprs.push((
+                Expr::Column(ColumnRef {
+                    relation: 0,
+                    index: (set.len() + k) as u16,
+                    name: "?column?".to_string(),
+                }),
+                "?column?".to_string(),
+            ));
+        }
+        LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Aggregate {
+                input: Box::new(input.clone()),
+                group: branch_group,
+                aggs: aggs.clone(),
+                grouping_sets: None,
+            }),
+            exprs,
+        }
+    };
+
+    let mut iter = sets.iter();
+    let first = branch(iter.next().expect("at least one grouping set"));
+    iter.fold(first, |acc, set| LogicalPlan::SetOp {
+        left: Box::new(acc),
+        right: Box::new(branch(set)),
+        op: SetOpKind::Union,
+        all: true,
+    })
 }
 
 fn contains_window(e: &Expr) -> bool {
@@ -4304,10 +4711,341 @@ mod tests {
         assert!(msg.contains("GROUP BY"), "message should explain: {msg}");
     }
 
+    // --- 4b: ROLLUP / CUBE / GROUPING SETS -> UNION ALL of aggregates -------
+    //
+    // Every expansion below was measured against a live PostgreSQL 18.2
+    // server before being written down; the fixture is
+    // `gs(a,b,v)` = ('x','p',1),('x','q',2),('y','p',4),('y',NULL,8) and the
+    // row counts quoted in the comments are that server's.
+
+    /// The branches of a left-deep `UNION ALL` chain, left to right. A single
+    /// grouping set produces no `SetOp` at all, which this reports as one
+    /// branch.
+    fn union_all_branches(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
+        match plan {
+            LogicalPlan::SetOp {
+                left,
+                right,
+                op: SetOpKind::Union,
+                all: true,
+            } => {
+                let mut v = union_all_branches(left);
+                v.push(right);
+                v
+            }
+            other => vec![other],
+        }
+    }
+
+    /// One branch's `(grouping keys, projected output row)`.
+    fn branch_shape(b: &LogicalPlan) -> (Vec<Expr>, Vec<Expr>) {
+        let LogicalPlan::Project { input, exprs } = b else {
+            panic!("expected a padding Project per branch, got {b:?}");
+        };
+        let LogicalPlan::Aggregate {
+            group,
+            grouping_sets,
+            ..
+        } = &**input
+        else {
+            panic!("expected an Aggregate under each branch's Project, got {input:?}");
+        };
+        assert!(
+            grouping_sets.is_none(),
+            "each branch must be a PLAIN aggregate: basin-exec refuses a \
+             grouping_sets-bearing Aggregate outright, so emitting one would \
+             trade a lowering-time refusal for a runtime failure"
+        );
+        (
+            group.clone(),
+            exprs.iter().map(|(e, _)| e.clone()).collect(),
+        )
+    }
+
+    /// Just the grouping-key lists, one per branch, in branch order.
+    fn set_groups(plan: &LogicalPlan) -> Vec<Vec<Expr>> {
+        union_all_branches(plan)
+            .into_iter()
+            .map(|b| branch_shape(b).0)
+            .collect()
+    }
+
     #[test]
-    fn rollup_is_unsupported() {
-        let err = lower("SELECT a, sum(id) FROM t GROUP BY ROLLUP (a)").unwrap_err();
-        assert!(matches!(err, LowerError::Unsupported(_)));
+    fn rollup_lowers_to_a_union_all_of_plain_aggregates_with_null_padding() {
+        let plan = lower("SELECT a, sum(id) FROM t GROUP BY ROLLUP (a)").unwrap();
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        // The SELECT list is rewritten against the FULL grouping list exactly
+        // as it is for a plain `GROUP BY` — the union underneath is invisible
+        // to everything above it, which is the whole point of the shape.
+        assert_eq!(exprs[0].0, col(0, "a"));
+        assert_eq!(exprs[1].0, col(1, "?column?"));
+
+        let branches = union_all_branches(&input);
+        assert_eq!(branches.len(), 2, "ROLLUP (a) is the two sets (a) and ()");
+
+        let (g0, p0) = branch_shape(branches[0]);
+        assert_eq!(g0, vec![col(1, "a")], "\"a\" is base-scope index 1");
+        assert_eq!(p0, vec![col(0, "a"), col(1, "?column?")]);
+
+        let (g1, p1) = branch_shape(branches[1]);
+        assert!(g1.is_empty(), "the grand-total branch groups by nothing");
+        assert_eq!(
+            p1[0],
+            Expr::Literal(Datum::Null, PgType::INT4),
+            "the grand total's grouped column is a NULL of that column's own type"
+        );
+        assert_eq!(
+            p1[1],
+            col(0, "?column?"),
+            "the aggregate follows the padding"
+        );
+    }
+
+    #[test]
+    fn rollup_of_two_columns_is_the_three_prefixes_longest_first() {
+        // Measured: `ROLLUP (a,b)` returns 7 rows — the sets (a,b), (a), ().
+        let plan = lower("SELECT a, b, count(*) FROM t GROUP BY ROLLUP (a, b)").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            set_groups(&input),
+            vec![vec![col(1, "a"), col(2, "b")], vec![col(1, "a")], vec![]]
+        );
+    }
+
+    #[test]
+    fn each_padded_null_carries_its_own_columns_type() {
+        let plan = lower("SELECT a, b, count(*) FROM t GROUP BY ROLLUP (a, b)").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let branches = union_all_branches(&input);
+        // set (a) pads only b, which is TEXT
+        assert_eq!(
+            branch_shape(branches[1]).1[1],
+            Expr::Literal(Datum::Null, PgType::TEXT)
+        );
+        // the grand total pads both, each with its own type
+        let (_, p) = branch_shape(branches[2]);
+        assert_eq!(p[0], Expr::Literal(Datum::Null, PgType::INT4));
+        assert_eq!(p[1], Expr::Literal(Datum::Null, PgType::TEXT));
+    }
+
+    #[test]
+    fn cube_expands_to_every_subset() {
+        // Measured: `CUBE (a,b)` returns 10 rows — all four subsets.
+        let plan = lower("SELECT a, b, count(*) FROM t GROUP BY CUBE (a, b)").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            set_groups(&input),
+            vec![
+                vec![col(1, "a"), col(2, "b")],
+                vec![col(2, "b")],
+                vec![col(1, "a")],
+                vec![],
+            ]
+        );
+    }
+
+    #[test]
+    fn grouping_sets_expands_to_exactly_the_sets_written() {
+        // Measured: `GROUPING SETS ((a),(b),())` returns 6 rows, those three
+        // sets and nothing else — no rollup of them is implied.
+        let plan =
+            lower("SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS ((a), (b), ())").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            set_groups(&input),
+            vec![vec![col(1, "a")], vec![col(2, "b")], vec![]]
+        );
+    }
+
+    #[test]
+    fn duplicate_grouping_sets_are_not_deduplicated() {
+        // Measured: `GROUPING SETS ((a),(a))` returns 4 rows over the 2-group
+        // fixture — each group TWICE. `UNION ALL` (not `UNION`) is what keeps
+        // that true.
+        let plan = lower("SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a), (a))").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let groups = set_groups(&input);
+        assert_eq!(
+            groups.len(),
+            2,
+            "the repeated set must survive as two branches"
+        );
+        assert_eq!(groups[0], groups[1]);
+        assert!(
+            matches!(*input, LogicalPlan::SetOp { all: true, .. }),
+            "UNION (not ALL) would collapse the duplicate rows PostgreSQL emits"
+        );
+    }
+
+    #[test]
+    fn a_parenthesised_group_counts_as_one_rollup_element() {
+        // Measured: `ROLLUP ((a,b))` returns 5 rows — the sets (a,b) and (),
+        // NOT the three that `ROLLUP (a,b)` gives.
+        let plan = lower("SELECT a, b, count(*) FROM t GROUP BY ROLLUP ((a, b))").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            set_groups(&input),
+            vec![vec![col(1, "a"), col(2, "b")], vec![]]
+        );
+    }
+
+    #[test]
+    fn a_parenthesised_group_inside_grouping_sets_is_one_set_of_two_columns() {
+        // Measured: `GROUPING SETS ((a,b),())` returns 5 rows — one set of
+        // both columns plus the grand total. The raw parse tree calls that
+        // `(a,b)` a `RowExpr`, and lowering it as one would make it an
+        // `Expr::RowLit` that the SELECT list's own `a` could never match.
+        let plan =
+            lower("SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS ((a, b), ())").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            set_groups(&input),
+            vec![vec![col(1, "a"), col(2, "b")], vec![]]
+        );
+    }
+
+    #[test]
+    fn a_plain_group_by_item_crosses_with_a_rollup() {
+        // Measured: `GROUP BY a, ROLLUP (b)` returns 6 rows — the sets (a,b)
+        // and (a). Clause items multiply; they do not concatenate.
+        let plan = lower("SELECT a, b, count(*) FROM t GROUP BY a, ROLLUP (b)").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            set_groups(&input),
+            vec![vec![col(1, "a"), col(2, "b")], vec![col(1, "a")]]
+        );
+    }
+
+    #[test]
+    fn two_grouping_sets_clauses_cross_into_all_four_sets() {
+        // Measured: this returns the same 10 rows as `CUBE (a,b)`.
+        let plan = lower(
+            "SELECT a, b, count(*) FROM t \
+             GROUP BY GROUPING SETS ((a), ()), GROUPING SETS ((b), ())",
+        )
+        .unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            set_groups(&input),
+            vec![
+                vec![col(1, "a"), col(2, "b")],
+                vec![col(1, "a")],
+                vec![col(2, "b")],
+                vec![],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rollup_nested_inside_grouping_sets_expands_in_place() {
+        // Measured: `GROUPING SETS (ROLLUP(a,b))` returns the same 7 rows as
+        // `ROLLUP (a,b)` — a nested element expands on its own terms.
+        let plan =
+            lower("SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS (ROLLUP (a, b))").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            set_groups(&input),
+            vec![vec![col(1, "a"), col(2, "b")], vec![col(1, "a")], vec![]]
+        );
+    }
+
+    #[test]
+    fn a_lone_empty_grouping_set_is_still_an_aggregate_query() {
+        // `GROUP BY GROUPING SETS (())` names no grouping expression at all,
+        // so the `!group_exprs.is_empty()` test alone would not see it as an
+        // aggregate query. Measured: it returns exactly one row — and over an
+        // EMPTY table it STILL returns one row, which is what an aggregate
+        // with no group keys already does.
+        let plan = lower("SELECT count(*) FROM t GROUP BY GROUPING SETS (())").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let branches = union_all_branches(&input);
+        assert_eq!(branches.len(), 1, "one set means no SetOp is needed at all");
+        let (g, p) = branch_shape(branches[0]);
+        assert!(g.is_empty());
+        assert_eq!(p, vec![col(0, "?column?")]);
+    }
+
+    #[test]
+    fn having_filters_above_the_union_not_inside_each_branch() {
+        // Load-bearing rather than cosmetic: `opt::pushdown` treats `SetOp` as
+        // an opaque barrier, so a HAVING left HERE is never pushed into a
+        // branch — where it would fold against a padded constant NULL and,
+        // below that branch's Aggregate, could delete the single row an empty
+        // grouping set must still emit.
+        let plan =
+            lower("SELECT a, count(*) FROM t GROUP BY ROLLUP (a) HAVING count(*) > 1").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Filter { input, .. } = *input else {
+            panic!("expected the HAVING Filter directly above the union");
+        };
+        assert!(
+            matches!(*input, LogicalPlan::SetOp { all: true, .. }),
+            "the HAVING must sit above the whole union"
+        );
+    }
+
+    #[test]
+    fn order_by_sorts_the_whole_union_rather_than_a_branch() {
+        let plan =
+            lower("SELECT a, count(*) FROM t GROUP BY ROLLUP (a) ORDER BY a NULLS LAST").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Sort { input, keys } = *input else {
+            panic!("expected Sort above the union");
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].expr, col(0, "a"));
+        assert!(matches!(*input, LogicalPlan::SetOp { all: true, .. }));
+    }
+
+    #[test]
+    fn cube_past_twelve_elements_is_refused_like_postgres_refuses_it() {
+        // PostgreSQL 18.2, measured: "CUBE is limited to 12 elements".
+        let cols = ["a"; 13].join(", ");
+        let err = lower(&format!("SELECT count(*) FROM t GROUP BY CUBE ({cols})")).unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("12 elements"), "message should explain: {msg}");
+    }
+
+    #[test]
+    fn a_window_function_is_still_rejected_inside_a_grouping_set() {
+        // Expanding grouping sets must not smuggle a window function past the
+        // check every other GROUP BY expression goes through. PostgreSQL 18.2
+        // rejects this with exactly this sentence, measured live.
+        let err = lower("SELECT count(*) FROM t GROUP BY ROLLUP (rank() OVER ())").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert_eq!(msg, "window functions are not allowed in GROUP BY");
     }
 
     // --- 5: ORDER BY -> Sort, with Postgres's null defaults -----------------

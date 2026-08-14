@@ -631,6 +631,57 @@ fn hash_key_bytes(k: &HashKey) -> usize {
         }
 }
 
+/// PostgreSQL's ascending order for a `DISTINCT` aggregate's input.
+///
+/// `DISTINCT` inside an aggregate is implemented in PostgreSQL by *sorting*
+/// the input and feeding the transition function the deduplicated run, so for
+/// the two aggregates here whose output order is observable the result comes
+/// back sorted rather than in arrival order. Measured on a live PG 18.2:
+///
+/// ```text
+/// select array_agg(distinct x) from (values (3),(1),(3),(null),(2)) v(x);
+///   -> {1,2,3,NULL}          -- sorted, NULL last; NOT {3,1,NULL,2}
+/// select string_agg(distinct s, ',')
+///   from (values ('c'),('a'),('c'),(null),('b')) v(s);
+///   -> a,b,c                 -- NOT c,a,b
+/// select array_agg(distinct x)
+///   from (values ('NaN'::float8),(1.0),(null),('Infinity'::float8),(-1.0)) v(x);
+///   -> {-1,1,Infinity,NaN,NULL}
+/// ```
+///
+/// Two rules the last one pins, both of which a plain `partial_cmp` would get
+/// wrong: **NULLs sort last**, and **`NaN` sorts after every number**
+/// including `Infinity` — that is `float8`'s btree ordering, not IEEE's,
+/// under which every NaN comparison is `false` and `partial_cmp` returns
+/// `None`.
+///
+/// Text ordering is byte order here, as it is everywhere else in this crate
+/// (`update_extreme`, and `sort.rs`); PostgreSQL uses the database collation
+/// (`en_US.UTF-8` on the reference server). The two agree on ASCII of one
+/// case and can disagree on mixed case or non-ASCII — a pre-existing,
+/// engine-wide collation gap, not one this function introduces.
+fn distinct_sort_cmp(a: &Option<CellValue>, b: &Option<CellValue>) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(CellValue::Float64(x)), Some(CellValue::Float64(y))) => {
+            match (x.is_nan(), y.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => x
+                    .partial_cmp(y)
+                    .expect("neither operand is NaN, so float8 compares totally"),
+            }
+        }
+        (Some(x), Some(y)) => x.partial_cmp(y).expect(
+            "one aggregate reads one column, so every cell shares a CellValue variant, and \
+             the only partial variant (Float64) is handled above",
+        ),
+    }
+}
+
 fn cell_heap_bytes(v: &Option<CellValue>) -> usize {
     match v {
         Some(CellValue::Utf8(s)) => s.len(),
@@ -932,12 +983,26 @@ enum AccState {
     /// see [`AccState::push_array_agg`]). The outer `None` is what makes
     /// zero-rows-accepted finalize to SQL NULL rather than `{}` (item: array
     /// agg NULL-over-empty).
-    ArrayAgg(Option<Vec<Option<CellValue>>>),
+    ArrayAgg {
+        list: Option<Vec<Option<CellValue>>>,
+        /// `array_agg(DISTINCT x)` sorts; plain `array_agg(x)` does not. See
+        /// [`distinct_sort_cmp`] for the ordering and the live evidence.
+        sorted: bool,
+    },
     /// `string_agg(expr, delimiter)`. `None` until the first *non-null*
     /// value is accepted and stays `None` forever if none ever is (NULLs
     /// are skipped entirely, unlike `ArrayAgg` — see
     /// [`AccState::push_string_agg`]).
-    StringAgg(Option<String>),
+    StringAgg {
+        /// The joined text, built incrementally in arrival order. Used when
+        /// the aggregate is not `DISTINCT`.
+        built: Option<String>,
+        /// `string_agg(DISTINCT v, d)` only: one `(value, delimiter)` per
+        /// accepted row, because the join cannot happen until every row is
+        /// in and sorted. `None` for a non-`DISTINCT` `string_agg`, which
+        /// never needs to hold the values at all.
+        pending: Option<Vec<(String, String)>>,
+    },
     /// The variance family. NULLs are skipped before reaching [`VarAcc`], so
     /// `n` counts non-NULL rows only.
     Variance(VarKind, VarAcc),
@@ -965,7 +1030,13 @@ enum AccState {
 }
 
 impl AccState {
-    fn new(func: AggFunc, num_kind: NumKind) -> Self {
+    /// `distinct` is [`AggregateSpec::distinct`]. Only `array_agg` and
+    /// `string_agg` need it — they are the two aggregates here whose *output
+    /// order* is observable, and PostgreSQL sorts a `DISTINCT` aggregate's
+    /// input before feeding the transition function (see
+    /// [`distinct_sort_cmp`]). Every other aggregate's result is
+    /// order-independent, so they ignore it.
+    fn new(func: AggFunc, num_kind: NumKind, distinct: bool) -> Self {
         match func {
             AggFunc::CountStar => AccState::CountStar(0),
             AggFunc::Count => AccState::Count(0),
@@ -976,8 +1047,14 @@ impl AccState {
             AggFunc::Min => AccState::Min(None),
             AggFunc::Max => AccState::Max(None),
             AggFunc::Avg => AccState::Avg { sum: 0.0, count: 0 },
-            AggFunc::ArrayAgg => AccState::ArrayAgg(None),
-            AggFunc::StringAgg { .. } => AccState::StringAgg(None),
+            AggFunc::ArrayAgg => AccState::ArrayAgg {
+                list: None,
+                sorted: distinct,
+            },
+            AggFunc::StringAgg { .. } => AccState::StringAgg {
+                built: None,
+                pending: distinct.then(Vec::new),
+            },
             AggFunc::Variance(k) => AccState::Variance(k, VarAcc::default()),
             AggFunc::BoolAnd => AccState::Bool {
                 and_semantics: true,
@@ -1026,7 +1103,7 @@ impl AccState {
     /// PG 18: `select array_agg(x) from (values (1),(NULL),(3)) t(x)` →
     /// `{1,NULL,3}`, a 3-element array.
     fn push_array_agg(&mut self, val: Option<CellValue>) -> usize {
-        let AccState::ArrayAgg(list) = self else {
+        let AccState::ArrayAgg { list, .. } = self else {
             unreachable!("push_array_agg is only called for an ArrayAgg accumulator")
         };
         let bytes = std::mem::size_of::<Option<CellValue>>() + cell_heap_bytes(&val);
@@ -1052,12 +1129,19 @@ impl AccState {
     ///   delimiter column: appending `y` after `x` used `y`'s own row's
     ///   delimiter, not `x`'s.
     /// - The delimiter is never emitted before the first accepted value.
+    ///
+    /// Under `DISTINCT` the join is deferred to [`AccState::finalize`]
+    /// instead, because the rows have to be sorted first and this method sees
+    /// them one at a time. Both rules above still hold there — in particular
+    /// each row keeps its *own* delimiter across the sort, which is what
+    /// makes `string_agg(DISTINCT s, d)` over `('c','-'),('a','+'),('b','|')`
+    /// come back `a|b-c` on a live PG 18.2 and not `a+b|c`.
     fn push_string_agg(
         &mut self,
         val: &Option<CellValue>,
         delim: &Option<CellValue>,
     ) -> Result<usize, ExecError> {
-        let AccState::StringAgg(acc) = self else {
+        let AccState::StringAgg { built, pending } = self else {
             unreachable!("push_string_agg is only called for a StringAgg accumulator")
         };
         let Some(v) = val else {
@@ -1077,9 +1161,13 @@ impl AccState {
             }
             None => "", // NULL delimiter: no separator, not an error
         };
-        Ok(match acc {
+        if let Some(rows) = pending {
+            rows.push((s.clone(), delim_str.to_string()));
+            return Ok(s.len() + delim_str.len() + std::mem::size_of::<(String, String)>());
+        }
+        Ok(match built {
             None => {
-                *acc = Some(s.clone());
+                *built = Some(s.clone());
                 s.len()
             }
             Some(buf) => {
@@ -1175,10 +1263,10 @@ impl AccState {
                 });
             }
             AccState::CountStar(_) => unreachable!("count(*) never inspects a per-row value"),
-            AccState::ArrayAgg(_) => unreachable!(
+            AccState::ArrayAgg { .. } => unreachable!(
                 "array_agg is never routed through update_scalar — see push_array_agg's doc"
             ),
-            AccState::StringAgg(_) => unreachable!(
+            AccState::StringAgg { .. } => unreachable!(
                 "string_agg is never routed through update_scalar — see push_string_agg's doc"
             ),
             AccState::Regr(..) => unreachable!(
@@ -1262,7 +1350,7 @@ impl AccState {
             AccState::CountStar(_) => {
                 unreachable!("count(*) takes the row-count fast path in build_ungrouped, never a column kernel")
             }
-            AccState::ArrayAgg(_) | AccState::StringAgg(_) | AccState::Regr(..) => unreachable!(
+            AccState::ArrayAgg { .. } | AccState::StringAgg { .. } | AccState::Regr(..) => unreachable!(
                 "array_agg/string_agg/regr_* are always row-wise (push_array_agg/\
                  push_string_agg/push_regr), never dispatched to the arrow-kernel fast path"
             ),
@@ -1288,8 +1376,45 @@ impl AccState {
                     Some(CellValue::Float64(sum / *count as f64))
                 }
             }
-            AccState::ArrayAgg(list) => list.clone().map(CellValue::List),
-            AccState::StringAgg(s) => s.clone().map(CellValue::Utf8),
+            // `array_agg(DISTINCT x)` comes back SORTED, not in arrival
+            // order — see [`distinct_sort_cmp`]. Plain `array_agg(x)` keeps
+            // arrival order, so the sort is conditional and not a blanket
+            // tidy-up: sorting the non-DISTINCT case too would be a wrong
+            // answer in the opposite direction.
+            AccState::ArrayAgg { list, sorted } => list.clone().map(|mut v| {
+                if *sorted {
+                    v.sort_by(distinct_sort_cmp);
+                }
+                CellValue::List(v)
+            }),
+            // Non-DISTINCT: already joined in arrival order. DISTINCT: sort
+            // the held rows by VALUE (only — see below) and join, each row
+            // contributing its own delimiter ahead of its own value.
+            AccState::StringAgg { built, pending } => match pending {
+                None => built.clone().map(CellValue::Utf8),
+                Some(rows) if rows.is_empty() => None,
+                Some(rows) => {
+                    let mut rows = rows.clone();
+                    // `sort_by` is stable, and the key is the value alone
+                    // rather than the `(value, delimiter)` pair: measured on
+                    // PG 18.2, `string_agg(DISTINCT s, d)` over
+                    // `('a','-'),('a','+')` returns `a+a` — i.e. the two rows
+                    // stayed in ARRIVAL order, which a sort on the pair would
+                    // have reversed (`'+' < '-'`). Two rows sharing a value
+                    // but not a delimiter is a pathological shape whose order
+                    // PostgreSQL does not document; matching what it does
+                    // here costs nothing and surprises no one.
+                    rows.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut out = String::new();
+                    for (i, (value, delim)) in rows.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(delim);
+                        }
+                        out.push_str(value);
+                    }
+                    Some(CellValue::Utf8(out))
+                }
+            },
             AccState::Variance(kind, acc) => acc.finalize(*kind).map(CellValue::Float64),
             AccState::Bool { acc, .. } => acc.map(CellValue::Bool),
             AccState::Bits { acc, .. } => acc.map(CellValue::Int64),
@@ -1567,7 +1692,7 @@ impl HashAggregate {
         let mut accs: Vec<AccState> = self
             .aggregates
             .iter()
-            .map(|a| AccState::new(a.spec.func, a.num_kind))
+            .map(|a| AccState::new(a.spec.func, a.num_kind, a.spec.distinct))
             .collect();
         let mut distinct_seen: Vec<Option<HashSet<HashKey>>> = self
             .aggregates
@@ -1670,8 +1795,13 @@ impl HashAggregate {
                     }
                     // DISTINCT on a two-argument aggregate dedups the whole
                     // argument list — see `HashKey::Pair`'s doc for the live
-                    // evidence.
-                    let key = if is_regr {
+                    // evidence. `string_agg` is two-argument too (value and
+                    // delimiter), and behaves the same way: measured on PG
+                    // 18.2, `string_agg(DISTINCT s, d)` over
+                    // `('a','-'),('a','+')` returns `a+a`, so the two rows
+                    // are NOT duplicates of each other even though their
+                    // values are equal.
+                    let key = if is_regr || matches!(func, AggFunc::StringAgg { .. }) {
                         HashKey::Pair(Box::new((HashKey::from(&val), HashKey::from(&second))))
                     } else {
                         HashKey::from(&val)
@@ -1776,7 +1906,7 @@ impl HashAggregate {
                         accs.push(
                             self.aggregates
                                 .iter()
-                                .map(|a| AccState::new(a.spec.func, a.num_kind))
+                                .map(|a| AccState::new(a.spec.func, a.num_kind, a.spec.distinct))
                                 .collect(),
                         );
                         distinct_seen.push(
@@ -1832,7 +1962,7 @@ impl HashAggregate {
                         if val.is_none() && !is_array_agg {
                             continue; // DISTINCT ignores NULLs, like the aggregate itself
                         }
-                        let key = if is_regr {
+                        let key = if is_regr || matches!(func, AggFunc::StringAgg { .. }) {
                             HashKey::Pair(Box::new((HashKey::from(&val), HashKey::from(&second))))
                         } else {
                             HashKey::from(&val)
@@ -2870,6 +3000,110 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(s.value(0), "x,y");
+    }
+
+    // The two tests above dedup correctly but say nothing about ORDER,
+    // because their fixtures happen to arrive already sorted — which is
+    // exactly how `array_agg(DISTINCT …)` and `string_agg(DISTINCT …)` shipped
+    // returning arrival order while every test agreed with PostgreSQL. The
+    // two below feed data whose arrival order is NOT its sorted order, so
+    // they fail against an implementation that just appends.
+    //
+    // PostgreSQL sorts a DISTINCT aggregate's input; see `distinct_sort_cmp`
+    // for the measurements and for NULL/NaN placement.
+
+    /// Live PG 18.2:
+    /// `select array_agg(distinct x) from (values (3),(1),(3),(null),(2)) v(x)`
+    /// -> `{1,2,3,NULL}`.
+    #[test]
+    fn array_agg_distinct_returns_sorted_order_not_arrival_order() {
+        let schema = schema_1int("x");
+        let batch = int_batch(&schema, vec![Some(3), Some(1), Some(3), None, Some(2)]);
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
+        let mut agg =
+            HashAggregate::new(input, vec![], vec![array_agg_spec(0, true)], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(
+            list_i64_values(out.column(0), 0).unwrap(),
+            vec![Some(1), Some(2), Some(3), None],
+            "array_agg(DISTINCT x) sorts ascending with NULL last"
+        );
+    }
+
+    /// Live PG 18.2, both measured on the same server:
+    ///
+    /// ```text
+    /// select string_agg(distinct s, ',')
+    ///   from (values ('c'),('a'),('c'),(null),('b')) v(s);         -> a,b,c
+    /// select string_agg(distinct s, d)
+    ///   from (values ('c','-'),('a','+'),('b','|')) v(s,d);        -> a|b-c
+    /// ```
+    ///
+    /// The second is the one that pins *which* delimiter survives the sort:
+    /// each row keeps its own, so the delimiters follow the values into
+    /// sorted order rather than staying where they arrived.
+    #[test]
+    fn string_agg_distinct_sorts_by_value_and_each_row_keeps_its_delimiter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("d", DataType::Utf8, true),
+        ]));
+        let constant_delim = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("c"),
+                    Some("a"),
+                    Some("c"),
+                    None,
+                    Some("b"),
+                ])),
+                Arc::new(StringArray::from(vec![","; 5])),
+            ],
+        )
+        .unwrap();
+        let mut agg = HashAggregate::new(
+            VecOperator::boxed(schema.clone(), vec![constant_delim]),
+            vec![],
+            vec![string_agg_spec(0, 1, true)],
+            usize::MAX,
+        )
+        .unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "a,b,c"
+        );
+
+        let per_row_delim = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("c"), Some("a"), Some("b")])),
+                Arc::new(StringArray::from(vec!["-", "+", "|"])),
+            ],
+        )
+        .unwrap();
+        let mut agg = HashAggregate::new(
+            VecOperator::boxed(schema, vec![per_row_delim]),
+            vec![],
+            vec![string_agg_spec(0, 1, true)],
+            usize::MAX,
+        )
+        .unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "a|b-c",
+            "sorted a,b,c — and `b`'s own '|' and `c`'s own '-' came with them"
+        );
     }
 
     // string_agg() requires text input — enforced at construction, the same
