@@ -53,6 +53,25 @@
 //! the only difference here is that the subquery runs once per row instead
 //! of once per statement, so the cardinality check is per row too.
 //!
+//! # Quantified subqueries share this operator
+//!
+//! `x IN (SELECT …)`, `x NOT IN (…)`, `x op ANY (…)` and `x op ALL (…)` have
+//! the same per-row problem when the subquery is correlated, but the opposite
+//! cardinality contract: **any** number of rows is legal, and the answer is a
+//! three-valued boolean rather than a value. [`CorrelatedKind::Quantified`]
+//! covers them. The rows are handed, as arrays, to a
+//! [`QuantifiedDecider`] closure that `build.rs` supplies; it returns the
+//! `Expr` deciding that one outer row, which this operator evaluates against
+//! a one-row slice of the input.
+//!
+//! Routing it through an `Expr` rather than a comparison kernel here is the
+//! point, not an accident: it makes the correlated path reuse — bit for bit —
+//! the same `Expr` shape (`InList`, or a Kleene `AND`/`OR` fold) that
+//! `build.rs` builds for the *uncorrelated* case, so there is exactly ONE
+//! implementation of SQL's three-valued `IN`/`ANY`/`ALL` semantics in the
+//! engine and no way for the two paths to disagree about, say, whether
+//! `x NOT IN (…, NULL)` is `NULL` or `true`.
+//!
 //! # Memory
 //!
 //! One input batch at a time, plus the per-row values accumulated for that
@@ -65,6 +84,8 @@ use std::sync::Arc;
 use arrow_array::{new_null_array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
+use basin_plan::Expr;
+
 use crate::lateral::InnerFactory;
 use crate::operator::{ExecError, Operator};
 
@@ -74,16 +95,43 @@ use crate::operator::{ExecError, Operator};
 pub(crate) const CARDINALITY_MESSAGE: &str =
     "more than one row returned by a subquery used as an expression";
 
-/// One correlated scalar subquery: how to build it for a given row, and the
-/// Arrow type its single output column has (needed up front, because a row
-/// whose subquery returns nothing contributes a typed NULL and there is no
-/// batch to take the type from).
+/// Turns one correlated subquery's result column — for ONE outer row,
+/// possibly split across several batches, and empty when the subquery matched
+/// nothing — into the boolean expression that decides that row.
+///
+/// Returned rather than applied so that the *expression* is the interface:
+/// see the module docs' "Quantified subqueries share this operator" for why
+/// that is what keeps three-valued logic implemented exactly once.
+pub type QuantifiedDecider = Box<dyn Fn(&[ArrayRef]) -> Result<Expr, ExecError>>;
+
+/// What a correlated subquery's per-row rows are allowed to be, and what they
+/// mean.
+pub enum CorrelatedKind {
+    /// A scalar subquery: zero rows is `NULL`, one row is that value, and
+    /// more than one row is SQLSTATE 21000. The appended column carries the
+    /// subquery's own value.
+    Scalar,
+    /// A quantified subquery (`IN`/`NOT IN`/`ANY`/`ALL`): **any** row count
+    /// is legal, and the appended column carries a three-valued BOOLEAN, not
+    /// the subquery's own values.
+    Quantified(QuantifiedDecider),
+}
+
+/// One correlated subquery: how to build it for a given row, what it means
+/// per row ([`CorrelatedKind`]), and the Arrow type of the column it
+/// contributes — needed up front, because a row whose subquery returns
+/// nothing still contributes a typed value and there is no batch to take the
+/// type from.
 pub struct CorrelatedSubquery {
     pub factory: InnerFactory,
+    /// The type of the APPENDED column, which for
+    /// [`CorrelatedKind::Quantified`] is `Boolean` regardless of what the
+    /// subquery's own column is.
     pub data_type: DataType,
     /// Output column name. Cosmetic — the expression above reads it by
     /// position — but a named column keeps `EXPLAIN`-style dumps readable.
     pub name: String,
+    pub kind: CorrelatedKind,
 }
 
 /// Appends one column per correlated scalar subquery to its input, each
@@ -118,8 +166,10 @@ impl CorrelatedScalar {
         }
     }
 
-    /// Evaluate one subquery for one row of `batch`, returning a one-row
-    /// array holding its value (a typed NULL when it produced no rows).
+    /// Evaluate one subquery for one row of `batch`, returning the one-row
+    /// array it contributes: its value for a [`CorrelatedKind::Scalar`] (a
+    /// typed NULL when it produced no rows), or the three-valued boolean for
+    /// a [`CorrelatedKind::Quantified`].
     fn eval_one(
         sub: &mut CorrelatedSubquery,
         batch: &RecordBatch,
@@ -129,22 +179,62 @@ impl CorrelatedScalar {
         let schema = op.schema();
         if schema.fields().len() != 1 {
             return Err(ExecError::Internal(format!(
-                "scalar subquery must return exactly one column, got {} — a planner bug",
+                "a subquery used as an expression must return exactly one column, got {} — a \
+                 planner bug",
                 schema.fields().len()
             )));
         }
-        let mut value: Option<ArrayRef> = None;
-        while let Some(b) = op.next_batch()? {
-            for r in 0..b.num_rows() {
-                if value.is_some() {
-                    return Err(ExecError::CardinalityViolation(
-                        CARDINALITY_MESSAGE.to_string(),
-                    ));
+        match &sub.kind {
+            CorrelatedKind::Scalar => {
+                let mut value: Option<ArrayRef> = None;
+                while let Some(b) = op.next_batch()? {
+                    for r in 0..b.num_rows() {
+                        if value.is_some() {
+                            return Err(ExecError::CardinalityViolation(
+                                CARDINALITY_MESSAGE.to_string(),
+                            ));
+                        }
+                        value = Some(b.column(0).slice(r, 1));
+                    }
                 }
-                value = Some(b.column(0).slice(r, 1));
+                Ok(value.unwrap_or_else(|| new_null_array(&sub.data_type, 1)))
+            }
+            // No cardinality check: `x IN (SELECT …)` over a hundred rows is
+            // ordinary SQL, not the 21000 a scalar subquery would raise.
+            // Empty is legal too and is NOT the same as NULL — `x NOT IN
+            // (empty)` is TRUE even when `x` itself is NULL — which is why
+            // the empty case goes to the decider like any other rather than
+            // short-circuiting to a null here.
+            CorrelatedKind::Quantified(decide) => {
+                let mut chunks: Vec<ArrayRef> = Vec::new();
+                while let Some(b) = op.next_batch()? {
+                    if b.num_rows() > 0 {
+                        chunks.push(Arc::clone(b.column(0)));
+                    }
+                }
+                let expr = decide(&chunks)?;
+                // The decision expression is written against the OUTER row's
+                // schema (the operand is an expression at that level), so it
+                // is evaluated against this row alone. `batch` is the input
+                // batch, before any of this operator's own columns are
+                // appended, so the column positions it names are the ones it
+                // was built with.
+                let decided = crate::eval::eval(&expr, &batch.slice(row, 1))?;
+                if decided.data_type() != &DataType::Boolean {
+                    return Err(ExecError::Internal(format!(
+                        "a quantified subquery must decide to a boolean, got {:?}",
+                        decided.data_type()
+                    )));
+                }
+                if decided.len() != 1 {
+                    return Err(ExecError::Internal(format!(
+                        "a quantified subquery must decide exactly one row, got {}",
+                        decided.len()
+                    )));
+                }
+                Ok(decided)
             }
         }
-        Ok(value.unwrap_or_else(|| new_null_array(&sub.data_type, 1)))
     }
 }
 
@@ -272,6 +362,7 @@ mod tests {
                 factory,
                 data_type: DataType::Int64,
                 name: "sub".into(),
+                kind: CorrelatedKind::Scalar,
             }],
         );
 
@@ -325,6 +416,7 @@ mod tests {
                 factory,
                 data_type: DataType::Int64,
                 name: "sub".into(),
+                kind: CorrelatedKind::Scalar,
             }],
         );
 
@@ -365,6 +457,7 @@ mod tests {
                 factory,
                 data_type: DataType::Int64,
                 name: "sub".into(),
+                kind: CorrelatedKind::Scalar,
             }],
         );
 
@@ -399,6 +492,7 @@ mod tests {
                 factory,
                 data_type: DataType::Int64,
                 name: "sub".into(),
+                kind: CorrelatedKind::Scalar,
             }],
         );
         assert!(matches!(
@@ -426,6 +520,7 @@ mod tests {
                 factory,
                 data_type: DataType::Int64,
                 name: "sub".into(),
+                kind: CorrelatedKind::Scalar,
             }],
         );
         let batch = op.next_batch().unwrap().expect("one batch");
@@ -458,6 +553,7 @@ mod tests {
                 }),
                 data_type: DataType::Int64,
                 name: format!("sub{mult}"),
+                kind: CorrelatedKind::Scalar,
             }
         };
         let mut op = CorrelatedScalar::new(

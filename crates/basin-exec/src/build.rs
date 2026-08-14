@@ -36,7 +36,7 @@ use basin_plan::{
 };
 
 use crate::aggregate::{AggFunc, AggregateSpec, HashAggregate, RegrKind, VarKind};
-use crate::correlated::{CorrelatedScalar, CorrelatedSubquery};
+use crate::correlated::{CorrelatedKind, CorrelatedScalar, CorrelatedSubquery, QuantifiedDecider};
 use crate::cte::{CteBuffer, ProjectSet};
 use crate::dml::{ConflictAction, Delete, Insert, MemoryRowSink, RowSink, Update};
 use crate::join::HashJoin;
@@ -664,14 +664,7 @@ fn build_inner(
             // literal of the right TYPE (derived from the outer schema's
             // Arrow type, independent of the value) without needing one —
             // see `outer_literal`'s NULL handling.
-            let outer_schema = outer_op.schema();
-            let probe_cols: Vec<arrow_array::ArrayRef> = outer_schema
-                .fields()
-                .iter()
-                .map(|f| arrow_array::new_null_array(f.data_type(), 1))
-                .collect();
-            let probe_batch = RecordBatch::try_new(Arc::clone(&outer_schema), probe_cols)
-                .map_err(|e| BuildError::Exec(ExecError::Internal(e.to_string())))?;
+            let probe_batch = null_probe_row(&outer_op.schema())?;
             let inner_schema = build_inner(
                 &inner_plan,
                 snapshot.as_ref(),
@@ -1306,20 +1299,70 @@ fn build_error_to_exec(e: BuildError) -> ExecError {
 /// relationship a join's `on`/`filter` already uses.
 const OUTER_REF: u16 = 1;
 
-/// Where a correlated scalar subquery goes when the node being built can
-/// evaluate one per row: [`bind_outer_rec`] replaces the subquery expression
-/// with a reference to a column that does not exist yet, and pushes its
-/// `subplan` here for the caller to turn into a [`CorrelatedScalar`] under
-/// the node. `base_width` is that operator's input width, so the `k`th
-/// subquery collected lands at output position `base_width + k` — the same
-/// position the `Column` left behind names.
+/// `AND` and `OR` have no `pg_operator` row — in PostgreSQL they are grammar,
+/// not operators — so every file in this workspace that needs to *build* one
+/// uses the same sentinel `OpId`s: `u32::MAX` for `AND`, one below it for
+/// `OR`. See `basin_plan::opt::pushdown`'s `AND_OP`, `opt::simplify`'s
+/// `AND_OP`/`OR_OP`/`NOT_OP`, `opt::decorrelate`'s `AND_OP`, and — the one
+/// that actually *evaluates* what this file emits — [`crate::eval`]'s
+/// `AND_OP`/`OR_OP`. Redefined here rather than imported because each is that
+/// file's own private convention, but bit-for-bit identical on purpose.
+///
+/// The reason this file needs them at all is [`quantified_expr`]: `x op ANY
+/// (subquery)` is a Kleene `OR` over one comparison per subquery row, and `x
+/// op ALL (…)` the Kleene `AND`. `eval` implements both with arrow's
+/// `or_kleene`/`and_kleene`, which is exactly SQL's three-valued rule — so
+/// emitting these two sentinels is what makes `x > ANY (…, NULL)` come out
+/// `NULL` rather than `false`. `and_or_sentinels_still_evaluate_kleene` pins
+/// that, because if `eval`'s private copies ever moved, these would silently
+/// become "unknown operator oid" — or, far worse, some real operator.
+const AND_OP: basin_plan::OpId = basin_plan::OpId(basin_pgtype::Oid(u32::MAX));
+/// See [`AND_OP`].
+const OR_OP: basin_plan::OpId = basin_plan::OpId(basin_pgtype::Oid(u32::MAX - 1));
+
+/// How many rows a quantified subquery (`IN`/`NOT IN`/`ANY`/`ALL`) may
+/// produce before this builder declines it.
+///
+/// The strategy [`quantified_expr`] uses is to turn each of the subquery's
+/// rows into a `Literal` and fold them into one expression — an `InList` for
+/// `IN`/`NOT IN`, a Kleene `AND`/`OR` chain for `ANY`/`ALL`. That is exactly
+/// right for the row counts real queries put on the right of an `IN`, and
+/// exactly wrong for a million: the expression tree grows with the subquery,
+/// and evaluating it costs one kernel call per element per batch. A set-based
+/// operator is the answer at that scale; until one exists, declining is
+/// honest and falling back to the other engine returns the right answer,
+/// whereas silently building a million-node expression would not.
+const MAX_QUANTIFIED_SUBQUERY_ROWS: usize = 10_000;
+
+/// One correlated subquery collected by [`CorrSink`], and what the appended
+/// column it becomes has to hold.
+enum CorrSubplan {
+    /// A correlated scalar subquery: the appended column is its value.
+    Scalar(LogicalPlan),
+    /// A correlated `IN`/`NOT IN`/`ANY`/`ALL`: the appended column is the
+    /// three-valued boolean `decide` computes from the subquery's rows. The
+    /// operand is already captured inside `decide` — it belongs to the
+    /// ENCLOSING query level, not to `subplan`.
+    Quantified {
+        subplan: LogicalPlan,
+        decide: QuantifiedDecider,
+    },
+}
+
+/// Where a correlated subquery goes when the node being built can evaluate
+/// one per row: [`bind_outer_rec`] replaces the subquery expression with a
+/// reference to a column that does not exist yet, and pushes its `subplan`
+/// here for the caller to turn into a [`CorrelatedScalar`] under the node.
+/// `base_width` is that operator's input width, so the `k`th subquery
+/// collected lands at output position `base_width + k` — the same position
+/// the `Column` left behind names.
 ///
 /// A `RefCell` rather than a `&mut Vec` because [`bind_outer_rec`]'s
 /// traversal hands the same sink to several closures at once, which a
 /// mutable borrow cannot express.
 struct CorrSink {
     base_width: u16,
-    subplans: RefCell<Vec<LogicalPlan>>,
+    subplans: RefCell<Vec<CorrSubplan>>,
 }
 
 /// Bind `expr` to a specific outer row for a `LateralJoin`'s per-row
@@ -1553,6 +1596,27 @@ fn bind_outer_rec(
             subplan,
             operand,
         } => {
+            use basin_plan::SubqueryKind as K;
+            // `IN`/`NOT IN`/`ANY`/`ALL` — a value tested against a whole
+            // relation rather than folded to one. Handled before the scalar
+            // fork below because they are the only kinds that carry an
+            // `operand`, and because the operand has to be bound WITHOUT the
+            // correlated sink (see inside).
+            if let (K::In | K::NotIn | K::Any(_) | K::All(_), Some(raw_operand)) =
+                (kind, operand.as_deref())
+            {
+                return bind_quantified_subquery(
+                    *kind,
+                    subplan,
+                    raw_operand,
+                    outer,
+                    corr,
+                    tables,
+                    dml,
+                    budget,
+                    ctes,
+                );
+            }
             let operand = ob(operand)?;
             if *kind == basin_plan::SubqueryKind::Scalar && operand.is_none() {
                 // A correlated subquery ANYWHERE inside `subplan` is refused
@@ -1595,7 +1659,7 @@ fn bind_outer_rec(
                     };
                     let mut collected = sink.subplans.borrow_mut();
                     let index = sink.base_width + collected.len() as u16;
-                    collected.push(subplan.as_ref().clone());
+                    collected.push(CorrSubplan::Scalar(subplan.as_ref().clone()));
                     Expr::Column(basin_plan::ColumnRef {
                         relation: 0,
                         index,
@@ -1716,6 +1780,244 @@ fn materialize_scalar_subquery(
     Ok(result.unwrap_or(Expr::Literal(basin_plan::Datum::Null, ty)))
 }
 
+/// `x IN (SELECT …)`, `x NOT IN (…)`, `x op ANY (…)`, `x op ALL (…)`.
+///
+/// The same uncorrelated/correlated fork [`bind_outer_rec`]'s scalar arm
+/// takes, for the same reason: an uncorrelated subquery is one relation for
+/// the whole statement and is materialised once; a correlated one is a
+/// different relation per outer row and goes to the sink, or is refused.
+///
+/// # The operand is bound WITHOUT the sink, on purpose
+///
+/// `operand` belongs to the enclosing query level, not to `subplan`, so it is
+/// bound here — but through [`bind_outer`], not [`bind_outer_collecting`].
+/// Were it bound with the sink, a correlated *scalar* subquery inside it
+/// (`(SELECT max(n) FROM u WHERE u.tid = t.id) IN (SELECT …)`) would be
+/// rewritten into a reference to a column that [`CorrelatedScalar`] appends
+/// — a column that does not exist in the input batch the quantified
+/// decision is evaluated against (`correlated.rs`'s `eval_one` slices the
+/// operator's INPUT, before its own appends). It would read the wrong column
+/// or run off the end. Binding without the sink turns that shape into a clean
+/// `Unsupported` refusal instead.
+#[allow(clippy::too_many_arguments)]
+fn bind_quantified_subquery(
+    kind: basin_plan::SubqueryKind,
+    subplan: &LogicalPlan,
+    raw_operand: &Expr,
+    outer: Outer<'_>,
+    corr: Option<&CorrSink>,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
+) -> Result<Expr, BuildError> {
+    let operand = bind_outer(raw_operand, outer, tables, dml, budget, ctes)?;
+
+    // Same refusal, and the same reason, as the scalar arm's: `OUTER_REF`
+    // says "outside my own FROM" and no more, so a correlated subquery nested
+    // two levels down could be reaching for either level and this builder
+    // would be right only by luck.
+    if contains_correlated_subquery(subplan) {
+        return Err(BuildError::Unsupported(
+            "correlated subquery nested inside a quantified (IN/ANY/ALL) subquery".into(),
+        ));
+    }
+
+    if !references_outer_row(subplan) {
+        let values = materialize_subquery_column(subplan, tables, dml, budget, ctes)?;
+        return quantified_expr(&kind, &operand, values);
+    }
+
+    let sink = match corr {
+        Some(sink) if outer.is_none() => sink,
+        _ => {
+            return Err(BuildError::Unsupported(
+                "correlated IN/NOT IN/ANY/ALL subquery in this position".into(),
+            ))
+        }
+    };
+    let mut collected = sink.subplans.borrow_mut();
+    let index = sink.base_width + collected.len() as u16;
+    collected.push(CorrSubplan::Quantified {
+        subplan: subplan.clone(),
+        decide: quantified_decider(kind, operand),
+    });
+    Ok(Expr::Column(basin_plan::ColumnRef {
+        relation: 0,
+        index,
+        name: format!("?correlated{index}?"),
+    }))
+}
+
+/// Build and run `subplan` once, folding its single column's rows into
+/// `Literal`s — the quantified counterpart of
+/// [`materialize_scalar_subquery`]'s InitPlan, differing only in that ANY row
+/// count is legal here (there is no 21000 for `x IN (SELECT …)`) and that the
+/// result is a list rather than a value.
+fn materialize_subquery_column(
+    subplan: &LogicalPlan,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
+) -> Result<Vec<Expr>, BuildError> {
+    let mut op = build_inner(subplan, tables, dml, budget, ctes, None)?;
+    let schema = op.schema();
+    if schema.fields().len() != 1 {
+        return Err(BuildError::Exec(ExecError::Internal(format!(
+            "a subquery on the right of IN/ANY/ALL must return exactly one column, got {} — a \
+             planner bug",
+            schema.fields().len()
+        ))));
+    }
+    let mut values = Vec::new();
+    while let Some(batch) = op.next_batch().map_err(BuildError::Exec)? {
+        let col = batch.column(0).as_ref();
+        for row in 0..batch.num_rows() {
+            if values.len() >= MAX_QUANTIFIED_SUBQUERY_ROWS {
+                return Err(BuildError::Unsupported(format!(
+                    "an IN/ANY/ALL subquery returning more than {MAX_QUANTIFIED_SUBQUERY_ROWS} \
+                     rows"
+                )));
+            }
+            values.push(outer_literal(col, row)?);
+        }
+    }
+    Ok(values)
+}
+
+/// The correlated path's bridge back to [`quantified_expr`]: capture `kind`
+/// and the already-bound `operand`, and hand `correlated.rs` a closure that
+/// turns one outer row's subquery result into the deciding expression. See
+/// `correlated.rs`'s "Quantified subqueries share this operator" for why the
+/// two paths deliberately meet in the same function.
+fn quantified_decider(kind: basin_plan::SubqueryKind, operand: Expr) -> QuantifiedDecider {
+    Box::new(move |chunks: &[arrow_array::ArrayRef]| {
+        let mut values = Vec::new();
+        for chunk in chunks {
+            for row in 0..chunk.len() {
+                if values.len() >= MAX_QUANTIFIED_SUBQUERY_ROWS {
+                    return Err(ExecError::Internal(format!(
+                        "a correlated IN/ANY/ALL subquery returned more than \
+                         {MAX_QUANTIFIED_SUBQUERY_ROWS} rows for one outer row"
+                    )));
+                }
+                values.push(outer_literal(chunk.as_ref(), row).map_err(build_error_to_exec)?);
+            }
+        }
+        quantified_expr(&kind, &operand, values).map_err(build_error_to_exec)
+    })
+}
+
+/// **The three-valued logic, in one place.** `operand` against `values` —
+/// the subquery's rows, already folded to literals — under `kind`.
+///
+/// Every rule below was read off a live PostgreSQL 18.2, not recalled; the
+/// tests in this module carry the server's own output for each.
+///
+/// # A non-empty subquery
+///
+/// `IN`/`NOT IN` become [`Expr::InList`], which `eval` already implements
+/// with `or_kleene` over `eq` (and, for `NOT IN`, the De Morgan dual:
+/// `and_kleene` over `neq` — *not* a `not` wrapped around the positive form,
+/// which is the same thing under Kleene logic but is the shape `eval` chose).
+/// That gives, for free and without a second implementation:
+///
+/// - `3 IN (1, NULL)` → `or_kleene(false, NULL)` = **NULL**, not false.
+/// - `3 NOT IN (1, NULL)` → `and_kleene(true, NULL)` = **NULL**, not true.
+///   This is the footgun `opt::decorrelate` refuses `NotIn` over (its trap
+///   1): an anti-join would answer `true` here. Nothing about that changes;
+///   this path is not a join and does not have to prove the column
+///   non-nullable, it simply computes the right answer.
+/// - `1 NOT IN (1, NULL)` → `and_kleene(false, NULL)` = **false**. A match
+///   still wins over the NULL, which is why `NOT IN` is not "NULL whenever a
+///   NULL is present" either.
+/// - `NULL IN (1, 2)` → **NULL**, from `eq`'s own null propagation.
+///
+/// `ANY`/`ALL` become a Kleene `OR`/`AND` fold of one `operand op value`
+/// comparison per row, which is the same computation for the same reason —
+/// `x = ANY (…)` *is* `IN`, `x <> ALL (…)` *is* `NOT IN`, and every other
+/// operator follows the identical NULL rule (`3 > ANY (1, NULL)` is true,
+/// because a true beats the NULL; `1 > ANY (1, NULL)` is NULL, because it
+/// does not).
+///
+/// # An EMPTY subquery
+///
+/// The case that surprises people, and the one an `InList` cannot express at
+/// all (`eval_in_list` rejects an empty list as a planner bug, since SQL's
+/// grammar cannot produce one). PostgreSQL folds it to a constant:
+/// `IN`/`ANY` → **false**, `NOT IN`/`ALL` → **true**, *including when the
+/// operand is NULL* — `NULL NOT IN (SELECT … no rows)` is `true`, not
+/// `NULL`. That is not an inconsistency: with no rows there is nothing to
+/// compare against, so no unknown ever enters the fold, and an empty `OR` is
+/// false while an empty `AND` is true.
+fn quantified_expr(
+    kind: &basin_plan::SubqueryKind,
+    operand: &Expr,
+    values: Vec<Expr>,
+) -> Result<Expr, BuildError> {
+    use basin_plan::SubqueryKind as K;
+
+    if values.len() > MAX_QUANTIFIED_SUBQUERY_ROWS {
+        return Err(BuildError::Unsupported(format!(
+            "an IN/ANY/ALL subquery returning more than {MAX_QUANTIFIED_SUBQUERY_ROWS} rows"
+        )));
+    }
+
+    let empty_answer = match kind {
+        K::In | K::Any(_) => false,
+        K::NotIn | K::All(_) => true,
+        other => {
+            return Err(BuildError::Exec(ExecError::Internal(format!(
+                "{other:?} is not a quantified subquery — a builder bug"
+            ))))
+        }
+    };
+    if values.is_empty() {
+        return Ok(Expr::Literal(
+            basin_plan::Datum::Bool(empty_answer),
+            PgType::BOOL,
+        ));
+    }
+
+    Ok(match kind {
+        K::In | K::NotIn => Expr::InList {
+            arg: Box::new(operand.clone()),
+            list: values,
+            negated: matches!(kind, K::NotIn),
+        },
+        K::Any(op) | K::All(op) => {
+            let connective = if matches!(kind, K::Any(_)) {
+                OR_OP
+            } else {
+                AND_OP
+            };
+            let mut tests = values.into_iter().map(|v| Expr::Binary {
+                op: *op,
+                lhs: Box::new(operand.clone()),
+                rhs: Box::new(v),
+            });
+            // `values` is non-empty (checked above), so `next` is `Some`.
+            let first = tests
+                .next()
+                .expect("a non-empty value list yields a first comparison");
+            tests.fold(first, |acc, test| Expr::Binary {
+                op: connective,
+                lhs: Box::new(acc),
+                rhs: Box::new(test),
+            })
+        }
+        // Unreachable: `empty_answer` above already rejected every other
+        // kind, and it is computed before this match precisely so that the
+        // two cannot drift.
+        other => {
+            return Err(BuildError::Exec(ExecError::Internal(format!(
+                "{other:?} is not a quantified subquery — a builder bug"
+            ))))
+        }
+    })
+}
+
 /// The uncorrelated case's opposite number: wrap `child` in a
 /// [`CorrelatedScalar`] that evaluates each collected `subplan` once per
 /// row, appending one column each at positions `base_width..`.
@@ -1729,26 +2031,25 @@ fn materialize_scalar_subquery(
 /// path only).
 fn build_correlated_scalars(
     child: Box<dyn Operator>,
-    subplans: Vec<LogicalPlan>,
+    subplans: Vec<CorrSubplan>,
     base_width: u16,
     tables: &dyn TableResolver,
     budget: usize,
     ctes: &CteRegistry,
 ) -> Result<Box<dyn Operator>, BuildError> {
-    let child_schema = child.schema();
-    let probe_cols: Vec<arrow_array::ArrayRef> = child_schema
-        .fields()
-        .iter()
-        .map(|f| arrow_array::new_null_array(f.data_type(), 1))
-        .collect();
-    let probe = RecordBatch::try_new(Arc::clone(&child_schema), probe_cols)
-        .map_err(|e| BuildError::Exec(ExecError::Internal(e.to_string())))?;
+    let probe = null_probe_row(&child.schema())?;
 
     let mut subqueries = Vec::with_capacity(subplans.len());
-    for (k, subplan) in subplans.into_iter().enumerate() {
+    for (k, collected) in subplans.into_iter().enumerate() {
+        let (subplan, kind) = match collected {
+            CorrSubplan::Scalar(subplan) => (subplan, CorrelatedKind::Scalar),
+            CorrSubplan::Quantified { subplan, decide } => {
+                (subplan, CorrelatedKind::Quantified(decide))
+            }
+        };
         if subplan.is_mutating() {
             return Err(BuildError::Unsupported(
-                "data-modifying statement inside a scalar subquery".into(),
+                "data-modifying statement inside a subquery".into(),
             ));
         }
         let mut snapshot = SnapshotResolver::default();
@@ -1766,11 +2067,20 @@ fn build_correlated_scalars(
         .schema();
         if schema.fields().len() != 1 {
             return Err(BuildError::Exec(ExecError::Internal(format!(
-                "scalar subquery must return exactly one column, got {} — a planner bug",
+                "a subquery used as an expression must return exactly one column, got {} — a \
+                 planner bug",
                 schema.fields().len()
             ))));
         }
-        let data_type = schema.field(0).data_type().clone();
+        // A quantified subquery contributes the three-valued BOOLEAN its
+        // decider computes, not a value of the subquery's own column type —
+        // so the probe build above is run for its schema CHECK and for the
+        // errors it surfaces early, and its column type is then deliberately
+        // discarded.
+        let data_type = match &kind {
+            CorrelatedKind::Scalar => schema.field(0).data_type().clone(),
+            CorrelatedKind::Quantified(_) => arrow_schema::DataType::Boolean,
+        };
 
         let snapshot_for_factory = Rc::clone(&snapshot);
         let ctes_for_factory = Rc::clone(ctes);
@@ -1793,9 +2103,52 @@ fn build_correlated_scalars(
             // reads this position, so a schema dump and an expression dump
             // agree with each other.
             name: format!("?correlated{}?", base_width as usize + k),
+            kind,
         });
     }
     Ok(Box::new(CorrelatedScalar::new(child, subqueries)))
+}
+
+/// A one-row, all-NULL batch shaped like `schema` — the probe a correlated
+/// rebuild is handed to learn its subplan's output type before any real outer
+/// row exists. Used by the `LateralJoin` arm and by
+/// [`build_correlated_scalars`], which have the identical problem.
+///
+/// # Every field is forced NULLABLE, and that is the whole point
+///
+/// `RecordBatch::try_new` validates nullability, so building this batch
+/// against the child's own schema failed outright the moment that schema
+/// carried a `NOT NULL` column — and `CREATE TABLE t (id BIGINT NOT NULL,
+/// …)` is about as ordinary as SQL gets. The error was
+/// `Invalid argument error: Column 'id' is declared as non-nullable but
+/// contains null values`, raised while *building*, so EVERY correlated
+/// subquery over such a table declined. Measured against the probe corpus,
+/// not assumed: it is what both
+/// `SELECT id FROM t WHERE amt > ALL (SELECT n FROM u WHERE u.tid = t.id)`
+/// and `SELECT id, (SELECT count(*) FROM u WHERE u.tid = t.id) FROM t` were
+/// failing on, the second of which is the very query `correlated.rs` exists
+/// for.
+///
+/// Relaxing nullability here is sound because no VALUE in this batch is ever
+/// observed: [`bind_outer_rec`] turns each referenced column into a typed
+/// NULL `Literal` via [`outer_literal`] — which reads the array's DATA TYPE
+/// and its null bit, nothing else — and the operator built from it is thrown
+/// away as soon as its schema has been read. Only the types have to be real,
+/// and forcing nullability does not change a type.
+fn null_probe_row(schema: &SchemaRef) -> Result<RecordBatch, BuildError> {
+    let fields: Vec<arrow_schema::Field> = schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_nullable(true))
+        .collect();
+    let nullable: SchemaRef = Arc::new(arrow_schema::Schema::new(fields));
+    let cols: Vec<arrow_array::ArrayRef> = nullable
+        .fields()
+        .iter()
+        .map(|f| arrow_array::new_null_array(f.data_type(), 1))
+        .collect();
+    RecordBatch::try_new(nullable, cols)
+        .map_err(|e| BuildError::Exec(ExecError::Internal(e.to_string())))
 }
 
 /// Read one value out of an Arrow array as an [`Expr::Literal`]. Shared by
@@ -2577,7 +2930,7 @@ fn offset_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use basin_pgtype::PgType;
     use basin_plan::{ColId, ColumnRef, Datum, SnapshotId};
@@ -4700,5 +5053,754 @@ mod tests {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1);
         assert_eq!(sink.borrow().len(), 1, "id=2 removed, id=1 remains");
+    }
+
+    // ── QUANTIFIED SUBQUERIES: IN / NOT IN / ANY / ALL ───────────────────
+    //
+    // Before these, `bind_outer_rec` folded only `SubqueryKind::Scalar`;
+    // `In`, `NotIn`, `Any` and `All` were rebuilt as `Expr::Subquery` and
+    // reached `eval`, which answers every one of them with
+    //   internal: subqueries must be decorrelated into a join (or a scalar
+    //   materialized elsewhere) before scalar eval sees them
+    // and the engine bridge turns that into a fallback. `opt::decorrelate`
+    // is not the gap: it declines `NotIn` deliberately (its trap 1 — an
+    // anti-join answers `true` where SQL says NULL), declines an
+    // UNCORRELATED `IN` deliberately (its trap 2 — nothing to join on), and
+    // says outright that it does not handle `ANY`/`ALL` at all. Every one of
+    // those declines was correct; what was missing was somewhere for the
+    // declined shape to go.
+    //
+    // EVERY expected value below was read off a live PostgreSQL 18.2
+    // (`postgres://…/postgres`, `SELECT version()` → 18.2) against the exact
+    // tables these fixtures reproduce, and is quoted in each test. None of it
+    // is derived from reasoning about what three-valued logic ought to say.
+
+    /// The uncorrelated fixture, transcribed from the live server:
+    ///
+    /// ```sql
+    /// CREATE TABLE outer_t(x int); INSERT INTO outer_t VALUES (1),(3),(NULL);
+    /// CREATE TABLE s_full(v int);  INSERT INTO s_full  VALUES (1),(2);
+    /// CREATE TABLE s_null(v int);  INSERT INTO s_null  VALUES (1),(NULL);
+    /// CREATE TABLE s_empty(v int); -- no rows
+    /// ```
+    ///
+    /// `x` covers the three cases that matter for every form: a value the
+    /// subquery contains, a value it does not, and NULL.
+    fn quantified_resolver() -> MemTableResolver {
+        fn one_int_col(name: &str, values: Vec<Option<i32>>) -> (Arc<Schema>, RecordBatch) {
+            let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, true)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(values)) as arrow_array::ArrayRef],
+            )
+            .unwrap();
+            (schema, batch)
+        }
+        let mut r = MemTableResolver::new();
+        for (id, name, values) in [
+            (OUTER_T, "x", vec![Some(1), Some(3), None]),
+            (S_FULL, "v", vec![Some(1), Some(2)]),
+            (S_NULL, "v", vec![Some(1), None]),
+            (S_EMPTY, "v", vec![]),
+        ] {
+            let (schema, batch) = one_int_col(name, values);
+            r.insert(id, schema, vec![batch]);
+        }
+        r
+    }
+
+    const OUTER_T: TableId = TableId(1);
+    const S_FULL: TableId = TableId(2);
+    const S_NULL: TableId = TableId(3);
+    const S_EMPTY: TableId = TableId(4);
+
+    fn one_col_scan(table: TableId) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table,
+            projection: vec![ColId(0)],
+            filters: vec![],
+            snapshot: SnapshotId(0),
+        }
+    }
+
+    /// Read a boolean column back as `Option<bool>` — the only shape that can
+    /// tell SQL's three values apart. A `Vec<bool>` would collapse NULL onto
+    /// false, which is precisely the bug this whole section is about.
+    fn three_valued(batches: &[RecordBatch], column: usize) -> Vec<Option<bool>> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(column)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("a quantified subquery decides to a boolean")
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// `SELECT (x <kind> (SELECT v FROM <set>)) FROM outer_t`, as the three
+    /// values for `x` = 1, 3, NULL.
+    fn quantified_answers(kind: basin_plan::SubqueryKind, set: TableId) -> Vec<Option<bool>> {
+        let plan = LogicalPlan::Project {
+            input: Box::new(one_col_scan(OUTER_T)),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind,
+                    subplan: Box::new(one_col_scan(set)),
+                    operand: Some(Box::new(col(0, "x"))),
+                },
+                "r".into(),
+            )],
+        };
+        let batches = drain(build(&plan, &quantified_resolver()).unwrap());
+        three_valued(&batches, 0)
+    }
+
+    /// ```text
+    /// SELECT x, x IN (SELECT v FROM s_full), x IN (SELECT v FROM s_null),
+    ///           x IN (SELECT v FROM s_empty) FROM outer_t;
+    ///  x | in_full | in_null | in_empty
+    /// ---+---------+---------+----------
+    ///  1 | t       | t       | f
+    ///  3 | f       |         | f
+    ///    |         |         | f
+    /// ```
+    ///
+    /// The middle column is the one worth staring at: `3 IN (1, NULL)` is
+    /// **NULL**, not false — there is a value in the subquery that might have
+    /// matched and the engine cannot say it did not.
+    #[test]
+    fn in_a_subquery_matches_postgres_three_valued_answers() {
+        use basin_plan::SubqueryKind::In;
+        assert_eq!(
+            quantified_answers(In, S_FULL),
+            vec![Some(true), Some(false), None],
+            "x IN (1, 2)"
+        );
+        assert_eq!(
+            quantified_answers(In, S_NULL),
+            vec![Some(true), None, None],
+            "x IN (1, NULL) — no match plus a NULL is NULL, not false"
+        );
+        assert_eq!(
+            quantified_answers(In, S_EMPTY),
+            vec![Some(false), Some(false), Some(false)],
+            "x IN (empty) is false for every x, NULL included"
+        );
+    }
+
+    /// ```text
+    /// SELECT x, x NOT IN (SELECT v FROM s_full), x NOT IN (SELECT v FROM s_null),
+    ///           x NOT IN (SELECT v FROM s_empty) FROM outer_t;
+    ///  x | notin_full | notin_null | notin_empty
+    /// ---+------------+------------+-------------
+    ///  1 | f          | f          | t
+    ///  3 | t          |            | t
+    ///    |            |            | t
+    /// ```
+    ///
+    /// The classic footgun, and the reason `opt::decorrelate` refuses to turn
+    /// `NOT IN` into an anti-join at all: with a NULL in the subquery the
+    /// answer is **never true**. An anti-join would have returned row `x = 3`.
+    ///
+    /// Note `1 NOT IN (1, NULL)` is `false`, not NULL — an actual match still
+    /// wins over the unknown, so "any NULL makes the whole thing NULL" is
+    /// itself the wrong rule. Only rows with no match go NULL.
+    #[test]
+    fn not_in_a_subquery_is_never_true_when_the_subquery_has_a_null() {
+        use basin_plan::SubqueryKind::NotIn;
+        assert_eq!(
+            quantified_answers(NotIn, S_FULL),
+            vec![Some(false), Some(true), None],
+            "x NOT IN (1, 2)"
+        );
+        assert_eq!(
+            quantified_answers(NotIn, S_NULL),
+            vec![Some(false), None, None],
+            "x NOT IN (1, NULL) — never true; an anti-join would say true for x=3"
+        );
+        assert_eq!(
+            quantified_answers(NotIn, S_EMPTY),
+            vec![Some(true), Some(true), Some(true)],
+            "x NOT IN (empty) is TRUE for every x — NULL included"
+        );
+    }
+
+    /// `x = ANY (…)` is `IN` and `x <> ALL (…)` is `NOT IN`. Same server, same
+    /// rows, same answers — asserted against the *other* form's expectations
+    /// so the two implementations (an `InList`, versus a Kleene `OR`/`AND`
+    /// fold of `=`/`<>`) cannot drift apart.
+    ///
+    /// ```text
+    ///  x | eq_any_full | eq_any_null | eq_any_empty | ne_all_full | ne_all_null | ne_all_empty
+    /// ---+-------------+-------------+--------------+-------------+-------------+--------------
+    ///  1 | t           | t           | f            | f           | f           | t
+    ///  3 | f           |             | f            | t           |             | t
+    ///    |             |             | f            |             |             | t
+    /// ```
+    #[test]
+    fn eq_any_is_in_and_ne_all_is_not_in() {
+        use basin_plan::SubqueryKind::{All, Any, In, NotIn};
+        // int4 '=' is oid 96, int4 '<>' is 518 — read from pg_operator.
+        let eq = basin_plan::OpId(basin_pgtype::Oid(96));
+        let ne = basin_plan::OpId(basin_pgtype::Oid(518));
+        for set in [S_FULL, S_NULL, S_EMPTY] {
+            assert_eq!(
+                quantified_answers(Any(eq), set),
+                quantified_answers(In, set),
+                "x = ANY (…) must equal x IN (…) for {set:?}"
+            );
+            assert_eq!(
+                quantified_answers(All(ne), set),
+                quantified_answers(NotIn, set),
+                "x <> ALL (…) must equal x NOT IN (…) for {set:?}"
+            );
+        }
+        assert_eq!(
+            quantified_answers(Any(eq), S_NULL),
+            vec![Some(true), None, None]
+        );
+        assert_eq!(
+            quantified_answers(All(ne), S_EMPTY),
+            vec![Some(true), Some(true), Some(true)]
+        );
+    }
+
+    /// A comparison other than `=`/`<>` follows the identical NULL rule, and
+    /// `ANY`/`ALL` differ in exactly the way an `OR` fold differs from an
+    /// `AND` one.
+    ///
+    /// ```text
+    ///  x | gt_any_full | gt_any_null | gt_any_empty | gt_all_full | gt_all_null | gt_all_empty
+    /// ---+-------------+-------------+--------------+-------------+-------------+--------------
+    ///  1 | f           |             | f            | f           | f           | t
+    ///  3 | t           | t           | f            | t           |             | t
+    ///    |             |             | f            |             |             | t
+    /// ```
+    ///
+    /// `1 > ANY (1, NULL)` is NULL (false OR unknown) while `3 > ANY (1,
+    /// NULL)` is true (true OR unknown) — a true beats the unknown, a false
+    /// does not. `ALL` is the mirror image: `1 > ALL (1, NULL)` is false
+    /// (false AND unknown), `3 > ALL (1, NULL)` is NULL.
+    #[test]
+    fn gt_any_and_gt_all_follow_the_same_null_rule() {
+        use basin_plan::SubqueryKind::{All, Any};
+        // int4 '>' is oid 521 — read from pg_operator.
+        let gt = basin_plan::OpId(basin_pgtype::Oid(521));
+        assert_eq!(
+            quantified_answers(Any(gt), S_FULL),
+            vec![Some(false), Some(true), None]
+        );
+        assert_eq!(
+            quantified_answers(Any(gt), S_NULL),
+            vec![None, Some(true), None],
+            "1 > ANY (1, NULL) is NULL; 3 > ANY (1, NULL) is true"
+        );
+        assert_eq!(
+            quantified_answers(Any(gt), S_EMPTY),
+            vec![Some(false), Some(false), Some(false)],
+            "ANY over an empty subquery is false, NULL operand included"
+        );
+        assert_eq!(
+            quantified_answers(All(gt), S_FULL),
+            vec![Some(false), Some(true), None]
+        );
+        assert_eq!(
+            quantified_answers(All(gt), S_NULL),
+            vec![Some(false), None, None],
+            "1 > ALL (1, NULL) is false; 3 > ALL (1, NULL) is NULL"
+        );
+        assert_eq!(
+            quantified_answers(All(gt), S_EMPTY),
+            vec![Some(true), Some(true), Some(true)],
+            "ALL over an empty subquery is true, NULL operand included"
+        );
+    }
+
+    /// `SELECT x FROM outer_t WHERE x IN (SELECT v FROM s_null)` — the probe's
+    /// own shape, in a `WHERE` rather than a target list. Live server:
+    ///
+    /// ```text
+    ///  x
+    /// ---
+    ///  1
+    /// ```
+    ///
+    /// One row, not two: `WHERE` keeps only TRUE, and both the NULL rows are
+    /// NULL rather than false — indistinguishable here, which is exactly why
+    /// the target-list tests above exist as well.
+    #[test]
+    fn in_a_subquery_in_a_where_clause_keeps_only_the_true_rows() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(one_col_scan(OUTER_T)),
+            predicate: Expr::Subquery {
+                kind: basin_plan::SubqueryKind::In,
+                subplan: Box::new(one_col_scan(S_NULL)),
+                operand: Some(Box::new(col(0, "x"))),
+            },
+        };
+        let batches = drain(build(&plan, &quantified_resolver()).unwrap());
+        let xs: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(xs, vec![Some(1)]);
+    }
+
+    // ── CORRELATED quantified subqueries ─────────────────────────────────
+    //
+    // The uncorrelated cases above materialize the subquery once. These have
+    // a different subquery result per outer row, so they go through
+    // `CorrelatedScalar`'s per-row factory with a `CorrelatedKind::Quantified`
+    // decider — which calls back into the SAME `quantified_expr` the
+    // uncorrelated path uses, so there is one three-valued implementation and
+    // not two.
+
+    const CORR_T: TableId = TableId(1);
+    const CORR_U: TableId = TableId(2);
+
+    /// The correlated fixture, transcribed from the live server:
+    ///
+    /// ```sql
+    /// CREATE TABLE t(id int, amt int);
+    /// INSERT INTO t VALUES (1,5),(2,5),(3,5),(4,NULL);
+    /// CREATE TABLE u(tid int, n int);
+    /// INSERT INTO u VALUES (1,1),(1,2),(2,1),(2,NULL),(4,9);
+    /// ```
+    ///
+    /// Per outer row the subquery `SELECT n FROM u WHERE u.tid = t.id` is a
+    /// different relation: `{1,2}` for id=1, `{1,NULL}` for id=2, **empty**
+    /// for id=3, `{9}` for id=4 (whose `amt` is itself NULL). One row for
+    /// each of the four cases that matter.
+    fn correlated_quantified_resolver() -> MemTableResolver {
+        let t_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("amt", DataType::Int32, true),
+        ]));
+        let t = RecordBatch::try_new(
+            t_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int32Array::from(vec![Some(5), Some(5), Some(5), None])),
+            ],
+        )
+        .unwrap();
+        let u_schema = Arc::new(Schema::new(vec![
+            Field::new("tid", DataType::Int32, true),
+            Field::new("n", DataType::Int32, true),
+        ]));
+        let u = RecordBatch::try_new(
+            u_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2, 4])),
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(1),
+                    None,
+                    Some(9),
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut r = MemTableResolver::new();
+        r.insert(CORR_T, t_schema, vec![t]);
+        r.insert(CORR_U, u_schema, vec![u]);
+        r
+    }
+
+    /// `SELECT n FROM u WHERE u.tid = t.id` — correlated on the enclosing
+    /// row's column 0 via `opt::decorrelate`'s `OUTER_REF` convention.
+    fn correlated_n_subplan() -> LogicalPlan {
+        LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Scan {
+                    table: CORR_U,
+                    projection: vec![ColId(0), ColId(1)],
+                    filters: vec![],
+                    snapshot: SnapshotId(0),
+                }),
+                // u.tid = <outer>.id — OID 96 is int4 '='.
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "tid")),
+                    rhs: Box::new(Expr::Column(ColumnRef {
+                        relation: OUTER_REF,
+                        index: 0,
+                        name: "id".into(),
+                    })),
+                },
+            }),
+            exprs: vec![(col(1, "n"), "n".into())],
+        }
+    }
+
+    /// `SELECT amt <kind> (SELECT n FROM u WHERE u.tid = t.id) FROM t`, as the
+    /// four values for id = 1, 2, 3, 4.
+    fn correlated_quantified_answers(kind: basin_plan::SubqueryKind) -> Vec<Option<bool>> {
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Scan {
+                table: CORR_T,
+                projection: vec![ColId(0), ColId(1)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind,
+                    subplan: Box::new(correlated_n_subplan()),
+                    operand: Some(Box::new(col(1, "amt"))),
+                },
+                "r".into(),
+            )],
+        };
+        let batches = drain(build(&plan, &correlated_quantified_resolver()).unwrap());
+        three_valued(&batches, 0)
+    }
+
+    /// ```text
+    /// SELECT id, amt,
+    ///   amt > ALL (SELECT n FROM u WHERE u.tid = t.id),
+    ///   amt > ANY (SELECT n FROM u WHERE u.tid = t.id),
+    ///   amt IN     (SELECT n FROM u WHERE u.tid = t.id),
+    ///   amt NOT IN (SELECT n FROM u WHERE u.tid = t.id)
+    /// FROM t ORDER BY id;
+    ///  id | amt | gt_all | gt_any | in_corr | notin_corr
+    /// ----+-----+--------+--------+---------+------------
+    ///   1 |   5 | t      | t      | f       | t
+    ///   2 |   5 |        | t      |         |
+    ///   3 |   5 | t      | f      | f       | t
+    ///   4 |     |        |        |         |
+    /// ```
+    ///
+    /// Row `id = 3` is the empty-subquery case *per row*: `ALL` is true and
+    /// `ANY` is false for that row while every other row's subquery is
+    /// non-empty — which a once-per-statement evaluation could not produce at
+    /// all, and a "NULL when the subquery is empty" shortcut would get wrong
+    /// in both directions.
+    #[test]
+    fn a_correlated_quantified_subquery_is_decided_per_outer_row() {
+        use basin_plan::SubqueryKind::{All, Any, In, NotIn};
+        let gt = basin_plan::OpId(basin_pgtype::Oid(521));
+        assert_eq!(
+            correlated_quantified_answers(All(gt)),
+            vec![Some(true), None, Some(true), None],
+            "amt > ALL (…): {{1,2}} → t, {{1,NULL}} → NULL, empty → t, NULL > {{9}} → NULL"
+        );
+        assert_eq!(
+            correlated_quantified_answers(Any(gt)),
+            vec![Some(true), Some(true), Some(false), None],
+            "amt > ANY (…): the empty row is FALSE, not true and not NULL"
+        );
+        assert_eq!(
+            correlated_quantified_answers(In),
+            vec![Some(false), None, Some(false), None]
+        );
+        assert_eq!(
+            correlated_quantified_answers(NotIn),
+            vec![Some(true), None, Some(true), None],
+            "5 NOT IN {{1,NULL}} is NULL, and NULL NOT IN {{9}} is NULL"
+        );
+    }
+
+    /// The probe's own query, `SELECT id FROM t WHERE amt > ALL (SELECT n FROM
+    /// u WHERE u.tid = t.id)`. Live server:
+    ///
+    /// ```text
+    ///  id
+    /// ----
+    ///   1
+    ///   3
+    /// ```
+    ///
+    /// Two rows. `id = 2` and `id = 4` are NULL, not true, and `WHERE` drops
+    /// both; `id = 3`'s empty subquery is TRUE and must survive.
+    #[test]
+    fn gt_all_a_correlated_subquery_in_a_where_clause() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table: CORR_T,
+                projection: vec![ColId(0), ColId(1)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            predicate: Expr::Subquery {
+                kind: basin_plan::SubqueryKind::All(basin_plan::OpId(basin_pgtype::Oid(521))),
+                subplan: Box::new(correlated_n_subplan()),
+                operand: Some(Box::new(col(1, "amt"))),
+            },
+        };
+        let op = build(&plan, &correlated_quantified_resolver()).unwrap();
+        assert_eq!(
+            op.schema().fields().len(),
+            2,
+            "the boolean column the decider added is projected back off — a \
+             Filter must not change its input's schema"
+        );
+        let batches = drain(op);
+        let ids: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids, vec![Some(1), Some(3)]);
+    }
+
+    /// A correlated quantified subquery in a position with nowhere to hang a
+    /// per-row evaluation is REFUSED — the same posture the correlated
+    /// *scalar* case takes, and for the same reason: a clean fallback beats a
+    /// plausible wrong answer. `Sort` is such a position.
+    #[test]
+    fn a_correlated_quantified_subquery_with_nowhere_to_go_is_refused() {
+        let plan = LogicalPlan::Sort {
+            input: Box::new(LogicalPlan::Scan {
+                table: CORR_T,
+                projection: vec![ColId(0), ColId(1)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            keys: vec![PlanSortKey {
+                expr: Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::In,
+                    subplan: Box::new(correlated_n_subplan()),
+                    operand: Some(Box::new(col(1, "amt"))),
+                },
+                descending: false,
+                nulls_first: false,
+            }],
+        };
+        match build(&plan, &correlated_quantified_resolver()) {
+            Err(BuildError::Unsupported(m)) => assert!(
+                m.contains("correlated IN/NOT IN/ANY/ALL subquery"),
+                "got {m:?}"
+            ),
+            Err(other) => panic!("expected an Unsupported refusal, got {other:?}"),
+            Ok(_) => panic!("a correlated quantified subquery under Sort must not build"),
+        }
+    }
+
+    /// `eval` recognizes `AND`/`OR` only by the sentinel oids this file
+    /// redefines, and implements both with arrow's Kleene kernels. If either
+    /// half of that ever moved, `ANY`/`ALL` would stop being three-valued
+    /// while still compiling — so it is pinned directly rather than only
+    /// through the query-level tests above.
+    ///
+    /// The four rows are SQL's, checked on the live server:
+    /// `SELECT true OR NULL, false OR NULL, true AND NULL, false AND NULL`
+    /// → `t, NULL, NULL, f`.
+    #[test]
+    fn and_or_sentinels_still_evaluate_kleene() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef],
+        )
+        .unwrap();
+        let lit = |b: Option<bool>| match b {
+            Some(v) => Expr::Literal(Datum::Bool(v), PgType::BOOL),
+            None => Expr::Literal(Datum::Null, PgType::BOOL),
+        };
+        for (op, lhs, want) in [
+            (OR_OP, Some(true), Some(true)),
+            (OR_OP, Some(false), None),
+            (AND_OP, Some(true), None),
+            (AND_OP, Some(false), Some(false)),
+        ] {
+            let e = Expr::Binary {
+                op,
+                lhs: Box::new(lit(lhs)),
+                rhs: Box::new(lit(None)),
+            };
+            let got = crate::eval::eval(&e, &batch).expect("the sentinel still evaluates");
+            let got = got
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("a boolean")
+                .iter()
+                .next()
+                .unwrap();
+            assert_eq!(got, want, "{lhs:?} {op:?} NULL");
+        }
+    }
+
+    /// A `NOT NULL` column in the OUTER relation must not stop a correlated
+    /// subquery from building.
+    ///
+    /// The type-probe row every correlated rebuild starts from is a one-row,
+    /// all-NULL batch, and `RecordBatch::try_new` validates nullability — so
+    /// building it against the child's own schema raised
+    /// `Column 'id' is declared as non-nullable but contains null values`
+    /// and declined the query, for both correlated *scalar* and correlated
+    /// *quantified* subqueries. `CREATE TABLE t (id BIGINT NOT NULL, …)` is
+    /// the probe corpus's own `t`, so this was not an edge case: it is why
+    /// `SELECT id FROM t WHERE amt > ALL (SELECT n FROM u WHERE u.tid =
+    /// t.id)` and `SELECT id, (SELECT count(*) FROM u WHERE u.tid = t.id)
+    /// FROM t` both fell back. See [`null_probe_row`].
+    ///
+    /// Same data and same expected answers as
+    /// [`a_correlated_quantified_subquery_is_decided_per_outer_row`] — only
+    /// `t.id`'s nullability differs — so a failure here is unambiguously
+    /// about nullability and nothing else.
+    #[test]
+    fn a_correlated_subquery_builds_over_a_not_null_outer_column() {
+        let t_schema = Arc::new(Schema::new(vec![
+            // NOT NULL — the whole point of the test.
+            Field::new("id", DataType::Int32, false),
+            Field::new("amt", DataType::Int32, true),
+        ]));
+        let t = RecordBatch::try_new(
+            t_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int32Array::from(vec![Some(5), Some(5), Some(5), None])),
+            ],
+        )
+        .unwrap();
+        let mut resolver = correlated_quantified_resolver();
+        resolver.insert(CORR_T, t_schema, vec![t]);
+
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Scan {
+                table: CORR_T,
+                projection: vec![ColId(0), ColId(1)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::All(basin_plan::OpId(basin_pgtype::Oid(521))),
+                    subplan: Box::new(correlated_n_subplan()),
+                    operand: Some(Box::new(col(1, "amt"))),
+                },
+                "r".into(),
+            )],
+        };
+        let op = build(&plan, &resolver)
+            .expect("a NOT NULL outer column must not block the correlated type probe");
+        assert_eq!(
+            three_valued(&drain(op), 0),
+            vec![Some(true), None, Some(true), None]
+        );
+    }
+
+    /// The same nullability trap, on the correlated *scalar* path — the older
+    /// of the two, and the one `correlated.rs` was written for. `SELECT amt,
+    /// (SELECT max(n) FROM u WHERE u.tid = t.id) FROM t` over a `NOT NULL`
+    /// `t.id`. Live server, same fixture:
+    ///
+    /// ```text
+    ///  id | max
+    /// ----+-----
+    ///   1 |   2
+    ///   2 |   1
+    ///   3 |
+    ///   4 |   9
+    /// ```
+    #[test]
+    fn a_correlated_scalar_subquery_builds_over_a_not_null_outer_column() {
+        let t_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amt", DataType::Int32, true),
+        ]));
+        let t = RecordBatch::try_new(
+            t_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int32Array::from(vec![Some(5), Some(5), Some(5), None])),
+            ],
+        )
+        .unwrap();
+        let mut resolver = correlated_quantified_resolver();
+        resolver.insert(CORR_T, t_schema, vec![t]);
+
+        // max(int4) is pg_proc oid 2116 — see `agg_func_of`.
+        let max_n = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Scan {
+                    table: CORR_U,
+                    projection: vec![ColId(0), ColId(1)],
+                    filters: vec![],
+                    snapshot: SnapshotId(0),
+                }),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "tid")),
+                    rhs: Box::new(Expr::Column(ColumnRef {
+                        relation: OUTER_REF,
+                        index: 0,
+                        name: "id".into(),
+                    })),
+                },
+            }),
+            group: vec![],
+            aggs: vec![Expr::Aggregate {
+                func: basin_plan::FuncId(basin_pgtype::Oid(2116)),
+                args: vec![col(1, "n")],
+                distinct: false,
+                filter: None,
+                order_by: vec![],
+            }],
+            grouping_sets: None,
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Scan {
+                table: CORR_T,
+                projection: vec![ColId(0), ColId(1)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(max_n),
+                    operand: None,
+                },
+                "m".into(),
+            )],
+        };
+        let op = build(&plan, &resolver)
+            .expect("a NOT NULL outer column must not block the correlated type probe");
+        let got: Vec<Option<i32>> = drain(op)
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(got, vec![Some(2), Some(1), None, Some(9)]);
+    }
+
+    /// A subquery bigger than [`MAX_QUANTIFIED_SUBQUERY_ROWS`] is declined,
+    /// not folded into an expression tree of that size. A decline is a
+    /// fallback; the alternative is a build that succeeds and then evaluates
+    /// one kernel call per element per batch.
+    #[test]
+    fn an_oversized_quantified_subquery_is_declined_rather_than_unrolled() {
+        let values: Vec<Expr> = (0..MAX_QUANTIFIED_SUBQUERY_ROWS + 1)
+            .map(|i| Expr::Literal(Datum::Int32(i as i32), PgType::INT4))
+            .collect();
+        match quantified_expr(&basin_plan::SubqueryKind::In, &col(0, "x"), values) {
+            Err(BuildError::Unsupported(m)) => assert!(m.contains("more than"), "got {m:?}"),
+            other => panic!("expected a decline, got {other:?}"),
+        }
     }
 }
