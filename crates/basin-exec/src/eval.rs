@@ -228,10 +228,13 @@ use arrow_array::{
     },
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array,
-    Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, RecordBatch, StringArray,
+    Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, ListArray, RecordBatch,
+    StringArray,
     TimestampMicrosecondArray,
 };
-use arrow_schema::{ArrowError, DataType};
+use arrow::buffer::OffsetBuffer;
+use arrow_schema::{ArrowError, DataType, Field};
+use arrow_select::interleave;
 use chrono::{
     offset::MappedLocalTime, DateTime, Datelike, NaiveDate, NaiveDateTime, Offset, TimeDelta,
     TimeZone as _, Timelike,
@@ -650,6 +653,7 @@ pub fn eval_with(
             Ok(Arc::new(eval_bool_test(a, *test)))
         }
         Expr::ScalarFn { func, args } => eval_scalar_fn(*func, args, batch, session),
+        Expr::ArrayLit(elements) => eval_array_lit(elements, batch, session),
         Expr::DistinctFrom { lhs, rhs, negated } => eval_distinct_from(lhs, rhs, *negated, batch, session),
         Expr::InList { arg, list, negated } => eval_in_list(arg, list, *negated, batch, session),
         Expr::Between {
@@ -1185,8 +1189,18 @@ fn eval_case(
     {
         let cond_arr: BooleanArray = match &operand_arr {
             Some(o) => {
-                let v = eval_with(cond_expr, batch, session)?;
-                cmp::eq(o, &v).map_err(|e| map_arrow(e, "CASE"))?
+                // The same resolution an ordinary `=` gets, for the same
+                // reason: `CASE id WHEN 1 THEN …` over a `bigint` column is
+                // int8-vs-int4 to arrow's kernel, which demands identical
+                // types, and `CASE name WHEN 'a' THEN …` puts an `unknown`
+                // literal against `text`. Postgres widens and resolves both
+                // — `CASE x WHEN v` IS `CASE WHEN x = v` to it — so routing
+                // through [`eval_operand_against`] (rather than a bare
+                // `cmp::eq`) is what keeps the two spellings the same query
+                // here too. Without it the simple form fell back on data the
+                // searched form served.
+                let (o, v) = eval_operand_against(o.clone(), cond_expr, batch, session)?;
+                cmp::eq(&o, &v).map_err(|e| map_arrow(e, "CASE"))?
             }
             None => {
                 let c = eval_with(cond_expr, batch, session)?;
@@ -1278,6 +1292,72 @@ fn eval_branches_unified(exprs: &[&Expr], batch: &RecordBatch,
 /// `is_not_null` + `zip`, folded right to left: start from the last
 /// expression, then for each earlier one, take it where it is not null and
 /// fall back to the accumulator otherwise.
+/// `ARRAY[e1, e2, ...]` — one list value per row, whose k entries are the k
+/// element expressions evaluated at that row.
+///
+/// The element expressions are arrays *down* the batch (`e1` over every row),
+/// but a list value is a run *across* the elements at one row, so this is a
+/// transpose. It is done with a single [`interleave`] rather than a per-row
+/// builder loop precisely so it stays type-generic: an `ARRAY[...]` of any
+/// element type — text, timestamps, decimals — goes through the same code as
+/// integers, with no per-type match to fall out of date.
+///
+/// Element types are unified by the same [`eval_branches_unified`] that CASE
+/// and COALESCE use, and for the same reason: `ARRAY['x','y']` is a run of
+/// `unknown` literals that Postgres resolves to `text` (a live PostgreSQL
+/// 18.2 agrees: `pg_typeof(ARRAY['x','y'])` is `text[]`), and `ARRAY[1, 2]`
+/// against a wider sibling needs the widening. A list whose entries were
+/// materialized at *different* types could not be one Arrow child array at
+/// all, so this is a precondition, not a nicety.
+///
+/// `NULL` elements are ordinary null slots in the child array — an array
+/// *containing* NULL, which is not the same as a NULL array, and Arrow's
+/// separate child-validity and list-validity buffers keep them distinct.
+fn eval_array_lit(
+    elements: &[Expr],
+    batch: &RecordBatch,
+    session: &EvalSession,
+) -> Result<ArrayRef, ExecError> {
+    // `ARRAY[]` has no element to take a type from. `basin_plan::schema`
+    // already declines to type it, so this is unreachable from a planned
+    // query; refusing (rather than inventing `text[]` here, out of step with
+    // the type the plan never produced) keeps the two ends honest.
+    if elements.is_empty() {
+        return Err(ExecError::Internal(
+            "empty ARRAY[] has no element type — the planner declines to type it, so it \
+             should never reach eval"
+                .to_string(),
+        ));
+    }
+
+    let refs: Vec<&Expr> = elements.iter().collect();
+    let columns = eval_branches_unified(&refs, batch, session)?;
+    let elem_type = columns[0].data_type().clone();
+
+    let k = columns.len();
+    let rows = batch.num_rows();
+    // Row-major: row 0's k entries, then row 1's, ... Each pair is
+    // (which element expression, which row) — the transpose itself.
+    let indices: Vec<(usize, usize)> = (0..rows)
+        .flat_map(|row| (0..k).map(move |elem| (elem, row)))
+        .collect();
+    let borrowed: Vec<&dyn Array> = columns.iter().map(|c| c.as_ref()).collect();
+    let values =
+        interleave::interleave(&borrowed, &indices).map_err(|e| map_arrow(e, "ARRAY[...]"))?;
+
+    // Every list is exactly k long, so the offsets are a fixed stride. The
+    // field is `("item", nullable)` because that is what
+    // `basin_pgtype::physical` produces for an array type — a different name
+    // or nullability here would be a different Arrow type to the schema the
+    // plan declared, and the batch would be rejected downstream.
+    let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(k, rows));
+    let field = Arc::new(Field::new("item", elem_type, true));
+    Ok(Arc::new(
+        ListArray::try_new(field, offsets, values, None)
+            .map_err(|e| map_arrow(e, "ARRAY[...]"))?,
+    ))
+}
+
 fn eval_coalesce(exprs: &[Expr], batch: &RecordBatch,
     session: &EvalSession) -> Result<ArrayRef, ExecError> {
     if exprs.is_empty() {
@@ -4408,6 +4488,179 @@ mod tests {
         };
         let result = eval(&expr, &batch).unwrap();
         assert_eq!(i32_array(&result).value(0), 200);
+    }
+
+    /// `CASE id WHEN 1 THEN … END` over a `bigint` column: the WHEN values
+    /// lower as `int4` literals, the operand is `int8`, and arrow's `eq`
+    /// kernel rejects a mismatched pair outright. Postgres widens instead —
+    /// values below read off a live PostgreSQL 18.2:
+    ///
+    /// ```text
+    /// CREATE TEMP TABLE tt(id BIGINT, name TEXT);
+    /// INSERT INTO tt VALUES (1,'a'),(2,'b'),(3,'c'),(100,NULL),(101,'a');
+    /// SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END FROM tt;
+    ///  -- one, two, many, many, many
+    /// ```
+    ///
+    /// Before the widening this errored with
+    /// `Invalid comparison operation: Int64 == Int32`, which the owned
+    /// engine turned into a fallback for the whole statement.
+    #[test]
+    fn case_simple_form_widens_an_int4_when_against_an_int8_operand() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1i64),
+                Some(2),
+                Some(3),
+                Some(100),
+                Some(101),
+            ]))],
+        )
+        .unwrap();
+        let expr = Expr::Case {
+            operand: Some(Box::new(col(0, "id"))),
+            whens: vec![
+                (lit_i32(1), lit_text("one")),
+                (lit_i32(2), lit_text("two")),
+            ],
+            else_: Some(Box::new(lit_text("many"))),
+        };
+        let result = eval(&expr, &batch).unwrap();
+        let got = str_array(&result);
+        assert_eq!(
+            (0..5).map(|i| got.value(i)).collect::<Vec<_>>(),
+            vec!["one", "two", "many", "many", "many"]
+        );
+    }
+
+    /// A companion guard, not a second reproduction: a bare `'a'` WHEN value
+    /// is `unknown` until the operand types it, and this case already passed
+    /// before the widening above (a `Datum::Utf8` materializes as `Utf8`
+    /// whatever its `PgType` says). It is pinned here anyway because routing
+    /// the operand through [`eval_operand_against`] moved this path, and a
+    /// resolution that silently stopped resolving would otherwise only show
+    /// up as a fallback in the probe. Values from the same live PostgreSQL
+    /// 18.2 table as above:
+    ///
+    /// ```text
+    /// SELECT CASE name WHEN 'a' THEN 'A!' WHEN 'b' THEN 'B!' END FROM tt;
+    ///  -- A!, B!, NULL, NULL, A!
+    /// ```
+    ///
+    /// The NULL-named row lands on the no-ELSE NULL, not on a match: a NULL
+    /// operand compares NULL to every WHEN, which never matches.
+    #[test]
+    fn case_simple_form_resolves_an_unknown_when_against_a_text_operand() {
+        let batch = batch_str1(
+            "name",
+            vec![Some("a"), Some("b"), Some("c"), None, Some("a")],
+        );
+        let expr = Expr::Case {
+            operand: Some(Box::new(col(0, "name"))),
+            whens: vec![
+                (lit_text_unknown("a"), lit_text("A!")),
+                (lit_text_unknown("b"), lit_text("B!")),
+            ],
+            else_: None,
+        };
+        let result = eval(&expr, &batch).unwrap();
+        let got = str_array(&result);
+        let seen: Vec<Option<&str>> = (0..5)
+            .map(|i| (!got.is_null(i)).then(|| got.value(i)))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![Some("A!"), Some("B!"), None, None, Some("A!")]
+        );
+    }
+
+    /// Pull one row's list out of a `ListArray` as an owned `ArrayRef`, so
+    /// the array-literal tests below can assert on entries rather than on
+    /// offset arithmetic.
+    fn list_row(v: &ArrayRef, row: usize) -> ArrayRef {
+        v.as_any()
+            .downcast_ref::<ListArray>()
+            .expect("expected a ListArray")
+            .value(row)
+    }
+
+    /// `SELECT ARRAY[1,2,3]` — the shape the fallback probe reported as
+    /// `ArrayLit(...) is not implemented in eval yet`. From a live
+    /// PostgreSQL 18.2: `SELECT ARRAY[1,2,3]` is `{1,2,3}` and
+    /// `pg_typeof(ARRAY[1,2,3])` is `integer[]`.
+    #[test]
+    fn array_literal_of_ints_builds_one_list_per_row() {
+        let expr = Expr::ArrayLit(vec![lit_i32(1), lit_i32(2), lit_i32(3)]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(
+            result.data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            "must match what basin_pgtype::physical produces for int4[]"
+        );
+        let row = list_row(&result, 0);
+        let got = i32_array(&row);
+        assert_eq!((0..3).map(|i| got.value(i)).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    /// `SELECT ARRAY['x','y']` — every element is an `unknown` literal, which
+    /// Postgres resolves to `text` (live PostgreSQL 18.2:
+    /// `pg_typeof(ARRAY['x','y'])` is `text[]`, value `{x,y}`). Without the
+    /// shared unification this could not pick an element type at all.
+    #[test]
+    fn array_literal_of_unknown_literals_resolves_to_text() {
+        let expr = Expr::ArrayLit(vec![lit_text_unknown("x"), lit_text_unknown("y")]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(
+            result.data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        );
+        let row = list_row(&result, 0);
+        let got = str_array(&row);
+        assert_eq!((0..2).map(|i| got.value(i)).collect::<Vec<_>>(), vec!["x", "y"]);
+    }
+
+    /// An array *containing* NULL is not a NULL array. Live PostgreSQL 18.2:
+    /// `SELECT ARRAY[1,NULL,3]` is `{1,NULL,3}`,
+    /// `array_length(ARRAY[1,NULL,3], 1)` is 3, and `(ARRAY[1,NULL,3])[2] IS
+    /// NULL` is true — the NULL occupies a slot, it does not shorten the
+    /// array or nullify it.
+    #[test]
+    fn array_literal_keeps_a_null_element_as_a_slot() {
+        let expr = Expr::ArrayLit(vec![
+            lit_i32(1),
+            Expr::Literal(Datum::Null, PgType::INT4),
+            lit_i32(3),
+        ]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert!(!result.is_null(0), "the array itself is not NULL");
+        let row = list_row(&result, 0);
+        assert_eq!(row.len(), 3, "array_length is 3, NULL included");
+        let got = i32_array(&row);
+        assert_eq!(got.value(0), 1);
+        assert!(got.is_null(1), "(ARRAY[1,NULL,3])[2] IS NULL");
+        assert_eq!(got.value(2), 3);
+    }
+
+    /// The transpose, which is the whole of the implementation: element
+    /// expressions run *down* the batch, a list value runs *across* the
+    /// elements at one row. With a column as an element, every row must get
+    /// its own list — a bug here would repeat row 0's value everywhere, or
+    /// return the column itself.
+    #[test]
+    fn array_literal_transposes_per_row_rather_than_per_element() {
+        let batch = batch_i32("x", vec![Some(10), Some(20), Some(30)]);
+        let expr = Expr::ArrayLit(vec![col(0, "x"), lit_i32(7)]);
+        let result = eval(&expr, &batch).unwrap();
+        assert_eq!(result.len(), 3, "one list per row");
+        for (row, expected_first) in [(0, 10), (1, 20), (2, 30)] {
+            let got_row = list_row(&result, row);
+            let got = i32_array(&got_row);
+            assert_eq!(got.len(), 2);
+            assert_eq!(got.value(0), expected_first);
+            assert_eq!(got.value(1), 7);
+        }
     }
 
     #[test]

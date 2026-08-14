@@ -619,6 +619,12 @@ fn lower_aexpr_op(ae: &AExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
         }
         Some(lhs_node) => {
             let lhs = lower_expr(lhs_node, ctx)?;
+            // `(a, b) = (c, d)` — a comparison of two row values, which has
+            // no composite-typed execution path and does not need one. See
+            // [`lower_row_comparison`].
+            if let (Expr::RowLit(l), Expr::RowLit(r)) = (&lhs, &rhs) {
+                return lower_row_comparison(ctx, &name, l, r);
+            }
             let op = resolve_op(ctx, &name, Some(&lhs), &rhs)?;
             Ok(Expr::Binary {
                 op,
@@ -1444,6 +1450,98 @@ fn lower_row_expr(re: &pg_query::protobuf::RowExpr, ctx: &LowerCtx) -> Result<Ex
         .map(|n| lower_expr(n, ctx))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Expr::RowLit(args))
+}
+
+/// `(a, b) = (c, d)` and `(a, b) <> (c, d)` — a row comparison, expanded
+/// field-wise here rather than carried into execution as a comparison of two
+/// composite values.
+///
+/// Doing it at lowering is not an optimization, it is what makes the shape
+/// *representable*: `record` has no Arrow physical type this engine builds,
+/// so a `Binary { =, RowLit, RowLit }` reaching `eval` can only fail (and
+/// did — `RowLit(...) is not implemented in eval yet`). The expansion needs
+/// no composite support anywhere, because after it there are no composites:
+/// only ordinary per-field comparisons over ordinary scalar types, each
+/// resolved through the same [`resolve_op`] seam any hand-written
+/// `a = c AND b = d` would use.
+///
+/// **The expansion is exact for `=`/`<>` specifically**, including the NULL
+/// cases, because Kleene `AND`/`OR` already produce Postgres's answers.
+/// Confirmed against a live PostgreSQL 18.2:
+///
+/// ```text
+/// SELECT (1,'a')       = (1,'a');  -- t
+/// SELECT (1,'a')       = (2,'a');  -- f
+/// SELECT (1,NULL::text)= (1,'a');  -- NULL  (TRUE  AND NULL = NULL)
+/// SELECT (1,NULL::text)= (2,'a');  -- f     (FALSE AND NULL = FALSE)
+/// SELECT (1,NULL::text)<>(2,'a');  -- t     (TRUE  OR  NULL = TRUE)
+/// SELECT (1,NULL::text)<>(1,'a');  -- NULL  (FALSE OR  NULL = NULL)
+/// ```
+///
+/// Note the two NULL rows: a row `=` is *not* strict, so a NULL field does
+/// not force a NULL result — `(1,NULL) = (2,'a')` is FALSE because the first
+/// field already decided it. That is precisely Kleene `AND`, which is what
+/// `eval` applies to `AND` (see its module docs), so the expansion inherits
+/// the right answer instead of restating it.
+///
+/// **The ordering operators are deliberately NOT expanded.** `<`/`<=`/`>`/
+/// `>=` on rows are lexicographic, not a fold of per-field comparisons —
+/// `(1,2) < (1,3)` needs the second field only *because* the first tied, and
+/// a naive conjunction/disjunction gets it wrong. Refusing here costs a
+/// clean fallback; guessing would cost a silently wrong answer.
+fn lower_row_comparison(
+    ctx: &LowerCtx,
+    name: &str,
+    lhs: &[Expr],
+    rhs: &[Expr],
+) -> Result<Expr, LowerError> {
+    let combiner = match name {
+        "=" => "AND",
+        "<>" => "OR",
+        _ => {
+            return Err(LowerError::Unsupported(format!(
+                "row comparison with `{name}` is lexicographic, not field-wise, \
+                 and is not yet lowered"
+            )))
+        }
+    };
+    // Postgres rejects this outright ("unequal number of entries in row
+    // expressions"); there is no sensible expansion, so decline.
+    if lhs.len() != rhs.len() {
+        return Err(LowerError::Malformed(
+            "row comparison between rows of different widths",
+        ));
+    }
+    if lhs.is_empty() {
+        return Err(LowerError::Malformed("row comparison with no fields"));
+    }
+
+    let fields = lhs
+        .iter()
+        .zip(rhs.iter())
+        .map(|(l, r)| {
+            let op = resolve_op(ctx, name, Some(l), r)?;
+            Ok(Expr::Binary {
+                op,
+                lhs: Box::new(l.clone()),
+                rhs: Box::new(r.clone()),
+            })
+        })
+        .collect::<Result<Vec<_>, LowerError>>()?;
+
+    // Same left fold `lower_bool_expr` uses: `Expr::Binary` is two-ary, so an
+    // N-field row becomes a chain rather than one N-ary node.
+    let mut iter = fields.into_iter();
+    let mut acc = iter.next().expect("checked non-empty above");
+    for next in iter {
+        let op = resolve_op(ctx, combiner, Some(&acc), &next)?;
+        acc = Expr::Binary {
+            op,
+            lhs: Box::new(acc),
+            rhs: Box::new(next),
+        };
+    }
+    Ok(acc)
 }
 
 /// `a[i]`, `a[i:j]`, and chains of either. `(composite).field` access shares
@@ -2471,6 +2569,77 @@ mod tests {
             panic!("expected RowLit");
         };
         assert_eq!(fields.len(), 2);
+    }
+
+    /// `(a, b) = (1, 'x')` must not survive lowering as a comparison of two
+    /// `RowLit`s — `record` has no physical type here, so that shape can only
+    /// fail in `eval`. It expands field-wise into `a = 1 AND b = 'x'`.
+    #[test]
+    fn row_equality_expands_field_wise_into_a_conjunction() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("(a, b) = (1, 'x')"), &ctx(&c, &o)).unwrap();
+
+        let Expr::Binary { op, lhs, rhs } = &e else {
+            panic!("expected a Binary at the top, got {e:?}");
+        };
+        // The mock resolves AND/OR to this sentinel; a real catalog gives a
+        // real oid. What matters is that it is the *combiner*, not `=`.
+        assert_eq!(*op, OpId(Oid(u32::MAX)), "top node should be AND");
+
+        for (side, expected_field) in [(lhs, col_a()), (rhs, col_b())] {
+            let Expr::Binary { lhs: fl, .. } = side.as_ref() else {
+                panic!("expected a per-field Binary, got {side:?}");
+            };
+            assert_eq!(**fl, expected_field);
+        }
+        // And nothing composite is left anywhere in the tree.
+        assert!(
+            !format!("{e:?}").contains("RowLit"),
+            "no RowLit should survive the expansion: {e:?}"
+        );
+    }
+
+    /// `<>` folds with OR rather than AND — `(1,NULL) <> (2,'a')` is TRUE on
+    /// a live PostgreSQL 18.2 because the first field already differs, which
+    /// is Kleene OR, not AND. See [`lower_row_comparison`].
+    #[test]
+    fn row_inequality_expands_with_or_not_and() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("(a, b) <> (1, 'x')"), &ctx(&c, &o)).unwrap();
+        let Expr::Binary { op, .. } = &e else {
+            panic!("expected a Binary at the top, got {e:?}");
+        };
+        assert_eq!(*op, OpId(Oid(u32::MAX)), "top node should be OR");
+        assert!(!format!("{e:?}").contains("RowLit"));
+    }
+
+    /// The ordering operators on rows are lexicographic, which a field-wise
+    /// fold cannot express. Declining is the correct answer — a clean
+    /// fallback beats a silently wrong one. See [`lower_row_comparison`].
+    #[test]
+    fn row_ordering_comparison_is_refused_rather_than_folded() {
+        let c = cols();
+        let o = CatalogOperators;
+        let err = lower_expr(&parse_expr("(a, b) < (1, 'x')"), &ctx(&c, &o)).unwrap_err();
+        assert!(
+            matches!(err, LowerError::Unsupported(ref m) if m.contains("lexicographic")),
+            "expected a lexicographic refusal, got {err:?}"
+        );
+    }
+
+    /// Postgres rejects `(a) = (1, 'x')` with "unequal number of entries in
+    /// row expressions"; there is no expansion to guess at.
+    #[test]
+    fn row_comparison_between_different_widths_is_refused() {
+        let c = cols();
+        let o = CatalogOperators;
+        let err = lower_expr(&parse_expr("(a, b) = ROW(1)"), &ctx(&c, &o)).unwrap_err();
+        assert!(
+            matches!(err, LowerError::Malformed(m) if m.contains("different widths")),
+            "expected a width mismatch refusal, got {err:?}"
+        );
     }
 
     #[test]

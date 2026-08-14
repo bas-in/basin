@@ -348,15 +348,40 @@ pub fn expr_type(expr: &Expr, input: &Schema) -> Result<PgType, SchemaError> {
         },
 
         Expr::ArrayLit(xs) => {
-            let Some(first) = xs.first() else {
+            if xs.is_empty() {
                 // An empty `ARRAY[]` has no element to infer a type from. In
                 // real Postgres this is resolved from context (`::int[]`, an
                 // assignment target, ...); with none available the constant
                 // folder still has to pick *something* (`text[]`). This
                 // function does not have that context, so it does not guess.
                 return Err(SchemaError::Unimplemented("empty array literal type"));
-            };
-            let elem_ty = expr_type(first, input)?;
+            }
+            // The first element's type is authoritative, the same assumption
+            // CASE and COALESCE make above — with one addition it cannot skip:
+            // a bare string element is `unknown` (oid 705), which is not a
+            // real element type and has no `unknown[]` to point at, so
+            // `ARRAY['x','y']` had no type at all and could not be planned.
+            // Postgres resolves an all-`unknown` array literal to `text[]`
+            // (confirmed against a live PostgreSQL 18.2:
+            // `SELECT pg_typeof(ARRAY['x','y'])` is `text[]`), and resolves a
+            // mixed one from whichever elements *are* typed — so scan past the
+            // untyped ones for a concrete type first, and only fall back to
+            // `text` when every element is untyped.
+            //
+            // Known limitation, shared with CASE/COALESCE directly above and
+            // called out rather than papered over: this takes the first
+            // concrete element type, it does not *widen* across elements the
+            // way `basin_exec::eval` does. For a literal whose elements
+            // disagree in width (`ARRAY[1, 2000000000000]`, `int4` then
+            // `int8`) the two disagree, and the resulting schema mismatch
+            // costs a fallback. That is a fallback, not a wrong answer.
+            let elem_ty = xs
+                .iter()
+                .map(|x| expr_type(x, input))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .find(|t| !t.is_unknown())
+                .unwrap_or(PgType::TEXT);
             match oid::array_of(elem_ty.oid) {
                 Some(array_oid) => Ok(PgType::new(array_oid)),
                 None => Err(SchemaError::Unimplemented(
@@ -1159,6 +1184,33 @@ mod tests {
             expr_type(&Expr::ArrayLit(vec![]), &s),
             Err(SchemaError::Unimplemented("empty array literal type"))
         );
+    }
+
+    /// `ARRAY['x','y']` — every element is an `unknown` literal, so there is
+    /// no `unknown[]` to name and the literal had no type at all. Postgres
+    /// resolves it to `text[]` (live PostgreSQL 18.2:
+    /// `SELECT pg_typeof(ARRAY['x','y'])` is `text[]`).
+    #[test]
+    fn expr_type_array_literal_of_only_unknown_elements_is_text_array() {
+        let s = Schema::new();
+        let e = Expr::ArrayLit(vec![
+            Expr::Literal(Datum::Utf8("x".into()), PgType::UNKNOWN),
+            Expr::Literal(Datum::Utf8("y".into()), PgType::UNKNOWN),
+        ]);
+        assert_eq!(expr_type(&e, &s).unwrap(), PgType::new(oid::TEXT_ARRAY));
+    }
+
+    /// A leading `NULL`/bare-string element must not veto the concrete type
+    /// the rest of the literal does carry — the scan looks past untyped
+    /// elements rather than stopping at the first one.
+    #[test]
+    fn expr_type_array_literal_skips_untyped_elements_for_a_concrete_one() {
+        let s = Schema::new();
+        let e = Expr::ArrayLit(vec![
+            Expr::Literal(Datum::Null, PgType::UNKNOWN),
+            lit_int(2),
+        ]);
+        assert_eq!(expr_type(&e, &s).unwrap(), PgType::new(oid::INT8_ARRAY));
     }
 
     #[test]
