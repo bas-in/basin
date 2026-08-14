@@ -1138,6 +1138,25 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // doesn't incorrectly fire during a burst of aborted commands.
     crate::session::touch_last_active(&sess.state);
 
+    // #151: snap this statement's `statement_timestamp()`. This is the hook
+    // `datetime_more_udf` was written against and nothing called, which is why
+    // every timestamp reader fell back to a fresh `Utc::now()` per invocation
+    // — a `now()` that changes between two rows of one statement, which is
+    // `clock_timestamp()` wearing the wrong name. Unconditional and at the very
+    // top, before any parse, dispatch or fast path can return early: every
+    // route out of this function must have a pinned statement clock, and the
+    // literal-INSERT preparse below is one such early return.
+    //
+    // PostgreSQL snaps this per protocol *message*, not per statement — two
+    // statements in one simple-query message share it (measured: two
+    // `SELECT statement_timestamp()` in one `-c` string return the identical
+    // value, while the same two as separate messages differ). Basin's router
+    // splits multi-statement bodies before reaching here, so Basin snaps per
+    // statement; the two agree for every single-statement message, which is
+    // every extended-protocol message and the overwhelming majority of simple
+    // ones.
+    crate::datetime_more_udf::tick_statement_ts(&sess.state.datetime);
+
     // Phase 5.28.C: check whether the idle-in-txn reaper has flagged this
     // session as expired. If so, reject with SQLSTATE 25P03 immediately.
     if sess.reaped_flag.is_reaped() {
@@ -1275,6 +1294,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         .map(|g| g.clone())
                         .unwrap_or_default();
                     crate::session::tx_begin(&sess.state, current_snapshots);
+                    // #151: pin `now()` / `transaction_timestamp()` for the
+                    // whole transaction. PostgreSQL snaps it at the `BEGIN`
+                    // itself, not at the first statement inside — measured:
+                    // inside one `BEGIN`, `now()` reads EARLIER than the first
+                    // statement's `statement_timestamp()`, and is byte-identical
+                    // across every statement in the block.
+                    crate::datetime_more_udf::tick_txn_ts(&sess.state.datetime);
                     return Ok(ExecResult::Empty {
                         tag: "BEGIN".into(),
                     });
@@ -1576,6 +1602,10 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                             .collect();
                         dispatch_post_commit(&sess.engine, events);
                     }
+                    // #151: the transaction is over, so its `now()` anchor is
+                    // too. The next statement runs in autocommit and falls back
+                    // to its own statement timestamp until the next `BEGIN`.
+                    crate::datetime_more_udf::clear_txn_ts(&sess.state.datetime);
                     return Ok(ExecResult::Empty {
                         tag: "COMMIT".into(),
                     });
@@ -1735,6 +1765,12 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                             // state and survive — only the queued sends
                             // are dropped.
                             crate::session::listen_discard_pending_notifies(&sess.state);
+                            // #151: transaction over — drop its `now()` anchor.
+                            // Only the *bare* ROLLBACK does this; `ROLLBACK TO
+                            // SAVEPOINT` (the arm above) leaves the transaction
+                            // open, and PostgreSQL keeps `now()` pinned across
+                            // it because the transaction never ended.
+                            crate::datetime_more_udf::clear_txn_ts(&sess.state.datetime);
                             return Ok(ExecResult::Empty {
                                 tag: "ROLLBACK".into(),
                             });
@@ -2023,6 +2059,20 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 // advisory / LISTEN — that is `DISCARD ALL`).
                 if matches!(kind, crate::pg_ast::StmtKind::VariableSet) && upper == "RESET ALL" {
                     sess.state.reset_gucs();
+                    return Ok(ExecResult::Empty {
+                        tag: "RESET".into(),
+                    });
+                }
+                // `RESET TimeZone` / `RESET TIME ZONE` — the single-GUC reset.
+                // Handled here beside `RESET ALL` because both parse as
+                // VariableSet (VAR_RESET) and the noop-accept interceptor
+                // downstream would otherwise swallow them with a bare `RESET`
+                // tag, leaving the zone set and `SHOW TimeZone` disagreeing
+                // with what the client just asked for.
+                if matches!(kind, crate::pg_ast::StmtKind::VariableSet)
+                    && (upper == "RESET TIMEZONE" || upper == "RESET TIME ZONE")
+                {
+                    crate::session::reset_session_time_zone(&sess.state);
                     return Ok(ExecResult::Empty {
                         tag: "RESET".into(),
                     });
@@ -3060,6 +3110,13 @@ async fn dispatch_parsed_statement(
 
             if var_name == "search_path" {
                 crate::schema_ddl::exec_set_search_path(sess, &values)
+            } else if var_name == "timezone" || var_name == "time_zone" {
+                // `SET TimeZone = 'x'` / `SET TIMEZONE TO 'x'` /
+                // `SET TIME ZONE = 'x'` all land here — sqlparser normalises
+                // every assignment spelling to the variable name `TIMEZONE`.
+                // The bare `SET TIME ZONE 'x'` (no `=`/`TO`) is a different
+                // AST node; see the `Set::SetTimeZone` arm below.
+                exec_set_time_zone_value(sess, values.first())
             } else if var_name == "statement_timeout" {
                 // Wire `SET statement_timeout = …` to the per-session override.
                 // Accept both string literals ('5s', '500ms') and bare integers (5000).
@@ -3132,6 +3189,18 @@ async fn dispatch_parsed_statement(
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
             }
+        }
+        // ── SET TIME ZONE <value> (no `=` / `TO`) ────────────────────────────
+        // The PostgreSQL-specific shorthand, which sqlparser gives its own AST
+        // node. `SET TIME ZONE LOCAL` and `SET TIME ZONE DEFAULT` both reset;
+        // measured on 18.2, both restore the value `SHOW TimeZone` reported
+        // before any `SET`.
+        Statement::Set(sqlparser::ast::Set::SetTimeZone { local, value }) => {
+            if local {
+                crate::session::reset_session_time_zone(&sess.state);
+                return Ok(ExecResult::Empty { tag: "SET".into() });
+            }
+            exec_set_time_zone_value(sess, Some(&value))
         }
         Statement::Insert(ins) => {
             // Phase 5.29.B: if the target table is a hypertable, register
@@ -3796,6 +3865,12 @@ async fn dispatch_parsed_statement(
                 .to_ascii_lowercase();
             if var_name == "search_path" {
                 crate::schema_ddl::exec_show_search_path(sess)
+            } else if var_name == "timezone" || var_name == "time_zone" {
+                // `SHOW TimeZone` and `SHOW TIME ZONE` — the latter arrives as
+                // two idents, which this handler joins with `_`. PostgreSQL
+                // titles the column `TimeZone` in both cases.
+                let val = crate::session::session_time_zone(&sess.state);
+                Ok(make_show_result("TimeZone", &val))
             } else if var_name == "statement_timeout" {
                 let val = crate::session::show_statement_timeout(&sess.state);
                 let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
@@ -12433,6 +12508,145 @@ pub(crate) fn make_show_result(col_name: &str, val: &str) -> ExecResult {
 /// Extract the string form of the first value in a SET expression.
 /// Handles both literal string values and numeric literals.
 /// Falls back to `"0"` for unrecognised forms.
+/// Apply one `SET TimeZone`-family value, whatever spelling it arrived in.
+///
+/// Every accepted form, and what PostgreSQL 18.2 answers to a following
+/// `SHOW TimeZone` (all measured on the live server, not inferred):
+///
+/// | statement                                        | `SHOW TimeZone` |
+/// |--------------------------------------------------|-----------------|
+/// | `SET TimeZone = 'UTC'` / `= 'utc'` / `= UTC`      | `UTC`           |
+/// | `SET TIME ZONE 'America/New_York'`                | `America/New_York` |
+/// | `SET TimeZone TO DEFAULT` / `SET TIME ZONE LOCAL` | the pre-`SET` value |
+/// | `SET TIME ZONE INTERVAL '+05:00' HOUR TO MINUTE` | `<+05>-05`      |
+/// | `SET TIME ZONE -8`                               | `<-08>+08`      |
+/// | `SET TIME ZONE 5.5`                              | `<+05:30>-05:30` |
+/// | `SET TimeZone = 'Not/AZone'`                     | `ERROR: invalid value for parameter "TimeZone": "Not/AZone"` |
+///
+/// Note the case rule the `'utc'` row encodes: PostgreSQL echoes the
+/// *canonical* zone name, not the spelling the client typed — `'utc'` comes
+/// back as `UTC`. Basin gets that for free by echoing the name its zone
+/// resolver canonicalised, and only for the zones the resolver knows.
+fn exec_set_time_zone_value(
+    sess: &ProjectSession,
+    value: Option<&sqlparser::ast::Expr>,
+) -> Result<ExecResult> {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+
+    let Some(expr) = value else {
+        // `SET TimeZone` with no value is not valid SQL; treat as a reset
+        // rather than erroring, matching this dispatcher's tolerance elsewhere.
+        crate::session::reset_session_time_zone(&sess.state);
+        return Ok(ExecResult::Empty { tag: "SET".into() });
+    };
+
+    // `INTERVAL '+05:00' HOUR TO MINUTE` — a fixed offset, which PostgreSQL
+    // renders in POSIX form. The offset text is the interval's own value
+    // expression; the HOUR TO MINUTE qualifier adds nothing Basin needs.
+    if let Expr::Interval(iv) = expr {
+        let raw = match iv.value.as_ref() {
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                ..
+            }) => s.clone(),
+            other => other.to_string(),
+        };
+        let minutes = parse_offset_minutes(&raw).ok_or_else(|| {
+            basin_common::BasinError::InvalidSchema(format!(
+                "invalid value for parameter \"TimeZone\": \"{raw}\""
+            ))
+        })?;
+        crate::session::set_session_time_zone(
+            &sess.state,
+            &crate::session::render_interval_time_zone(minutes),
+        )?;
+        return Ok(ExecResult::Empty { tag: "SET".into() });
+    }
+
+    // A bare number is a count of hours, fractional part included
+    // (`SET TIME ZONE 5.5` → `<+05:30>-05:30`).
+    if let Expr::Value(ValueWithSpan {
+        value: Value::Number(n, _),
+        ..
+    }) = expr
+    {
+        let hours: f64 = n.parse().map_err(|_| {
+            basin_common::BasinError::InvalidSchema(format!(
+                "invalid value for parameter \"TimeZone\": \"{n}\""
+            ))
+        })?;
+        let minutes = (hours * 60.0).round() as i32;
+        crate::session::set_session_time_zone(
+            &sess.state,
+            &crate::session::render_interval_time_zone(minutes),
+        )?;
+        return Ok(ExecResult::Empty { tag: "SET".into() });
+    }
+
+    // Unary minus wrapping a number: `SET TIME ZONE -8`.
+    if let Expr::UnaryOp {
+        op: sqlparser::ast::UnaryOperator::Minus,
+        expr: inner,
+    } = expr
+    {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) = inner.as_ref()
+        {
+            let hours: f64 = n.parse().map_err(|_| {
+                basin_common::BasinError::InvalidSchema(format!(
+                    "invalid value for parameter \"TimeZone\": \"-{n}\""
+                ))
+            })?;
+            let minutes = -((hours * 60.0).round() as i32);
+            crate::session::set_session_time_zone(
+                &sess.state,
+                &crate::session::render_interval_time_zone(minutes),
+            )?;
+            return Ok(ExecResult::Empty { tag: "SET".into() });
+        }
+    }
+
+    let raw = match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) => s.clone(),
+        Expr::Identifier(id) => id.value.clone(),
+        other => other.to_string(),
+    };
+
+    // `DEFAULT` and `LOCAL` are resets, not zone names.
+    if raw.eq_ignore_ascii_case("default") || raw.eq_ignore_ascii_case("local") {
+        crate::session::reset_session_time_zone(&sess.state);
+        return Ok(ExecResult::Empty { tag: "SET".into() });
+    }
+
+    crate::session::set_session_time_zone(&sess.state, &raw)?;
+    Ok(ExecResult::Empty { tag: "SET".into() })
+}
+
+/// Parse an interval-valued time-zone offset (`+05:00`, `-05:30`, `2:30`, `7`)
+/// into signed total minutes. `None` if it is not one of those shapes.
+fn parse_offset_minutes(raw: &str) -> Option<i32> {
+    let s = raw.trim();
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1, r),
+        None => (1, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let mut parts = rest.split(':');
+    let hours: i32 = parts.next()?.trim().parse().ok()?;
+    let minutes: i32 = match parts.next() {
+        Some(m) => m.trim().parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
+}
+
 fn extract_set_string_value(values: &[sqlparser::ast::Expr]) -> String {
     use sqlparser::ast::{Expr, Value, ValueWithSpan};
     if let Some(expr) = values.first() {

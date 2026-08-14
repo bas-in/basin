@@ -78,7 +78,7 @@ use arrow_schema::{Schema, SchemaRef};
 use basin_plan::Expr;
 
 use crate::eval;
-use crate::operator::{ExecError, Operator};
+use crate::operator::{default_session, ExecError, Operator, SessionRef};
 
 /// Where a [`Scan`] pulls its input batches from.
 ///
@@ -141,10 +141,11 @@ fn record_batch_bytes(batch: &RecordBatch) -> usize {
 fn combined_predicate(
     filters: &[Expr],
     batch: &RecordBatch,
+    session: &SessionRef,
 ) -> Result<Option<BooleanArray>, ExecError> {
     let mut acc: Option<BooleanArray> = None;
     for expr in filters {
-        let arr = eval::eval(expr, batch)?;
+        let arr = eval::eval_with(expr, batch, session)?;
         let this = arr
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -190,6 +191,7 @@ pub struct Scan {
     /// Bytes of the most recently produced batch; `0` once the source is
     /// exhausted. See the module docs' Memory section.
     bytes_held: usize,
+    session: SessionRef,
 }
 
 impl Scan {
@@ -221,7 +223,17 @@ impl Scan {
             filters,
             schema,
             bytes_held: 0,
+            session: default_session(),
         })
+    }
+
+    /// Evaluate this scan's pushed-down filters in `session`. See
+    /// [`SessionRef`]. A pushed filter is an ordinary predicate — `WHERE
+    /// date_trunc('day', ts) = DATE '2024-01-01'` reaches the scan whole — so
+    /// it needs the zone for exactly the reason `Filter` does.
+    pub fn in_session(mut self, session: SessionRef) -> Self {
+        self.session = session;
+        self
     }
 }
 
@@ -236,7 +248,7 @@ impl Operator for Scan {
             return Ok(None);
         };
 
-        let filtered = match combined_predicate(&self.filters, &batch)? {
+        let filtered = match combined_predicate(&self.filters, &batch, &self.session)? {
             Some(predicate) => filter_record_batch(&batch, &predicate)
                 .map_err(|e| ExecError::Internal(e.to_string()))?,
             None => batch,

@@ -882,6 +882,38 @@ pub(crate) struct SessionState {
     ///   the staleness bound.
     pub(crate) read_tier: std::sync::atomic::AtomicU8,
 
+    // ── TimeZone GUC ─────────────────────────────────────────────────────────
+    /// The session's `TimeZone`, as `SHOW TimeZone` renders it.
+    ///
+    /// Set by `SET TimeZone = …` / `SET TIME ZONE …`, cleared back to
+    /// [`DEFAULT_TIME_ZONE`] by `RESET TimeZone` / `RESET ALL` / `DISCARD ALL`.
+    /// Read once per statement into the `basin_exec::eval::EvalSession` that
+    /// every operator evaluates against, which is what makes
+    /// `date_trunc`/`date_part` on `timestamptz` answer in the session's zone
+    /// rather than always in UTC.
+    ///
+    /// Stored as PostgreSQL's *rendering* of the zone, not as an
+    /// always-IANA name, because the two differ for the fixed-offset forms:
+    /// `SET TIME ZONE INTERVAL '+05:00' HOUR TO MINUTE` makes PostgreSQL's
+    /// `SHOW TimeZone` answer `<+05>-05` (measured, PostgreSQL 18.2), and
+    /// echoing back something else would make `SHOW` lie about what was set.
+    /// [`resolvable_time_zone`] maps that rendering onto the name the
+    /// evaluator's IANA/offset parser accepts.
+    ///
+    /// `RwLock<String>` rather than an atomic because the value is a string;
+    /// it is read once per statement, never on a per-row path.
+    pub(crate) time_zone: RwLock<String>,
+
+    /// Per-session `statement_timestamp()` / `transaction_timestamp()` anchors.
+    ///
+    /// Owned here — one instance per session — so the executor's statement and
+    /// transaction hooks and the readers (the timestamp UDFs, and the
+    /// per-statement `EvalSession`) all see the same clock. Before this field
+    /// existed, `register_datetime_more_udfs` created a state nothing else
+    /// could reach and every reader fell back to a fresh `Utc::now()`, which
+    /// made `now()` advance between two rows of one statement.
+    pub(crate) datetime: Arc<crate::datetime_more_udf::DateTimeSessionState>,
+
     /// Timestamp of the last statement activity on this session. Updated by
     /// the executor at the start of every `execute()` call; the idle-in-txn
     /// reaper compares this against the current time.
@@ -1049,6 +1081,8 @@ impl SessionState {
                 basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
             ),
             read_tier: std::sync::atomic::AtomicU8::new(ReadTier::DEFAULT as u8),
+            time_zone: RwLock::new(DEFAULT_TIME_ZONE.to_string()),
+            datetime: Arc::new(crate::datetime_more_udf::DateTimeSessionState::default()),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
             table_meta_cache: TableMetaCache::new(),
@@ -1090,6 +1124,8 @@ impl SessionState {
                 basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
             ),
             read_tier: std::sync::atomic::AtomicU8::new(ReadTier::DEFAULT as u8),
+            time_zone: RwLock::new(DEFAULT_TIME_ZONE.to_string()),
+            datetime: Arc::new(crate::datetime_more_udf::DateTimeSessionState::default()),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
             table_meta_cache: TableMetaCache::new(),
@@ -1169,6 +1205,167 @@ impl SessionState {
         // a fresh SessionState, so a future pooled checkout cannot leak a
         // 'lagging' tier set by a prior logical client.
         self.read_tier.store(ReadTier::DEFAULT as u8, Relaxed);
+
+        // TimeZone → the process default. Reset-by-construction like the rest:
+        // a pooled checkout that inherited `Australia/Lord_Howe` from the
+        // previous logical client would answer every `date_trunc('day', …)`
+        // an hour and a half off, silently.
+        *self.time_zone.write().expect("time_zone lock poisoned") = DEFAULT_TIME_ZONE.to_string();
+    }
+}
+
+// ── TimeZone GUC (accessors) ────────────────────────────────────────────────
+
+/// The `TimeZone` a fresh Basin session opens with.
+///
+/// **Why UTC, and not "whatever the host is".** PostgreSQL's own compiled-in
+/// default — `boot_val` in `pg_settings` — is `GMT`; measured on the live
+/// 18.2 server:
+///
+/// ```text
+///   name    |       setting       | boot_val |       source
+/// ----------+---------------------+----------+--------------------
+///  TimeZone | Africa/Johannesburg | GMT      | configuration file
+/// ```
+///
+/// The `Africa/Johannesburg` that server actually runs with is not a Postgres
+/// default at all: `initdb` probed the host clock at cluster-creation time and
+/// wrote the answer into `postgresql.conf`, which is why `source` reads
+/// *configuration file*. So there are two candidate "PostgreSQL defaults", and
+/// they disagree.
+///
+/// Basin takes the boot value, spelled `UTC` (`GMT` and `UTC` are the same
+/// zero offset with no DST; `UTC` is the name Basin's storage and wire layers
+/// already use everywhere). It deliberately does **not** copy PostgreSQL's
+/// initdb behaviour of adopting the host zone, because Basin is a server whose
+/// nodes are cattle: adopting the host zone would make `date_trunc('day', …)`
+/// return a different bucket depending on which machine served the query, and
+/// a wrong answer that depends on which host ran the batch is exactly the
+/// failure mode `EvalSession` was built to refuse. A deployment that wants a
+/// different zone says so with `SET TimeZone`.
+pub(crate) const DEFAULT_TIME_ZONE: &str = "UTC";
+
+/// The session's `TimeZone` as `SHOW TimeZone` renders it.
+pub(crate) fn session_time_zone(state: &SessionState) -> String {
+    state
+        .time_zone
+        .read()
+        .expect("time_zone lock poisoned")
+        .clone()
+}
+
+/// Map a `TimeZone` GUC *rendering* onto the name the evaluator's zone parser
+/// accepts.
+///
+/// Identity for every IANA name (`UTC`, `America/New_York`,
+/// `Australia/Lord_Howe`) and for the plain fixed-offset spelling (`+05:00`).
+/// The one rewrite is PostgreSQL's POSIX rendering of an interval-valued zone:
+/// `SET TIME ZONE INTERVAL '+05:00' HOUR TO MINUTE` renders as `<+05>-05`
+/// (measured), whose *inner* sign is POSIX-inverted — `<+05>` is the
+/// abbreviation and `-05` is the POSIX offset, so the real UTC offset is
+/// `+05:00`. Take the abbreviation between the angle brackets, which carries
+/// the ISO sign, and hand that to the parser.
+pub(crate) fn resolvable_time_zone(rendered: &str) -> String {
+    if let Some(rest) = rendered.strip_prefix('<') {
+        if let Some(abbrev) = rest.split('>').next() {
+            // `<+05>` → `+05:00`; `<-05:30>` → `-05:30`.
+            if abbrev.len() >= 3 && (abbrev.starts_with('+') || abbrev.starts_with('-')) {
+                return if abbrev.contains(':') {
+                    abbrev.to_string()
+                } else {
+                    format!("{abbrev}:00")
+                };
+            }
+        }
+    }
+    rendered.to_string()
+}
+
+/// Render a fixed UTC offset the way PostgreSQL's `SHOW TimeZone` renders an
+/// interval-valued zone: `<+05>-05`, `<-05:30>+05:30` (both measured).
+///
+/// The abbreviation inside the angle brackets carries the ISO sign; the suffix
+/// is the POSIX offset, which is the *negation*. Minutes are omitted from both
+/// halves when zero, exactly as PostgreSQL omits them.
+pub(crate) fn render_interval_time_zone(total_minutes: i32) -> String {
+    let sign = if total_minutes < 0 { '-' } else { '+' };
+    let posix_sign = if total_minutes < 0 { '+' } else { '-' };
+    let abs = total_minutes.abs();
+    let (h, m) = (abs / 60, abs % 60);
+    if m == 0 {
+        format!("<{sign}{h:02}>{posix_sign}{h:02}")
+    } else {
+        format!("<{sign}{h:02}:{m:02}>{posix_sign}{h:02}:{m:02}")
+    }
+}
+
+/// Apply `SET TimeZone = <value>`.
+///
+/// The zone is validated here, at `SET` time, with the *same* resolver the
+/// evaluator uses — so a name Basin cannot resolve is refused when it is set
+/// (PostgreSQL's own message and SQLSTATE 22023) rather than accepted and then
+/// silently answering in UTC for the rest of the session. Measured against
+/// PostgreSQL 18.2:
+///
+/// ```text
+/// SET TimeZone = 'Not/AZone';
+/// ERROR:  invalid value for parameter "TimeZone": "Not/AZone"
+/// ```
+pub(crate) fn set_session_time_zone(
+    state: &SessionState,
+    rendered: &str,
+) -> basin_common::Result<()> {
+    // `EvalSession::time_zone()` is the evaluator's own parser; asking it is
+    // what guarantees "accepted by SET" and "resolvable during evaluation"
+    // cannot drift apart.
+    basin_exec::eval::EvalSession::with_time_zone(resolvable_time_zone(rendered))
+        .time_zone()
+        .map_err(|_| {
+            basin_common::BasinError::InvalidSchema(format!(
+                "invalid value for parameter \"TimeZone\": \"{rendered}\""
+            ))
+        })?;
+    *state.time_zone.write().expect("time_zone lock poisoned") = rendered.to_string();
+    Ok(())
+}
+
+/// Reset `TimeZone` to [`DEFAULT_TIME_ZONE`] — `RESET TimeZone`,
+/// `SET TimeZone TO DEFAULT`, `SET TIME ZONE LOCAL`.
+pub(crate) fn reset_session_time_zone(state: &SessionState) {
+    *state.time_zone.write().expect("time_zone lock poisoned") = DEFAULT_TIME_ZONE.to_string();
+}
+
+/// Snapshot this session's evaluation context for one statement: the
+/// `TimeZone` GUC plus the transaction and statement timestamps.
+///
+/// This is the seam commit `6264603c` described and could not build: an
+/// [`EvalSession`](basin_exec::eval::EvalSession) is a value, taken once here
+/// and read (never written) by every operator in the plan.
+///
+/// The timestamps come from the hooks the executor fires — `tick_statement_ts`
+/// at the top of every statement, `tick_txn_ts` at `BEGIN`. Outside an
+/// explicit transaction there is no `BEGIN`, so `txn_ts` is `None` and the
+/// statement timestamp stands in for it, which is exactly PostgreSQL's
+/// autocommit behaviour: each statement is its own transaction, so `now()`
+/// and `statement_timestamp()` coincide and both advance per statement
+/// (measured — two successive autocommit `SELECT now()` differ by the
+/// round-trip, while two inside one `BEGIN` are byte-identical).
+pub(crate) fn eval_session(state: &SessionState) -> basin_exec::eval::EvalSession {
+    let session = basin_exec::eval::EvalSession::with_time_zone(resolvable_time_zone(
+        &session_time_zone(state),
+    ));
+    let stmt = *state
+        .datetime
+        .statement_ts
+        .lock()
+        .expect("statement_ts poisoned");
+    let txn = *state.datetime.txn_ts.lock().expect("txn_ts poisoned");
+    match (txn.or(stmt), stmt) {
+        (Some(txn), Some(stmt)) => session.at(txn, stmt),
+        // No hook has fired for this evaluation (a direct-API caller, not a
+        // statement). Leave the clock absent rather than inventing one — see
+        // `EvalSession::DEFAULT`'s docs for why `now()` must error instead.
+        _ => session,
     }
 }
 
@@ -3100,6 +3297,13 @@ pub(crate) async fn open(
     // per-session `Arc<AdvisorySessionLocks>` and overwrite (by name) the
     // removed stateless stubs. Registered here, like `register_auth_udfs`.
     crate::advisory_lock::register_advisory_lock_udfs(&ctx, state.advisory.clone());
+
+    // `statement_timestamp()` / `transaction_timestamp()`. Session-scoped for
+    // the same reason as the advisory-lock UDFs: they read state this session
+    // owns (the timestamps the executor's statement / BEGIN hooks tick), so
+    // they cannot live in the engine-wide stateless cache — one session's
+    // `BEGIN` would otherwise move every other session's `now()`.
+    crate::datetime_more_udf::register_datetime_session_udfs(&ctx, state.datetime.clone());
 
     // Phase 5.8.A: cron.schedule / cron.unschedule UDFs. Capture engine +
     // project so they can open an independent session to mutate cron_job.
@@ -6866,6 +7070,13 @@ mod tests {
         set_session_trgm_word_similarity_threshold(&dirty, 0.95);
         // Flip read_tier away from its default so the reset is observable.
         set_session_read_tier(&dirty, ReadTier::Lagging);
+        // TimeZone: a zone with a HALF-HOUR offset, deliberately — a leaked
+        // `Australia/Lord_Howe` across a pooled checkout does not merely shift
+        // `date_trunc('day', …)` by whole hours, it lands on a boundary no
+        // whole-hour zone can produce, so the wrong answer does not even look
+        // like a plausible one.
+        set_session_time_zone(&dirty, "Australia/Lord_Howe")
+            .expect("Australia/Lord_Howe must resolve");
 
         dirty.reset_gucs();
 
@@ -6908,6 +7119,16 @@ mod tests {
             session_read_tier(&dirty),
             session_read_tier(&fresh),
             "basin.read_tier not reset"
+        );
+        assert_eq!(
+            session_time_zone(&dirty),
+            session_time_zone(&fresh),
+            "TimeZone not reset"
+        );
+        assert_eq!(
+            session_time_zone(&fresh),
+            DEFAULT_TIME_ZONE,
+            "a fresh session's TimeZone is the documented default"
         );
     }
 
@@ -7708,6 +7929,77 @@ mod tests {
             session_idle_in_transaction_timeout(&state),
             Some(Duration::from_secs(30))
         );
+    }
+
+    /// `SET`/`SHOW`/`RESET TimeZone` at the accessor level, and the one rule
+    /// that makes the GUC worth validating: an unresolvable name is refused
+    /// rather than stored.
+    #[test]
+    fn time_zone_guc_accessor() {
+        let state = make_test_session_state();
+        assert_eq!(session_time_zone(&state), DEFAULT_TIME_ZONE);
+
+        for zone in ["UTC", "America/New_York", "Australia/Lord_Howe", "+05:00"] {
+            set_session_time_zone(&state, zone).unwrap_or_else(|e| panic!("{zone}: {e}"));
+            assert_eq!(session_time_zone(&state), zone);
+        }
+
+        // Refused, and — the half that matters — the previous value survives.
+        // A `SET` that failed must not leave the session in some third state
+        // neither the client nor the server can name.
+        set_session_time_zone(&state, "America/New_York").unwrap();
+        let err = set_session_time_zone(&state, "Not/AZone")
+            .expect_err("an unresolvable zone must be refused");
+        assert!(
+            format!("{err}").contains(r#"invalid value for parameter "TimeZone": "Not/AZone""#),
+            "expected PostgreSQL's wording, got {err}"
+        );
+        assert_eq!(session_time_zone(&state), "America/New_York");
+
+        reset_session_time_zone(&state);
+        assert_eq!(session_time_zone(&state), DEFAULT_TIME_ZONE);
+    }
+
+    /// The POSIX rendering PostgreSQL uses for an interval-valued zone, and
+    /// the round trip back to something the evaluator's parser accepts.
+    ///
+    /// Every expected rendering measured on PostgreSQL 18.2 — the sign
+    /// inversion is the whole point and is easy to get backwards:
+    /// `SET TIME ZONE INTERVAL '+05:00' HOUR TO MINUTE` shows `<+05>-05`, in
+    /// which `+05` is the abbreviation (ISO sign) and `-05` is the POSIX
+    /// offset (inverted). Resolution must follow the abbreviation.
+    #[test]
+    fn interval_time_zone_rendering_round_trips() {
+        for (minutes, rendered, resolvable) in [
+            (5 * 60, "<+05>-05", "+05:00"),
+            (-(5 * 60 + 30), "<-05:30>+05:30", "-05:30"),
+            (-(8 * 60), "<-08>+08", "-08:00"),
+            (5 * 60 + 30, "<+05:30>-05:30", "+05:30"),
+            (2 * 60 + 30, "<+02:30>-02:30", "+02:30"),
+            (7 * 60, "<+07>-07", "+07:00"),
+        ] {
+            assert_eq!(
+                render_interval_time_zone(minutes),
+                rendered,
+                "{minutes} min"
+            );
+            assert_eq!(
+                resolvable_time_zone(rendered),
+                resolvable,
+                "resolving {rendered}"
+            );
+            // And the resolved form is one the evaluator actually accepts —
+            // asking its own parser, so "renders" and "resolves" cannot drift.
+            basin_exec::eval::EvalSession::with_time_zone(resolvable_time_zone(rendered))
+                .time_zone()
+                .unwrap_or_else(|e| panic!("{rendered} → {resolvable} did not resolve: {e:?}"));
+        }
+
+        // An IANA name passes through untouched — the rewrite is scoped to the
+        // angle-bracket form and must not mangle anything else.
+        for name in ["UTC", "America/New_York", "Australia/Lord_Howe", "+05:00"] {
+            assert_eq!(resolvable_time_zone(name), name);
+        }
     }
 
     /// Serialises the env-mutating `basin.synchronous_commit` tests: env vars

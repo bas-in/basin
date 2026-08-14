@@ -1048,7 +1048,23 @@ async fn try_execute_inner(
     let (plan, passes) = basin_plan::opt::optimize_default(plan);
     sess.engine.note_owned_engine_optimizer_passes(passes);
 
-    let mut op = basin_exec::build::build(&plan, &resolver).map_err(Fallback::Build)?;
+    // The statement's evaluation context, snapshotted here — once, at the
+    // point the plan becomes operators — and read by every one of them. This
+    // is what makes `date_trunc('day', tstz)` truncate in the session's
+    // `TimeZone` rather than always in UTC, and what gives `now()` a
+    // transaction to be the timestamp of. `build_in_session` is the only
+    // difference from the plain `build`; everything above and below it is
+    // unchanged.
+    let session: basin_exec::SessionRef =
+        std::rc::Rc::new(crate::session::eval_session(&sess.state));
+    let mut op = basin_exec::build::build_in_session(
+        &plan,
+        &resolver,
+        None,
+        basin_exec::build::DEFAULT_OPERATOR_BUDGET,
+        &session,
+    )
+    .map_err(Fallback::Build)?;
 
     // A plain synchronous drain, deliberately with no `.await` in the loop:
     // `Box<dyn Operator>` (and the resolver's `StorageTableResolver`,

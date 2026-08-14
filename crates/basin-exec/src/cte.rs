@@ -149,7 +149,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use basin_plan::Expr;
 
 use crate::eval;
-use crate::operator::{ExecError, Operator};
+use crate::operator::{default_session, ExecError, Operator, SessionRef};
 
 fn arrow_err(e: ArrowError) -> ExecError {
     ExecError::Internal(e.to_string())
@@ -391,6 +391,7 @@ pub struct ProjectSet {
     srfs: Vec<ResolvedSrf>,
     input_ncols: usize,
     schema: SchemaRef,
+    session: SessionRef,
 }
 
 impl ProjectSet {
@@ -421,7 +422,19 @@ impl ProjectSet {
             srfs: resolved,
             input_ncols,
             schema: Arc::new(Schema::new(fields)),
+            session: default_session(),
         })
+    }
+
+    /// Evaluate this node's set-returning function arguments in `session`.
+    /// See [`SessionRef`].
+    ///
+    /// `resolve_srf`'s construction-time checks stay session-free: they
+    /// evaluate against a zero-row probe purely to read an argument's *type*,
+    /// and no `TimeZone` changes a type.
+    pub fn in_session(mut self, session: SessionRef) -> Self {
+        self.session = session;
+        self
     }
 }
 
@@ -560,8 +573,13 @@ impl SrfRowData {
     }
 }
 
-fn eval_i32_array(expr: &Expr, batch: &RecordBatch, ctx: &str) -> Result<Int32Array, ExecError> {
-    let arr = eval::eval(expr, batch)?;
+fn eval_i32_array(
+    expr: &Expr,
+    batch: &RecordBatch,
+    ctx: &str,
+    session: &SessionRef,
+) -> Result<Int32Array, ExecError> {
+    let arr = eval::eval_with(expr, batch, session)?;
     arr.as_any()
         .downcast_ref::<Int32Array>()
         .cloned()
@@ -573,8 +591,13 @@ fn eval_i32_array(expr: &Expr, batch: &RecordBatch, ctx: &str) -> Result<Int32Ar
         })
 }
 
-fn eval_i64_array(expr: &Expr, batch: &RecordBatch, ctx: &str) -> Result<Int64Array, ExecError> {
-    let arr = eval::eval(expr, batch)?;
+fn eval_i64_array(
+    expr: &Expr,
+    batch: &RecordBatch,
+    ctx: &str,
+    session: &SessionRef,
+) -> Result<Int64Array, ExecError> {
+    let arr = eval::eval_with(expr, batch, session)?;
     arr.as_any()
         .downcast_ref::<Int64Array>()
         .cloned()
@@ -658,14 +681,18 @@ fn gen_series_i64(
     Ok(out)
 }
 
-fn evaluate_srf(rs: &ResolvedSrf, batch: &RecordBatch) -> Result<SrfRowData, ExecError> {
+fn evaluate_srf(
+    rs: &ResolvedSrf,
+    batch: &RecordBatch,
+    session: &SessionRef,
+) -> Result<SrfRowData, ExecError> {
     let n = batch.num_rows();
     match rs.kind {
         SrfKind::GenerateSeriesI32 => {
-            let start = eval_i32_array(&rs.args[0], batch, "generate_series")?;
-            let stop = eval_i32_array(&rs.args[1], batch, "generate_series")?;
+            let start = eval_i32_array(&rs.args[0], batch, "generate_series", session)?;
+            let stop = eval_i32_array(&rs.args[1], batch, "generate_series", session)?;
             let step = match rs.args.get(2) {
-                Some(e) => Some(eval_i32_array(e, batch, "generate_series")?),
+                Some(e) => Some(eval_i32_array(e, batch, "generate_series", session)?),
                 None => None,
             };
             let mut rows = Vec::with_capacity(n);
@@ -681,10 +708,10 @@ fn evaluate_srf(rs: &ResolvedSrf, batch: &RecordBatch) -> Result<SrfRowData, Exe
             Ok(SrfRowData::I32(rows))
         }
         SrfKind::GenerateSeriesI64 => {
-            let start = eval_i64_array(&rs.args[0], batch, "generate_series")?;
-            let stop = eval_i64_array(&rs.args[1], batch, "generate_series")?;
+            let start = eval_i64_array(&rs.args[0], batch, "generate_series", session)?;
+            let stop = eval_i64_array(&rs.args[1], batch, "generate_series", session)?;
             let step = match rs.args.get(2) {
-                Some(e) => Some(eval_i64_array(e, batch, "generate_series")?),
+                Some(e) => Some(eval_i64_array(e, batch, "generate_series", session)?),
                 None => None,
             };
             let mut rows = Vec::with_capacity(n);
@@ -700,7 +727,7 @@ fn evaluate_srf(rs: &ResolvedSrf, batch: &RecordBatch) -> Result<SrfRowData, Exe
             Ok(SrfRowData::I64(rows))
         }
         SrfKind::Unnest => {
-            let arr = eval::eval(&rs.args[0], batch)?;
+            let arr = eval::eval_with(&rs.args[0], batch, session)?;
             let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
                 ExecError::TypeMismatch(format!(
                     "unnest() argument must evaluate to an array, got {:?} — a planner bug",
@@ -740,7 +767,7 @@ impl Operator for ProjectSet {
         let per_srf: Vec<SrfRowData> = self
             .srfs
             .iter()
-            .map(|rs| evaluate_srf(rs, &batch))
+            .map(|rs| evaluate_srf(rs, &batch, &self.session))
             .collect::<Result<_, _>>()?;
         let counts: Vec<Vec<usize>> = per_srf.iter().map(SrfRowData::counts).collect();
 

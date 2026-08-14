@@ -263,6 +263,14 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
             // idle_in_transaction_session_timeout fall through so the executor
             // stores them in per-session state.
             if after_set.starts_with("SEARCH_PATH")
+                // TimeZone: must reach the real handler, which stores the GUC
+                // and validates the zone. Silently accepting `SET TimeZone`
+                // would leave every `date_trunc`/`date_part` on a timestamptz
+                // answering in UTC while the client believes it asked for
+                // something else — a wrong answer with no error attached.
+                // Both spellings: `SET TIMEZONE …` and `SET TIME ZONE …`.
+                || after_set.starts_with("TIMEZONE")
+                || after_set.starts_with("TIME ZONE")
                 || after_set.starts_with("STATEMENT_TIMEOUT")
                 || after_set.starts_with("LOCK_TIMEOUT")
                 || after_set.starts_with("IDLE_IN_TRANSACTION_SESSION_TIMEOUT")
@@ -304,6 +312,10 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
             let trimmed = trimmed.trim_end_matches(';').trim_end();
             if trimmed == "SHOW TABLES"
                 || trimmed == "SHOW SEARCH_PATH"
+                // SHOW TimeZone must report the GUC the session actually holds,
+                // not the empty placeholder this interceptor would emit.
+                || trimmed == "SHOW TIMEZONE"
+                || trimmed == "SHOW TIME ZONE"
                 || trimmed == "SHOW STATEMENT_TIMEOUT"
                 || trimmed == "SHOW LOCK_TIMEOUT"
                 || trimmed == "SHOW IDLE_IN_TRANSACTION_SESSION_TIMEOUT"

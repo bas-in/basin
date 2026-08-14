@@ -53,7 +53,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use basin_plan::{Expr, SetOpKind};
 
 use crate::eval;
-use crate::operator::{ExecError, Operator};
+use crate::operator::{default_session, ExecError, Operator, SessionRef};
 
 fn arrow_err(e: ArrowError) -> ExecError {
     ExecError::Internal(e.to_string())
@@ -115,6 +115,7 @@ pub struct Values {
     schema: SchemaRef,
     rows: Vec<Vec<Expr>>,
     emitted: bool,
+    session: SessionRef,
 }
 
 impl Values {
@@ -156,7 +157,20 @@ impl Values {
             schema,
             rows,
             emitted: false,
+            session: default_session(),
         })
+    }
+
+    /// Evaluate this `VALUES` list's expressions in `session`. See
+    /// [`SessionRef`]. `SELECT now()` with no FROM lowers to a `Values` row,
+    /// so this is the operator a bare clock call actually runs in.
+    ///
+    /// The column *types* stay session-free for the same reason as
+    /// [`crate::project::Project::in_session`]: they are read off a probe
+    /// evaluation, and no zone changes an expression's type.
+    pub fn in_session(mut self, session: SessionRef) -> Self {
+        self.session = session;
+        self
     }
 }
 
@@ -182,7 +196,7 @@ impl Operator for Values {
             .collect();
         for row in &self.rows {
             for (j, expr) in row.iter().enumerate() {
-                per_column[j].push(eval::eval(expr, &probe)?);
+                per_column[j].push(eval::eval_with(expr, &probe, &self.session)?);
             }
         }
 

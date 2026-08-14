@@ -47,4 +47,4 @@ pub mod sort;
 pub mod storage_source;
 pub mod window;
 
-pub use operator::{ExecError, Operator};
+pub use operator::{default_session, ExecError, Operator, SessionRef};

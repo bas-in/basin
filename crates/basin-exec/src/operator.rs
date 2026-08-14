@@ -51,6 +51,34 @@ impl std::fmt::Display for ExecError {
 
 impl std::error::Error for ExecError {}
 
+/// The statement's evaluation context, shared by every operator in one plan.
+///
+/// [`EvalSession`](crate::eval::EvalSession) is a snapshot — taken once when
+/// the statement starts, read and never written while it runs — so the whole
+/// operator tree can share one behind an `Rc` rather than each node cloning a
+/// zone name. `Rc` and not `Arc` because `basin-exec` is single-partition by
+/// construction (see the crate docs) and every operator in a plan runs on the
+/// thread that built it; the [`Operator`] trait is deliberately not `Send`.
+///
+/// # Why every operator carries one, including the ones that ignore it
+///
+/// Each operator that evaluates an [`Expr`](basin_plan::Expr) keeps a
+/// `SessionRef` and hands it to [`eval_with`](crate::eval::eval_with). The
+/// default is [`EvalSession::DEFAULT`](crate::eval::EvalSession::DEFAULT) —
+/// UTC, no clock — which is what every constructor starts from and what the
+/// operator keeps unless [`in_session`] is called. `build::build_in_session`
+/// calls it on every node it constructs; the plain `build::build` does not,
+/// which is exactly the "answers as if the session were UTC" behaviour every
+/// existing caller and test already had.
+///
+/// [`in_session`]: crate::project::Filter::in_session
+pub type SessionRef = std::rc::Rc<crate::eval::EvalSession>;
+
+/// A fresh [`SessionRef`] over [`EvalSession::DEFAULT`](crate::eval::EvalSession::DEFAULT).
+pub fn default_session() -> SessionRef {
+    std::rc::Rc::new(crate::eval::EvalSession::DEFAULT)
+}
+
 /// A pull-based physical operator.
 ///
 /// `next_batch` returns `Ok(None)` at end of stream. Implementations must

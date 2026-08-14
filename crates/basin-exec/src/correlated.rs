@@ -141,6 +141,7 @@ pub struct CorrelatedScalar {
     subqueries: Vec<CorrelatedSubquery>,
     schema: SchemaRef,
     current: Option<RecordBatch>,
+    session: crate::operator::SessionRef,
 }
 
 impl CorrelatedScalar {
@@ -163,7 +164,20 @@ impl CorrelatedScalar {
             subqueries,
             schema,
             current: None,
+            session: crate::operator::default_session(),
         }
+    }
+
+    /// Evaluate the quantified decision expression in `session`. See
+    /// [`crate::operator::SessionRef`].
+    ///
+    /// The subquery *bodies* get their session separately: each is an operator
+    /// tree the `factory` builds, and `build.rs` threads the same session into
+    /// that build, so the inner plan is in-session too rather than only the
+    /// decider on top of it.
+    pub fn in_session(mut self, session: crate::operator::SessionRef) -> Self {
+        self.session = session;
+        self
     }
 
     /// Evaluate one subquery for one row of `batch`, returning the one-row
@@ -174,6 +188,7 @@ impl CorrelatedScalar {
         sub: &mut CorrelatedSubquery,
         batch: &RecordBatch,
         row: usize,
+        session: &crate::operator::SessionRef,
     ) -> Result<ArrayRef, ExecError> {
         let mut op = (sub.factory)(batch, row)?;
         let schema = op.schema();
@@ -219,7 +234,7 @@ impl CorrelatedScalar {
                 // batch, before any of this operator's own columns are
                 // appended, so the column positions it names are the ones it
                 // was built with.
-                let decided = crate::eval::eval(&expr, &batch.slice(row, 1))?;
+                let decided = crate::eval::eval_with(&expr, &batch.slice(row, 1), session)?;
                 if decided.data_type() != &DataType::Boolean {
                     return Err(ExecError::Internal(format!(
                         "a quantified subquery must decide to a boolean, got {:?}",
@@ -252,6 +267,9 @@ impl Operator for CorrelatedScalar {
         self.current = Some(batch.clone());
 
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        // Cloned out of `self` before the loop below borrows `self.subqueries`
+        // mutably. An `Rc` clone is a refcount bump, not a session copy.
+        let session = crate::operator::SessionRef::clone(&self.session);
         for sub in &mut self.subqueries {
             // An empty input batch still has to produce a column of the
             // right type and length (zero), and `concat` refuses an empty
@@ -263,7 +281,7 @@ impl Operator for CorrelatedScalar {
             }
             let mut per_row: Vec<ArrayRef> = Vec::with_capacity(rows);
             for row in 0..rows {
-                per_row.push(Self::eval_one(sub, &batch, row)?);
+                per_row.push(Self::eval_one(sub, &batch, row, &session)?);
             }
             let refs: Vec<&dyn arrow_array::Array> = per_row.iter().map(|a| a.as_ref()).collect();
             let joined =

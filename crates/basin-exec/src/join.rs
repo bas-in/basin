@@ -119,7 +119,7 @@ use arrow_select::take::take;
 use basin_plan::{ColumnRef, Expr, JoinKind};
 
 use crate::eval;
-use crate::operator::{ExecError, Operator};
+use crate::operator::{default_session, ExecError, Operator, SessionRef};
 
 /// Rewrite `filter` so every column it reads is a flat index into the
 /// concatenated left++right row, ready for direct use with `eval::eval`.
@@ -451,6 +451,9 @@ pub struct HashJoin {
     /// (`schema` above) is left-only. `Inner`/`Cross` reuse `schema`
     /// directly instead, since for them `schema` already *is* left++right.
     filter_schema: SchemaRef,
+    /// The statement's evaluation context, used only for `filter`. See
+    /// [`SessionRef`] and [`Self::in_session`].
+    session: SessionRef,
 
     phase: Phase,
     right_bytes: usize,
@@ -611,6 +614,7 @@ impl HashJoin {
             row_converter,
             filter,
             filter_schema,
+            session: default_session(),
             phase: Phase::Building,
             right_bytes: 0,
             right_batches: Vec::new(),
@@ -619,6 +623,16 @@ impl HashJoin {
             right_matched: Vec::new(),
             all_right_rows: Vec::new(),
         })
+    }
+
+    /// Evaluate this join's residual filter in `session`. See [`SessionRef`].
+    ///
+    /// Nothing else in a hash join is session-dependent: the equijoin keys are
+    /// column indices resolved at plan time, and row equality is byte equality
+    /// over the encoded key, which no `TimeZone` changes.
+    pub fn in_session(mut self, session: SessionRef) -> Self {
+        self.session = session;
+        self
     }
 
     /// Drain the right child fully, concatenate into one table, and build
@@ -718,7 +732,7 @@ impl HashJoin {
     /// mask. Downcast failure is a planner bug, not user error: `filter` is
     /// only ever produced from a boolean-typed predicate.
     fn eval_filter(&self, filter: &Expr, batch: &RecordBatch) -> Result<BooleanArray, ExecError> {
-        let array = eval::eval(filter, batch)?;
+        let array = eval::eval_with(filter, batch, &self.session)?;
         let bools = array
             .as_any()
             .downcast_ref::<BooleanArray>()

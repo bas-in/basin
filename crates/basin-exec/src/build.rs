@@ -42,7 +42,7 @@ use crate::dml::{ConflictAction, Delete, Insert, MemoryRowSink, RowSink, Update}
 use crate::join::HashJoin;
 use crate::lateral::{InnerFactory, LateralJoin};
 use crate::limit::Limit;
-use crate::operator::{ExecError, Operator};
+use crate::operator::{default_session, ExecError, Operator, SessionRef};
 use crate::project::{Filter, Project};
 use crate::recursive::{RecursiveCte, RecursiveTermFactory};
 use crate::scan::{BatchSource, Scan};
@@ -302,6 +302,32 @@ pub fn build(
     build_with_budget(plan, tables, DEFAULT_OPERATOR_BUDGET)
 }
 
+/// Build an operator tree that evaluates in `session` — the statement's
+/// `TimeZone` GUC and its transaction/statement clocks — rather than in
+/// [`EvalSession::DEFAULT`](crate::eval::EvalSession::DEFAULT)'s UTC with no
+/// clock.
+///
+/// This is the entry point the engine uses for a real statement. The three
+/// entry points above stay exactly as they were, defaulting to
+/// `EvalSession::DEFAULT`, for the same reason [`crate::eval::eval`] still
+/// exists beside [`crate::eval::eval_with`]: every existing caller and every
+/// read-only test battery keeps compiling and keeps its previous answers,
+/// and a session is something a caller opts into rather than something the
+/// signature forces it to invent.
+///
+/// `dml` is optional on the same terms as [`build_with_dml`] versus
+/// [`build`]: `None` refuses data-modifying plans.
+pub fn build_in_session(
+    plan: &LogicalPlan,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    session: &SessionRef,
+) -> Result<Box<dyn Operator>, BuildError> {
+    let ctes: CteRegistry = Rc::new(RefCell::new(HashMap::new()));
+    build_inner(plan, tables, dml, budget, &ctes, session, None)
+}
+
 /// Build an operator tree with an explicit memory budget for buffering
 /// operators. Like [`build`], data-modifying statements are refused — see
 /// [`build_with_dml`].
@@ -311,7 +337,7 @@ pub fn build_with_budget(
     budget: usize,
 ) -> Result<Box<dyn Operator>, BuildError> {
     let ctes: CteRegistry = Rc::new(RefCell::new(HashMap::new()));
-    build_inner(plan, tables, None, budget, &ctes, None)
+    build_inner(plan, tables, None, budget, &ctes, &default_session(), None)
 }
 
 /// Build an operator tree that may contain `INSERT`/`UPDATE`/`DELETE`,
@@ -326,7 +352,15 @@ pub fn build_with_dml(
     budget: usize,
 ) -> Result<Box<dyn Operator>, BuildError> {
     let ctes: CteRegistry = Rc::new(RefCell::new(HashMap::new()));
-    build_inner(plan, tables, Some(dml), budget, &ctes, None)
+    build_inner(
+        plan,
+        tables,
+        Some(dml),
+        budget,
+        &ctes,
+        &default_session(),
+        None,
+    )
 }
 
 /// The actual recursive builder. `ctes` is threaded (not created fresh per
@@ -340,6 +374,7 @@ fn build_inner(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
     outer: Outer<'_>,
 ) -> Result<Box<dyn Operator>, BuildError> {
     match plan {
@@ -352,7 +387,7 @@ fn build_inner(
             let cols: Vec<usize> = projection.iter().map(|c| c.0 as usize).collect();
             let filters: Vec<Expr> = filters
                 .iter()
-                .map(|f| bind_outer(f, outer, tables, dml, budget, ctes))
+                .map(|f| bind_outer(f, outer, tables, dml, budget, ctes, session))
                 .collect::<Result<_, _>>()?;
             let (source, pushed) = tables
                 .open(*table, &cols, &filters)
@@ -390,7 +425,9 @@ fn build_inner(
             } else {
                 filters_to_source_positions(filters, &cols)
             };
-            Ok(Box::new(Scan::new(source, scan_cols, scan_filters)?))
+            Ok(Box::new(
+                Scan::new(source, scan_cols, scan_filters)?.in_session(SessionRef::clone(session)),
+            ))
         }
 
         // `Filter` and `Project` are the two nodes that can host a per-row
@@ -400,26 +437,36 @@ fn build_inner(
         // subquery. Every other node refuses a correlated scalar subquery
         // rather than evaluating it once and pretending — `bind_outer`.
         LogicalPlan::Filter { input, predicate } => {
-            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let child = build_inner(input, tables, dml, budget, ctes, session, outer)?;
             let child_schema = child.schema();
             let sink = CorrSink {
                 base_width: child_schema.fields().len() as u16,
                 subplans: RefCell::new(Vec::new()),
             };
             let predicate =
-                bind_outer_collecting(predicate, outer, &sink, tables, dml, budget, ctes)?;
+                bind_outer_collecting(predicate, outer, &sink, tables, dml, budget, ctes, session)?;
             let subplans = sink.subplans.into_inner();
             if subplans.is_empty() {
-                return Ok(Box::new(Filter::new(child, predicate)));
+                return Ok(Box::new(
+                    Filter::new(child, predicate).in_session(SessionRef::clone(session)),
+                ));
             }
             // A `Filter` must not change its input's schema, so the columns
             // the subqueries added are projected back off above it — the
             // predicate has already been rewritten to read them, and
             // nothing above this node knows they existed.
             let width = child_schema.fields().len();
-            let child =
-                build_correlated_scalars(child, subplans, width as u16, tables, budget, ctes)?;
-            let filtered: Box<dyn Operator> = Box::new(Filter::new(child, predicate));
+            let child = build_correlated_scalars(
+                child,
+                subplans,
+                width as u16,
+                tables,
+                budget,
+                ctes,
+                session,
+            )?;
+            let filtered: Box<dyn Operator> =
+                Box::new(Filter::new(child, predicate).in_session(SessionRef::clone(session)));
             let trim: Vec<(Expr, String)> = child_schema
                 .fields()
                 .iter()
@@ -435,11 +482,13 @@ fn build_inner(
                     )
                 })
                 .collect();
-            Ok(Box::new(Project::new(filtered, trim)?))
+            Ok(Box::new(
+                Project::new(filtered, trim)?.in_session(SessionRef::clone(session)),
+            ))
         }
 
         LogicalPlan::Project { input, exprs } => {
-            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let child = build_inner(input, tables, dml, budget, ctes, session, outer)?;
             let base_width = child.schema().fields().len() as u16;
             let sink = CorrSink {
                 base_width,
@@ -449,7 +498,7 @@ fn build_inner(
                 .iter()
                 .map(|(e, n)| {
                     Ok((
-                        bind_outer_collecting(e, outer, &sink, tables, dml, budget, ctes)?,
+                        bind_outer_collecting(e, outer, &sink, tables, dml, budget, ctes, session)?,
                         n.clone(),
                     ))
                 })
@@ -458,9 +507,13 @@ fn build_inner(
             let child = if subplans.is_empty() {
                 child
             } else {
-                build_correlated_scalars(child, subplans, base_width, tables, budget, ctes)?
+                build_correlated_scalars(
+                    child, subplans, base_width, tables, budget, ctes, session,
+                )?
             };
-            Ok(Box::new(Project::new(child, exprs)?))
+            Ok(Box::new(
+                Project::new(child, exprs)?.in_session(SessionRef::clone(session)),
+            ))
         }
 
         // `Limit` with a fetch and a sorted input is the top-K shape. Basin's
@@ -478,11 +531,11 @@ fn build_inner(
             }
             let fetch = fetch
                 .as_ref()
-                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
                 .transpose()?;
             let skip_n = match skip
                 .as_ref()
-                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
                 .transpose()?
             {
                 Some(e) => Some(
@@ -499,7 +552,7 @@ fn build_inner(
                 None => None,
             };
             if fetch_n.is_none() && skip_n.is_none() {
-                return build_inner(input, tables, dml, budget, ctes, outer);
+                return build_inner(input, tables, dml, budget, ctes, session, outer);
             }
 
             // `ORDER BY … LIMIT` with no offset fuses into a bounded heap, which
@@ -509,20 +562,20 @@ fn build_inner(
             // streaming Limit over whatever the input already is.
             match (input.as_ref(), skip_n, fetch_n) {
                 (LogicalPlan::Sort { input: si, keys }, None, Some(k)) => {
-                    let child = build_inner(si, tables, dml, budget, ctes, outer)?;
-                    let keys = bind_sort_keys(keys, outer, tables, dml, budget, ctes)?;
+                    let child = build_inner(si, tables, dml, budget, ctes, session, outer)?;
+                    let keys = bind_sort_keys(keys, outer, tables, dml, budget, ctes, session)?;
                     Ok(Box::new(TopK::new(child, sort_keys(&keys)?, k)))
                 }
                 _ => {
-                    let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+                    let child = build_inner(input, tables, dml, budget, ctes, session, outer)?;
                     Ok(Box::new(Limit::new(child, skip_n.unwrap_or(0), fetch_n)))
                 }
             }
         }
 
         LogicalPlan::Sort { input, keys } => {
-            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
-            let keys = bind_sort_keys(keys, outer, tables, dml, budget, ctes)?;
+            let child = build_inner(input, tables, dml, budget, ctes, session, outer)?;
+            let keys = bind_sort_keys(keys, outer, tables, dml, budget, ctes, session)?;
             Ok(Box::new(Sort::new(child, sort_keys(&keys)?, budget)))
         }
 
@@ -537,10 +590,10 @@ fn build_inner(
                     "GROUPING SETS / ROLLUP / CUBE".into(),
                 ));
             }
-            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let child = build_inner(input, tables, dml, budget, ctes, session, outer)?;
             let group: Vec<Expr> = group
                 .iter()
-                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
                 .collect::<Result<_, _>>()?;
             let group_cols = group
                 .iter()
@@ -548,7 +601,7 @@ fn build_inner(
                 .collect::<Result<Vec<_>, _>>()?;
             let aggs: Vec<Expr> = aggs
                 .iter()
-                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
                 .collect::<Result<_, _>>()?;
             let specs = aggs
                 .iter()
@@ -592,13 +645,13 @@ fn build_inner(
                      physical operator that implements that today"
                 )));
             }
-            let l = build_inner(left, tables, dml, budget, ctes, outer)?;
-            let r = build_inner(right, tables, dml, budget, ctes, outer)?;
+            let l = build_inner(left, tables, dml, budget, ctes, session, outer)?;
+            let r = build_inner(right, tables, dml, budget, ctes, session, outer)?;
             let mut lk = Vec::with_capacity(on.len());
             let mut rk = Vec::with_capacity(on.len());
             for (a, b) in on {
-                let a = bind_outer(a, outer, tables, dml, budget, ctes)?;
-                let b = bind_outer(b, outer, tables, dml, budget, ctes)?;
+                let a = bind_outer(a, outer, tables, dml, budget, ctes, session)?;
+                let b = bind_outer(b, outer, tables, dml, budget, ctes, session)?;
                 lk.push(column_index(&a).ok_or(BuildError::NonColumnKey("join"))?);
                 rk.push(column_index(&b).ok_or(BuildError::NonColumnKey("join"))?);
             }
@@ -618,11 +671,12 @@ fn build_inner(
             // decorrelated Semi/Anti nested inside a LATERAL would mis-bind.
             let filter = filter
                 .as_ref()
-                .map(|f| bind_outer(f, outer, tables, dml, budget, ctes))
+                .map(|f| bind_outer(f, outer, tables, dml, budget, ctes, session))
                 .transpose()?;
-            Ok(Box::new(HashJoin::with_filter(
-                l, r, *kind, lk, rk, filter, budget,
-            )?))
+            Ok(Box::new(
+                HashJoin::with_filter(l, r, *kind, lk, rk, filter, budget)?
+                    .in_session(SessionRef::clone(session)),
+            ))
         }
 
         // `LATERAL` — the inner side is rebuilt fresh per outer row via a
@@ -651,7 +705,7 @@ fn build_inner(
                     "data-modifying statement inside a LATERAL subquery".into(),
                 ));
             }
-            let outer_op = build_inner(outer_plan, tables, dml, budget, ctes, outer)?;
+            let outer_op = build_inner(outer_plan, tables, dml, budget, ctes, session, outer)?;
 
             let inner_plan = inner.as_ref().clone();
             let mut snapshot = SnapshotResolver::default();
@@ -671,12 +725,18 @@ fn build_inner(
                 None,
                 budget,
                 ctes,
+                session,
                 Some((&probe_batch, 0)),
             )?
             .schema();
 
             let snapshot_for_factory = Rc::clone(&snapshot);
             let ctes_for_factory = Rc::clone(ctes);
+            // The inner plan is rebuilt per outer row, so the factory has to
+            // own a handle to the session rather than borrow one — an `Rc`
+            // clone, so every rebuild lands in the same session as the outer
+            // side rather than silently reverting to the UTC default.
+            let session_for_factory = SessionRef::clone(session);
             let inner_plan_for_factory = inner_plan.clone();
             let make_inner: InnerFactory = Box::new(move |row_batch: &RecordBatch, idx: usize| {
                 build_inner(
@@ -685,6 +745,7 @@ fn build_inner(
                     None,
                     budget,
                     &ctes_for_factory,
+                    &session_for_factory,
                     Some((row_batch, idx)),
                 )
                 .map_err(build_error_to_exec)
@@ -703,11 +764,13 @@ fn build_inner(
                 .iter()
                 .map(|r| {
                     r.iter()
-                        .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                        .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
                         .collect::<Result<_, _>>()
                 })
                 .collect::<Result<_, BuildError>>()?;
-            Ok(Box::new(Values::new(rows, names)?))
+            Ok(Box::new(
+                Values::new(rows, names)?.in_session(SessionRef::clone(session)),
+            ))
         }
 
         LogicalPlan::Empty {
@@ -727,13 +790,13 @@ fn build_inner(
         }
 
         LogicalPlan::Distinct { input, on } => {
-            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let child = build_inner(input, tables, dml, budget, ctes, session, outer)?;
             match on {
                 None => Ok(Box::new(Distinct::new(child, budget))),
                 Some(exprs) => {
                     let exprs: Vec<Expr> = exprs
                         .iter()
-                        .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                        .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
                         .collect::<Result<_, _>>()?;
                     let cols = exprs
                         .iter()
@@ -750,8 +813,8 @@ fn build_inner(
             op,
             all,
         } => {
-            let l = build_inner(left, tables, dml, budget, ctes, outer)?;
-            let r = build_inner(right, tables, dml, budget, ctes, outer)?;
+            let l = build_inner(left, tables, dml, budget, ctes, session, outer)?;
+            let r = build_inner(right, tables, dml, budget, ctes, session, outer)?;
             Ok(Box::new(SetOp::new(l, r, *op, *all, budget)?))
         }
 
@@ -761,13 +824,13 @@ fn build_inner(
         // sorted by those keys and never re-sorts, so an unsorted input is a
         // planner bug it will not paper over.
         LogicalPlan::Window { input, windows } => {
-            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let child = build_inner(input, tables, dml, budget, ctes, session, outer)?;
             let mut windows: Vec<Expr> = windows
                 .iter()
-                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
+                .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
                 .collect::<Result<_, _>>()?;
             let (partition_by, order_by) = window_keys(&windows)?;
-            let (child, trim) = materialize_window_args(child, &mut windows)?;
+            let (child, trim) = materialize_window_args(child, &mut windows, session)?;
             let specs = windows
                 .iter()
                 .enumerate()
@@ -797,18 +860,20 @@ fn build_inner(
         // implements the modern rule; this comment exists because the older one
         // is what most references and most recollections still describe.
         LogicalPlan::ProjectSet { input, srfs } => {
-            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let child = build_inner(input, tables, dml, budget, ctes, session, outer)?;
             let named: Vec<(Expr, String)> = srfs
                 .iter()
                 .enumerate()
                 .map(|(i, e)| {
                     Ok((
-                        bind_outer(e, outer, tables, dml, budget, ctes)?,
+                        bind_outer(e, outer, tables, dml, budget, ctes, session)?,
                         format!("srf{i}"),
                     ))
                 })
                 .collect::<Result<_, BuildError>>()?;
-            Ok(Box::new(ProjectSet::new(child, named)?))
+            Ok(Box::new(
+                ProjectSet::new(child, named)?.in_session(SessionRef::clone(session)),
+            ))
         }
 
         // A `WITH` body is built once into a `CteBuffer` and registered by
@@ -828,13 +893,13 @@ fn build_inner(
             input,
         } => {
             let body_op: Box<dyn Operator> = if *recursive {
-                build_recursive_cte(*name, body, tables, budget, ctes, outer)?
+                build_recursive_cte(*name, body, tables, budget, ctes, session, outer)?
             } else {
-                build_inner(body, tables, dml, budget, ctes, outer)?
+                build_inner(body, tables, dml, budget, ctes, session, outer)?
             };
             let buffer = CteBuffer::new(body_op, budget);
             ctes.borrow_mut().insert(*name, buffer);
-            build_inner(input, tables, dml, budget, ctes, outer)
+            build_inner(input, tables, dml, budget, ctes, session, outer)
         }
 
         // A planner bug, not a user error, if `name` was never registered —
@@ -861,7 +926,7 @@ fn build_inner(
             let (sink, write_schema, key_cols) = dml_resolver
                 .open(*table)
                 .ok_or(BuildError::UnknownTable(*table))?;
-            let input_op = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let input_op = build_inner(input, tables, dml, budget, ctes, session, outer)?;
             if input_op.schema() != write_schema {
                 return Err(BuildError::Unsupported(format!(
                     "INSERT input schema does not match {table:?}'s write schema — expected \
@@ -874,7 +939,7 @@ fn build_inner(
             let want_returning = returning.is_some();
             let dml_op: Box<dyn Operator> =
                 Box::new(Insert::new(input_op, sink, action, want_returning));
-            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes)
+            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes, session)
         }
 
         // `Update`/`Delete` carry no explicit input plan (unlike `Insert`) —
@@ -906,19 +971,22 @@ fn build_inner(
                 filters: Vec::new(),
                 snapshot: *snapshot,
             };
-            let scanned = build_inner(&scan, tables, dml, budget, ctes, outer)?;
+            let scanned = build_inner(&scan, tables, dml, budget, ctes, session, outer)?;
             let matched: Box<dyn Operator> = match predicate {
-                Some(p) => Box::new(Filter::new(
-                    scanned,
-                    bind_outer(p, outer, tables, dml, budget, ctes)?,
-                )),
+                Some(p) => Box::new(
+                    Filter::new(
+                        scanned,
+                        bind_outer(p, outer, tables, dml, budget, ctes, session)?,
+                    )
+                    .in_session(SessionRef::clone(session)),
+                ),
                 None => scanned,
             };
             let mut set_map: HashMap<usize, Expr> = HashMap::new();
             for (c, e) in set {
                 set_map.insert(
                     c.0 as usize,
-                    bind_outer(e, outer, tables, dml, budget, ctes)?,
+                    bind_outer(e, outer, tables, dml, budget, ctes, session)?,
                 );
             }
             let exprs: Vec<(Expr, String)> = (0..n)
@@ -934,7 +1002,7 @@ fn build_inner(
                     (e, name)
                 })
                 .collect();
-            let new_rows = Project::new(matched, exprs)?;
+            let new_rows = Project::new(matched, exprs)?.in_session(SessionRef::clone(session));
             let want_returning = returning.is_some();
             let dml_op: Box<dyn Operator> = Box::new(Update::new(
                 Box::new(new_rows),
@@ -942,7 +1010,7 @@ fn build_inner(
                 key_cols,
                 want_returning,
             ));
-            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes)
+            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes, session)
         }
 
         LogicalPlan::Delete {
@@ -968,18 +1036,21 @@ fn build_inner(
                 filters: Vec::new(),
                 snapshot: *snapshot,
             };
-            let scanned = build_inner(&scan, tables, dml, budget, ctes, outer)?;
+            let scanned = build_inner(&scan, tables, dml, budget, ctes, session, outer)?;
             let matched: Box<dyn Operator> = match predicate {
-                Some(p) => Box::new(Filter::new(
-                    scanned,
-                    bind_outer(p, outer, tables, dml, budget, ctes)?,
-                )),
+                Some(p) => Box::new(
+                    Filter::new(
+                        scanned,
+                        bind_outer(p, outer, tables, dml, budget, ctes, session)?,
+                    )
+                    .in_session(SessionRef::clone(session)),
+                ),
                 None => scanned,
             };
             let want_returning = returning.is_some();
             let dml_op: Box<dyn Operator> =
                 Box::new(Delete::new(matched, sink, key_cols, want_returning));
-            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes)
+            wrap_returning(dml_op, returning, outer, tables, dml, budget, ctes, session)
         }
     }
 }
@@ -1035,15 +1106,23 @@ fn wrap_returning(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Box<dyn Operator>, BuildError> {
     match returning {
         None => Ok(dml_op),
         Some(ret) => {
             let exprs: Vec<(Expr, String)> = ret
                 .iter()
-                .map(|(e, n)| Ok((bind_outer(e, outer, tables, dml, budget, ctes)?, n.clone())))
+                .map(|(e, n)| {
+                    Ok((
+                        bind_outer(e, outer, tables, dml, budget, ctes, session)?,
+                        n.clone(),
+                    ))
+                })
                 .collect::<Result<_, BuildError>>()?;
-            Ok(Box::new(Project::new(dml_op, exprs)?))
+            Ok(Box::new(
+                Project::new(dml_op, exprs)?.in_session(SessionRef::clone(session)),
+            ))
         }
     }
 }
@@ -1068,6 +1147,7 @@ fn build_recursive_cte(
     tables: &dyn TableResolver,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
     outer: Outer<'_>,
 ) -> Result<Box<dyn Operator>, BuildError> {
     let LogicalPlan::SetOp {
@@ -1087,7 +1167,7 @@ fn build_recursive_cte(
         ));
     }
 
-    let anchor_op = build_inner(left, tables, None, budget, ctes, outer)?;
+    let anchor_op = build_inner(left, tables, None, budget, ctes, session, outer)?;
     let anchor_schema = anchor_op.schema();
 
     let recursive_plan = right.as_ref().clone();
@@ -1095,6 +1175,10 @@ fn build_recursive_cte(
     snapshot_scans(&recursive_plan, tables, &mut snapshot)?;
     let snapshot = Rc::new(snapshot);
     let ctes_captured = Rc::clone(ctes);
+    // Owned by the factory for the same reason as the lateral one above:
+    // every iteration of the recursive term rebuilds the plan, and each
+    // rebuild must land in this statement's session.
+    let session_captured = SessionRef::clone(session);
     let schema_for_feed = Arc::clone(&anchor_schema);
     let outer_owned: Option<(RecordBatch, usize)> = outer.map(|(b, i)| (b.clone(), i));
 
@@ -1119,6 +1203,7 @@ fn build_recursive_cte(
             None,
             budget,
             &ctes_captured,
+            &session_captured,
             bound_outer,
         )
         .map_err(build_error_to_exec)
@@ -1389,8 +1474,9 @@ fn bind_outer(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Expr, BuildError> {
-    bind_outer_rec(expr, outer, None, tables, dml, budget, ctes)
+    bind_outer_rec(expr, outer, None, tables, dml, budget, ctes, session)
 }
 
 /// [`bind_outer`] for the two nodes that can host a per-row evaluation:
@@ -1404,8 +1490,9 @@ fn bind_outer_collecting(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Expr, BuildError> {
-    bind_outer_rec(expr, outer, Some(sink), tables, dml, budget, ctes)
+    bind_outer_rec(expr, outer, Some(sink), tables, dml, budget, ctes, session)
 }
 
 fn bind_sort_keys(
@@ -1415,11 +1502,12 @@ fn bind_sort_keys(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Vec<PlanSortKey>, BuildError> {
     keys.iter()
         .map(|k| {
             Ok(PlanSortKey {
-                expr: bind_outer(&k.expr, outer, tables, dml, budget, ctes)?,
+                expr: bind_outer(&k.expr, outer, tables, dml, budget, ctes, session)?,
                 descending: k.descending,
                 nulls_first: k.nulls_first,
             })
@@ -1461,15 +1549,16 @@ fn bind_outer_rec(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Expr, BuildError> {
     let b = |e: &Expr| -> Result<Box<Expr>, BuildError> {
         Ok(Box::new(bind_outer_rec(
-            e, outer, corr, tables, dml, budget, ctes,
+            e, outer, corr, tables, dml, budget, ctes, session,
         )?))
     };
     let v = |es: &[Expr]| -> Result<Vec<Expr>, BuildError> {
         es.iter()
-            .map(|e| bind_outer_rec(e, outer, corr, tables, dml, budget, ctes))
+            .map(|e| bind_outer_rec(e, outer, corr, tables, dml, budget, ctes, session))
             .collect()
     };
     let ob = |o: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, BuildError> {
@@ -1505,8 +1594,8 @@ fn bind_outer_rec(
                 .iter()
                 .map(|(w, t)| {
                     Ok((
-                        bind_outer_rec(w, outer, corr, tables, dml, budget, ctes)?,
-                        bind_outer_rec(t, outer, corr, tables, dml, budget, ctes)?,
+                        bind_outer_rec(w, outer, corr, tables, dml, budget, ctes, session)?,
+                        bind_outer_rec(t, outer, corr, tables, dml, budget, ctes, session)?,
                     ))
                 })
                 .collect::<Result<_, BuildError>>()?,
@@ -1615,6 +1704,7 @@ fn bind_outer_rec(
                     dml,
                     budget,
                     ctes,
+                    session,
                 );
             }
             let operand = ob(operand)?;
@@ -1642,7 +1732,7 @@ fn bind_outer_rec(
                 // all — it goes to the sink, if the node being built has
                 // one, and is otherwise refused outright.
                 if !references_outer_row(subplan) {
-                    materialize_scalar_subquery(subplan, tables, dml, budget, ctes)?
+                    materialize_scalar_subquery(subplan, tables, dml, budget, ctes, session)?
                 } else {
                     let sink = match corr {
                         // `outer.is_some()` means we are already inside a
@@ -1683,20 +1773,24 @@ fn bind_outer_rec(
                 .map(|s| {
                     Ok(match s {
                         basin_plan::Subscript::Index(e) => basin_plan::Subscript::Index(
-                            bind_outer_rec(e, outer, corr, tables, dml, budget, ctes)?,
+                            bind_outer_rec(e, outer, corr, tables, dml, budget, ctes, session)?,
                         ),
                         basin_plan::Subscript::Slice { lower, upper } => {
                             basin_plan::Subscript::Slice {
                                 lower: lower
                                     .as_ref()
                                     .map(|e| {
-                                        bind_outer_rec(e, outer, corr, tables, dml, budget, ctes)
+                                        bind_outer_rec(
+                                            e, outer, corr, tables, dml, budget, ctes, session,
+                                        )
                                     })
                                     .transpose()?,
                                 upper: upper
                                     .as_ref()
                                     .map(|e| {
-                                        bind_outer_rec(e, outer, corr, tables, dml, budget, ctes)
+                                        bind_outer_rec(
+                                            e, outer, corr, tables, dml, budget, ctes, session,
+                                        )
                                     })
                                     .transpose()?,
                             }
@@ -1754,8 +1848,9 @@ fn materialize_scalar_subquery(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Expr, BuildError> {
-    let mut op = build_inner(subplan, tables, dml, budget, ctes, None)?;
+    let mut op = build_inner(subplan, tables, dml, budget, ctes, session, None)?;
     let schema = op.schema();
     if schema.fields().len() != 1 {
         return Err(BuildError::Exec(ExecError::Internal(format!(
@@ -1810,8 +1905,9 @@ fn bind_quantified_subquery(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Expr, BuildError> {
-    let operand = bind_outer(raw_operand, outer, tables, dml, budget, ctes)?;
+    let operand = bind_outer(raw_operand, outer, tables, dml, budget, ctes, session)?;
 
     // Same refusal, and the same reason, as the scalar arm's: `OUTER_REF`
     // says "outside my own FROM" and no more, so a correlated subquery nested
@@ -1824,7 +1920,7 @@ fn bind_quantified_subquery(
     }
 
     if !references_outer_row(subplan) {
-        let values = materialize_subquery_column(subplan, tables, dml, budget, ctes)?;
+        let values = materialize_subquery_column(subplan, tables, dml, budget, ctes, session)?;
         return quantified_expr(&kind, &operand, values);
     }
 
@@ -1860,8 +1956,9 @@ fn materialize_subquery_column(
     dml: Option<&dyn DmlResolver>,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Vec<Expr>, BuildError> {
-    let mut op = build_inner(subplan, tables, dml, budget, ctes, None)?;
+    let mut op = build_inner(subplan, tables, dml, budget, ctes, session, None)?;
     let schema = op.schema();
     if schema.fields().len() != 1 {
         return Err(BuildError::Exec(ExecError::Internal(format!(
@@ -2036,6 +2133,7 @@ fn build_correlated_scalars(
     tables: &dyn TableResolver,
     budget: usize,
     ctes: &CteRegistry,
+    session: &SessionRef,
 ) -> Result<Box<dyn Operator>, BuildError> {
     let probe = null_probe_row(&child.schema())?;
 
@@ -2062,6 +2160,7 @@ fn build_correlated_scalars(
             None,
             budget,
             ctes,
+            session,
             Some((&probe, 0)),
         )?
         .schema();
@@ -2084,6 +2183,8 @@ fn build_correlated_scalars(
 
         let snapshot_for_factory = Rc::clone(&snapshot);
         let ctes_for_factory = Rc::clone(ctes);
+        // See the lateral factory: per-row rebuilds must stay in-session.
+        let session_for_factory = SessionRef::clone(session);
         let plan_for_factory = subplan;
         let factory: InnerFactory = Box::new(move |row_batch: &RecordBatch, idx: usize| {
             build_inner(
@@ -2092,6 +2193,7 @@ fn build_correlated_scalars(
                 None,
                 budget,
                 &ctes_for_factory,
+                &session_for_factory,
                 Some((row_batch, idx)),
             )
             .map_err(build_error_to_exec)
@@ -2106,7 +2208,9 @@ fn build_correlated_scalars(
             kind,
         });
     }
-    Ok(Box::new(CorrelatedScalar::new(child, subqueries)))
+    Ok(Box::new(
+        CorrelatedScalar::new(child, subqueries).in_session(SessionRef::clone(session)),
+    ))
 }
 
 /// A one-row, all-NULL batch shaped like `schema` — the probe a correlated
@@ -2806,6 +2910,7 @@ fn passthrough(schema: &SchemaRef, index: usize) -> Result<(Expr, String), Build
 fn materialize_window_args(
     child: Box<dyn Operator>,
     windows: &mut [Expr],
+    session: &SessionRef,
 ) -> Result<(Box<dyn Operator>, Option<WindowArgTrim>), BuildError> {
     let schema = child.schema();
     let base_width = schema.fields().len();
@@ -2845,7 +2950,13 @@ fn materialize_window_args(
         exprs.push(passthrough(&schema, i)?);
     }
     exprs.extend(extra);
-    Ok((Box::new(Project::new(child, exprs)?), Some(trim)))
+    // The materialized columns are the window arguments themselves — real
+    // expressions lifted out of the `Expr::Window`, not passthroughs — so this
+    // Project evaluates user SQL and needs the session like any other.
+    Ok((
+        Box::new(Project::new(child, exprs)?.in_session(SessionRef::clone(session))),
+        Some(trim),
+    ))
 }
 
 /// Drop the columns [`materialize_window_args`] appended, restoring the
@@ -3196,7 +3307,9 @@ mod tests {
         }];
         let child = build(&scan_plan(vec![ColId(0), ColId(1)], vec![]), &resolver()).unwrap();
         let before = child.schema();
-        let (child, trim) = materialize_window_args(child, &mut windows).unwrap();
+        let (child, trim) =
+            materialize_window_args(child, &mut windows, &crate::operator::default_session())
+                .unwrap();
         assert!(trim.is_none(), "nothing needed materializing");
         assert_eq!(child.schema(), before, "and nothing was wrapped");
     }

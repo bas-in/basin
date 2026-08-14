@@ -75,7 +75,7 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use basin_plan::{Datum, Expr, OpId};
 
 use crate::eval;
-use crate::operator::{ExecError, Operator};
+use crate::operator::{default_session, ExecError, Operator, SessionRef};
 
 /// Operator names (`pg_operator.oprname`, Postgres's own internal spelling)
 /// that **cannot** return NULL unless one of their operands is NULL. Every
@@ -261,11 +261,25 @@ fn expr_is_nullable(expr: &Expr, input: &Schema) -> bool {
 pub struct Filter {
     input: Box<dyn Operator>,
     predicate: Expr,
+    session: SessionRef,
 }
 
 impl Filter {
     pub fn new(input: Box<dyn Operator>, predicate: Expr) -> Self {
-        Self { input, predicate }
+        Self {
+            input,
+            predicate,
+            session: default_session(),
+        }
+    }
+
+    /// Evaluate this filter's predicate in `session` — the session's
+    /// `TimeZone` and clock, rather than [`SessionRef`]'s UTC-and-no-clock
+    /// default. See [`SessionRef`] for why this is a builder rather than a
+    /// constructor argument.
+    pub fn in_session(mut self, session: SessionRef) -> Self {
+        self.session = session;
+        self
     }
 }
 
@@ -281,7 +295,7 @@ impl Operator for Filter {
             return Ok(None);
         };
 
-        let predicate = eval::eval(&self.predicate, &batch)?;
+        let predicate = eval::eval_with(&self.predicate, &batch, &self.session)?;
         let predicate = predicate
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -326,6 +340,7 @@ pub struct Project {
     input: Box<dyn Operator>,
     exprs: Vec<(Expr, String)>,
     schema: SchemaRef,
+    session: SessionRef,
 }
 
 impl Project {
@@ -355,7 +370,19 @@ impl Project {
             input,
             exprs,
             schema: Arc::new(Schema::new(fields)),
+            session: default_session(),
         })
+    }
+
+    /// Evaluate this target list in `session`. See [`SessionRef`].
+    ///
+    /// The output *schema* is fixed at construction, deliberately without the
+    /// session: it comes from evaluating each expression against a zero-row
+    /// probe, and no `TimeZone` changes an expression's type — `date_trunc`
+    /// returns a timestamptz in every zone. Only the values move.
+    pub fn in_session(mut self, session: SessionRef) -> Self {
+        self.session = session;
+        self
     }
 }
 
@@ -371,7 +398,7 @@ impl Operator for Project {
 
         let mut arrays = Vec::with_capacity(self.exprs.len());
         for (expr, _name) in &self.exprs {
-            arrays.push(eval::eval(expr, &batch)?);
+            arrays.push(eval::eval_with(expr, &batch, &self.session)?);
         }
 
         let out = RecordBatch::try_new(Arc::clone(&self.schema), arrays)
