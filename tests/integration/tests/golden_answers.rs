@@ -310,6 +310,51 @@ fn nondeterministic_in_incumbent(sql: &str) -> Option<&'static str> {
             "ORDER BY is not a total order: three groups tie at count 1, and the tied rows came \
              back as (\\N, b, c) in one process and (b, c, \\N) in another",
         ),
+        // MEASURED, and the same defect as the entry above — this one was
+        // missed when the corpus was first recorded, and it cost a false
+        // divergence before it was found.
+        //
+        // The fixture is `(1,'a',1.5) … (100,NULL,NULL), (101,'a',10.5)`, so
+        // TWO of the five rows carry name='a'. `ORDER BY name` alone does not
+        // separate ids 1 and 101, and the projection is `id` — so the two
+        // orders are distinguishable in the output while both satisfy the
+        // statement. Measured on the live PostgreSQL 18.2 oracle over exactly
+        // these five rows: the answer is `100 1 101 2 3` when the rows sit in
+        // insert order and `100 101 1 2 3` after the identical rows are
+        // re-inserted in a shuffled order — 5 of 8 reshuffles flipped it.
+        // Nothing but physical row order changed.
+        //
+        // It had already produced a false failure: commit 037b7333 reports
+        // "a tie-order flip on a query whose ORDER BY is not total — proven
+        // not to be this patch, since the isolated probe serves it
+        // identically before and after", and flags this statement by number.
+        //
+        // WHY THE RUN-TWICE SELF-CHECK DID NOT CATCH IT — the part that
+        // generalises. `run_suite` executes each read-only statement twice and
+        // excludes it if the two disagree. Both executions share one process,
+        // one engine, one session, one set of files and one plan, and a sort's
+        // treatment of tied rows is a deterministic function of exactly those.
+        // So the check can only see per-EXECUTION nondeterminism (an RNG, a
+        // clock, a per-call hash seed); tie order is per-PROCESS or
+        // per-ENGINE, and is stable within a run by construction. That is a
+        // structural blind spot, not bad luck, and it covers every
+        // non-total-order statement in the corpus — which is why the corpus
+        // is audited for the defect directly (see
+        // `every_recorded_ordering_is_a_total_order`) rather than trusted to
+        // the self-check.
+        //
+        // Excluding loses no coverage: #0055 in the same area is
+        // `SELECT id FROM t ORDER BY name ASC NULLS FIRST, id DESC` — the same
+        // NULLS FIRST placement over the same rows, with the tiebreak that
+        // makes it a total order. The SQL here is replayed verbatim from
+        // `fallback_histogram.rs` and cannot be given a tiebreak without
+        // desyncing the two corpora.
+        "SELECT id FROM t ORDER BY name NULLS FIRST" => Some(
+            "ORDER BY is not a total order: ids 1 and 101 both have name='a', so the first two \
+             rows are order-undefined. PostgreSQL 18.2 on the identical five rows returned \
+             (100 1 101 2 3) and (100 101 1 2 3) depending only on physical row order; both \
+             satisfy the ORDER BY. #0055 covers the same NULLS FIRST semantics with a total order",
+        ),
         _ => None,
     }
 }
@@ -1764,4 +1809,169 @@ async fn golden_answers_match() {
         "{} of {compared} recorded answers changed (see the report above)",
         diverged.len()
     );
+}
+
+// ── Corpus audit: recorded row ORDER must be SQL-determined ──────────────────
+
+/// Load every golden block, keyed by `(suite, idx)`.
+fn load_golden() -> Vec<(String, Block)> {
+    let dir = golden_dir();
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".golden") {
+            continue;
+        }
+        let suite = name.split("--").next().unwrap().to_string();
+        let text = std::fs::read_to_string(entry.path()).unwrap();
+        for b in parse(&text, &suite, &name) {
+            out.push((name.clone(), b));
+        }
+    }
+    out.sort_by(|a, b| (&a.0, a.1.idx).cmp(&(&b.0, b.1.idx)));
+    out
+}
+
+/// Every statement in the corpus whose depth-0 `ORDER BY` is **not a total
+/// order over the fixture**, with the tie that makes it one.
+///
+/// A recorded `as-returned` answer is a claim that SQL determines the row
+/// order. When the ORDER BY leaves two output-distinguishable rows tied, that
+/// claim is false: both orders are correct answers, the engine picks one, and
+/// the golden file freezes the pick. Such a statement then flips on changes
+/// that did not touch it — #0054 already did exactly that (see
+/// `nondeterministic_in_incumbent`, and commit 037b7333, which had to prove a
+/// flip was *not* its own doing).
+///
+/// **This list is the output of a measured audit, not a guess.** Method: all
+/// 88 `as-returned` blocks that the recorder had written with `STATUS rows`
+/// were enumerated from the golden files. The 44 of them that run over the
+/// `base` (`t`, `u`) and `scale` (`big`) fixtures — the two that reproduce
+/// outside Basin — were replayed on the live PostgreSQL 18.2 oracle against
+/// the same rows in seven different physical orders (one insert-order table,
+/// six independent reshuffles). An ordering that is total returns byte-
+/// identical output every time; one that is not eventually flips its tied
+/// rows. Exactly ONE flipped: #0054. The remaining 44 (`catalog`, `rls`,
+/// `storage`, and the two set-operation shapes) were checked against their
+/// fixtures directly: every one orders by a key that is unique in its output
+/// — `id` over a distinct-id fixture, a `GROUP BY` / `DISTINCT ON` key, or an
+/// ORDER BY whose keys ARE the projection, so tied rows are byte-identical
+/// and their order is unobservable. Three blocks do repeat a leading output
+/// value (#0146 `UNION ALL`, #0213 `DISTINCT ON (tid, tag)`, scale #0020
+/// `ROLLUP`); each was checked and resolved — identical duplicate rows, a
+/// unique key further along, and the `count(*)` third sort key the corpus
+/// author added for precisely this reason.
+///
+/// Note that the PostgreSQL replay is a *lower bound*: it detects an ordering
+/// that PostgreSQL's own plans expose, and #0065 (already excluded, on
+/// measured evidence from Basin) does not flip under it. So it is the second
+/// check, over the fixtures, that carries the completeness claim.
+const NON_TOTAL_ORDER: &[(&str, &str)] = &[
+    (
+        "SELECT name, count(*) FROM t GROUP BY name ORDER BY count(*) DESC",
+        "three of the four groups tie at count 1 ('b', 'c' and the NULL group)",
+    ),
+    (
+        "SELECT id FROM t ORDER BY name NULLS FIRST",
+        "ids 1 and 101 both have name='a', and the projection is `id`, so the \
+         two possible orders are distinguishable in the output",
+    ),
+];
+
+/// The audit above covered this many recorded `as-returned` row answers. If
+/// the corpus grows, the new statement has to be audited too — this number is
+/// what forces that to be a decision rather than an oversight.
+const AUDITED_AS_RETURNED_ROW_BLOCKS: usize = 87;
+
+/// The corpus must not record a row order that SQL does not determine.
+///
+/// This is the check that catches the class the run-twice self-consistency
+/// check structurally cannot (see the note on `nondeterministic_in_incumbent`
+/// for `SELECT id FROM t ORDER BY name NULLS FIRST`): two consecutive
+/// in-process executions share the process, the engine and the plan, and a
+/// sort's treatment of tied rows is a deterministic function of exactly those,
+/// so they agree by construction no matter how undefined the order is.
+#[test]
+fn every_recorded_ordering_is_a_total_order() {
+    let golden = load_golden();
+    assert!(!golden.is_empty(), "no golden blocks parsed");
+
+    // 1. The harness must classify each non-total-order statement as having no
+    //    answer, so a re-record cannot quietly write one back.
+    for (sql, tie) in NON_TOTAL_ORDER {
+        assert!(
+            nondeterministic_in_incumbent(sql).is_some() || undetermined_by_sql(sql).is_some(),
+            "{sql:?} has no SQL-defined row order ({tie}) but the recorder would record one"
+        );
+    }
+
+    // 2. And the recorded corpus must agree: EXCLUDED, with a reason.
+    let mut seen = 0usize;
+    let mut as_returned_rows = 0usize;
+    for (file, b) in &golden {
+        // Mechanical invariant, checked on every block: the recorder's ORDER
+        // field must match what `has_top_level_order_by` says about the SQL. A
+        // mismatch means rows were left unsorted (or sorted) on a false
+        // premise, which is how an undefined order gets recorded in the first
+        // place.
+        let expect_order = if has_top_level_order_by(&b.sql) {
+            "as-returned"
+        } else {
+            "sorted"
+        };
+        assert_eq!(
+            b.order, expect_order,
+            "{file} #{:04}: ORDER says {:?} but the SQL says {expect_order:?} — {}",
+            b.idx, b.order, b.sql
+        );
+
+        if b.order == "as-returned" && matches!(b.outcome, Outcome::Rows { .. }) {
+            as_returned_rows += 1;
+        }
+
+        if let Some((_, tie)) = NON_TOTAL_ORDER.iter().find(|(s, _)| *s == b.sql) {
+            seen += 1;
+            match &b.outcome {
+                Outcome::Excluded(reason) => assert!(
+                    !reason.trim().is_empty(),
+                    "{file} #{:04}: excluded with no stated reason",
+                    b.idx
+                ),
+                other => panic!(
+                    "{file} #{:04} records a row order SQL does not determine ({tie}): {} \
+                     — recorded as {}, must be excluded",
+                    b.idx,
+                    b.sql,
+                    other.status()
+                ),
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        NON_TOTAL_ORDER.len(),
+        "the non-total-order list names statements the corpus no longer contains"
+    );
+
+    // 3. Every remaining as-returned row answer is one the audit cleared. A
+    //    new one is not covered by that audit, so it has to be audited.
+    assert_eq!(
+        as_returned_rows, AUDITED_AS_RETURNED_ROW_BLOCKS,
+        "the corpus records {as_returned_rows} `as-returned` row answers but the total-order \
+         audit covered {AUDITED_AS_RETURNED_ROW_BLOCKS}. Audit the new statement(s): does the \
+         fixture tie on the ORDER BY keys in a way the projection can see? If so add it to \
+         NON_TOTAL_ORDER with the tie; if not, raise this number."
+    );
+
+    // 4. No exclusion anywhere in the corpus may be silent.
+    for (file, b) in &golden {
+        if let Outcome::Excluded(reason) = &b.outcome {
+            assert!(
+                !reason.trim().is_empty(),
+                "{file} #{:04}: EXCLUDED with no reason — an exclusion without a stated reason \
+                 is a silent omission",
+                b.idx
+            );
+        }
+    }
 }

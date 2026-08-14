@@ -283,6 +283,26 @@ mod tests {
         );
     }
 
+    /// The other client-supplied-text-into-SQL path on this crate: a webhook
+    /// body. Unlike `parser::quote_sql_string` it needs no NUL guard, and
+    /// this test is why — `serde_json`'s serialiser escapes every control
+    /// character, so a `\u0000` in the body comes back out as the six-byte
+    /// escape and no raw `0x00` ever reaches the SQL text. Pinned rather than
+    /// assumed: if that ever stopped being true, this path would need the
+    /// same guard the parser has.
+    #[test]
+    fn build_jsonb_literal_never_emits_a_raw_nul() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"k":"a\u0000b"}"#).expect("valid JSON");
+        // The decoded value really does hold a NUL — the input is not inert.
+        assert_eq!(v["k"].as_str(), Some("a\0b"));
+        let lit = build_jsonb_literal(&v);
+        assert!(
+            !lit.contains('\0'),
+            "raw NUL spliced into SQL text: {lit:?}"
+        );
+        assert!(lit.contains(r"\u0000"), "expected the escape, got: {lit}");
+    }
+
     #[test]
     fn build_jsonb_literal_escapes_single_quotes() {
         // JSON string values CAN contain single-quotes (rare but possible via

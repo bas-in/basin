@@ -11,4 +11,19 @@ commit            037b73337e548962a4e3973566a34e14cef5ecbd
 statements        440
 files             45
 per_suite         {"base": 246, "catalog": 26, "errors": 34, "rls": 25, "scale": 49, "storage": 60}
-per_status        {"error": 32, "excluded": 18, "rows": 329, "tag": 61}
+per_status        {"error": 32, "excluded": 19, "rows": 328, "tag": 61}
+
+# AMENDMENT (one block, hand-edited; the recording itself is still the one
+# taken at the commit above).
+#
+# base #0054 `SELECT id FROM t ORDER BY name NULLS FIRST` was recorded as
+# `rows`. Its ORDER BY is not a total order — ids 1 and 101 both have
+# name='a' — so the recorded order was an engine choice, not an answer, and it
+# had already produced one false divergence (commit 037b7333). It is now
+# EXCLUDED with that reason, which moves per_status by one: excluded 18 -> 19,
+# rows 329 -> 328. The block was verified byte-identical to what
+# `record_golden_answers` now emits for it, by recording into a scratch
+# BASIN_GOLDEN_DIR and diffing; nothing else in the corpus was touched.
+#
+# `every_recorded_ordering_is_a_total_order` in golden_answers.rs pins this,
+# and audits the rest of the corpus for the same defect.

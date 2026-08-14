@@ -29,6 +29,35 @@
 //!    The escaping mirrors `basin_engine::prepared::quote_string` so REST
 //!    and pgwire have one set of rules.
 //!
+//! ## The NUL byte
+//!
+//! Quoting is not enough for one byte: `0x00`. PostgreSQL's `text` cannot
+//! represent it, and every PostgreSQL input path rejects it with
+//! `22021 invalid byte sequence for encoding "UTF8": 0x00` — which is what
+//! basin-router does at the pgwire boundary (`decode_param_text`,
+//! `decode_param_binary`, COPY). Arrow's `Utf8` *can* hold a NUL, so without
+//! a guard a `"\u0000"` in a JSON body, or a `%00` in a query string, would
+//! be spliced verbatim into generated SQL and stored — a value pgwire cannot
+//! read back and PostgreSQL would never have accepted.
+//!
+//! This surface does not speak SQLSTATE, so it uses the convention every
+//! other malformed request here uses: [`ApiError::invalid`], i.e.
+//! `400 Bad Request` with `{"code": "E_INVALID_REQUEST", "message": …}`.
+//! That matches PostgREST, which binds values as parameters, lets
+//! PostgreSQL raise `22021`, and maps data-exception SQLSTATEs to
+//! `400`. The message carries PostgreSQL's own wording so the two Basin
+//! surfaces are recognisably rejecting the same thing.
+//!
+//! The guard sits at the *splice site* ([`quote_sql_string`]), not at the
+//! parse sites: `render_literal` is the single funnel through which every
+//! user-supplied string — filter value, `in.(…)` element, INSERT/PATCH body
+//! value, RPC argument — becomes SQL text, so one check covers all of them
+//! and a new call site cannot miss it. Identifiers (table, projection,
+//! filter column, `order` column, PATCH/INSERT keys, RPC function name) are
+//! already NUL-free by construction: they go through
+//! [`basin_common::Ident::new`], whose `[A-Za-z_][A-Za-z0-9_]*` whitelist
+//! has no room for `0x00`.
+//!
 //! Property: identical results to the equivalent pgwire query, given the
 //! same body. The integration test `crud_round_trip` exercises this.
 
@@ -389,7 +418,7 @@ pub(crate) fn build_update_sql(
         first = false;
         sql.push_str(&col);
         sql.push_str(" = ");
-        sql.push_str(&render_literal(&lit));
+        sql.push_str(&render_literal(&lit)?);
     }
     write_where(&mut sql, &query.filters)?;
     Ok(sql)
@@ -442,7 +471,7 @@ pub(crate) fn build_insert_sql(
             if vi > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(&render_literal(v));
+            sql.push_str(&render_literal(v)?);
         }
         sql.push(')');
     }
@@ -472,42 +501,42 @@ fn write_where_with_cursor(
             sql.push_str(" AND ");
         }
         first = false;
-        write_filter(sql, f);
+        write_filter(sql, f)?;
     }
     Ok(())
 }
 
-fn write_filter(sql: &mut String, f: &Filter) {
+fn write_filter(sql: &mut String, f: &Filter) -> std::result::Result<(), ApiError> {
     match &f.op {
         FilterOp::Eq(v) => {
             sql.push_str(&f.column);
             sql.push_str(" = ");
-            sql.push_str(&render_literal(v));
+            sql.push_str(&render_literal(v)?);
         }
         FilterOp::Neq(v) => {
             sql.push_str(&f.column);
             sql.push_str(" <> ");
-            sql.push_str(&render_literal(v));
+            sql.push_str(&render_literal(v)?);
         }
         FilterOp::Gt(v) => {
             sql.push_str(&f.column);
             sql.push_str(" > ");
-            sql.push_str(&render_literal(v));
+            sql.push_str(&render_literal(v)?);
         }
         FilterOp::Gte(v) => {
             sql.push_str(&f.column);
             sql.push_str(" >= ");
-            sql.push_str(&render_literal(v));
+            sql.push_str(&render_literal(v)?);
         }
         FilterOp::Lt(v) => {
             sql.push_str(&f.column);
             sql.push_str(" < ");
-            sql.push_str(&render_literal(v));
+            sql.push_str(&render_literal(v)?);
         }
         FilterOp::Lte(v) => {
             sql.push_str(&f.column);
             sql.push_str(" <= ");
-            sql.push_str(&render_literal(v));
+            sql.push_str(&render_literal(v)?);
         }
         FilterOp::In(items) => {
             sql.push_str(&f.column);
@@ -516,7 +545,7 @@ fn write_filter(sql: &mut String, f: &Filter) {
                 if j > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&render_literal(it));
+                sql.push_str(&render_literal(it)?);
             }
             sql.push(')');
         }
@@ -529,27 +558,52 @@ fn write_filter(sql: &mut String, f: &Filter) {
             sql.push_str(" IS NOT NULL");
         }
     }
+    Ok(())
 }
+
+/// PostgreSQL's own message for a NUL byte in text input, reused verbatim so
+/// the REST rejection and the pgwire rejection (`basin_router`'s
+/// `NUL_MESSAGE`, SQLSTATE `22021`) are recognisably the same refusal. This
+/// surface reports it as `400 E_INVALID_REQUEST` rather than a SQLSTATE —
+/// see the module docs.
+pub(crate) const NUL_MESSAGE: &str = r#"invalid byte sequence for encoding "UTF8": 0x00"#;
 
 /// Render a [`Literal`] as a SQL value. Strings get single-quoted with
 /// internal `'` doubled — the standard SQL escape, matching
 /// `basin_engine::prepared::quote_string`.
-pub(crate) fn render_literal(v: &Literal) -> String {
-    match v {
+///
+/// Fallible because of the NUL byte: this is the single funnel every
+/// user-supplied string passes through on its way into generated SQL, so it
+/// is where the value is refused.
+pub(crate) fn render_literal(v: &Literal) -> std::result::Result<String, ApiError> {
+    Ok(match v {
         Literal::Null => "NULL".into(),
         Literal::Bool(true) => "TRUE".into(),
         Literal::Bool(false) => "FALSE".into(),
         Literal::Int(n) => n.to_string(),
+        // `Float` is only ever built from a string that round-tripped through
+        // `f64::from_str` or `serde_json::Number`, neither of which accepts a
+        // NUL, so there is nothing to check here.
         Literal::Float(s) => s.clone(),
-        Literal::Text(s) => quote_sql_string(s),
-    }
+        Literal::Text(s) => quote_sql_string(s)?,
+    })
 }
 
 /// SQL string literal: wrap in `'…'`, double internal quotes. The engine
 /// uses the same routine for prepared-statement substitution; keeping them
 /// aligned means a REST query and a pgwire query for the same value produce
 /// the same SQL.
-pub(crate) fn quote_sql_string(s: &str) -> String {
+///
+/// Rejects an embedded NUL rather than quoting it: quoting makes the byte
+/// syntactically inert but PostgreSQL's `text` still cannot hold it, so
+/// splicing it would store a value pgwire could never read back. See the
+/// module docs for why this is a `400` and not a SQLSTATE.
+pub(crate) fn quote_sql_string(s: &str) -> std::result::Result<String, ApiError> {
+    if let Some(at) = s.find('\0') {
+        return Err(ApiError::invalid(format!(
+            "{NUL_MESSAGE} (embedded NUL at byte {at} of a text value)"
+        )));
+    }
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -561,7 +615,7 @@ pub(crate) fn quote_sql_string(s: &str) -> String {
         }
     }
     out.push('\'');
-    out
+    Ok(out)
 }
 
 /// Convert a [`serde_json::Value`] to a [`Literal`] for the INSERT/PATCH paths.
@@ -655,11 +709,135 @@ mod tests {
 
     #[test]
     fn quote_sql_string_doubles_internal_quotes() {
-        assert_eq!(quote_sql_string("o'reilly"), "'o''reilly'");
+        assert_eq!(quote_sql_string("o'reilly").unwrap(), "'o''reilly'");
         assert_eq!(
-            quote_sql_string("'; DROP TABLE x; --"),
+            quote_sql_string("'; DROP TABLE x; --").unwrap(),
             "'''; DROP TABLE x; --'"
         );
+    }
+
+    // ---- The NUL byte -----------------------------------------------------
+    //
+    // PostgreSQL's `text` cannot hold `0x00` and rejects it at every input
+    // path with `22021 invalid byte sequence for encoding "UTF8": 0x00`;
+    // basin-router does the same at the pgwire boundary. Arrow's `Utf8` can
+    // hold it, so before these tests a `\u0000` in a JSON body or a `%00` in
+    // a query string went straight into generated SQL. This surface reports
+    // it the way it reports every other malformed request — 400 with
+    // `E_INVALID_REQUEST` — which is also what PostgREST returns, since it
+    // maps PostgreSQL's data-exception SQLSTATEs to 400.
+
+    /// Every rejection below must be *this* error, not some other 400.
+    fn assert_nul_rejection(err: &ApiError) {
+        assert_eq!(err.code, crate::errors::ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.code.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a NUL from a client is a client error"
+        );
+        assert!(
+            err.message.contains(NUL_MESSAGE),
+            "message should carry PostgreSQL's wording, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn quote_sql_string_rejects_embedded_nul() {
+        let err = quote_sql_string("a\0b").unwrap_err();
+        assert_nul_rejection(&err);
+        // A leading and a trailing NUL are the same defect.
+        assert_nul_rejection(&quote_sql_string("\0").unwrap_err());
+        assert_nul_rejection(&quote_sql_string("trailing\0").unwrap_err());
+    }
+
+    #[test]
+    fn render_literal_rejects_nul_only_in_text() {
+        assert_nul_rejection(&render_literal(&Literal::Text("x\0y".into())).unwrap_err());
+        // The non-text variants cannot carry one, and must keep working.
+        assert_eq!(render_literal(&Literal::Null).unwrap(), "NULL");
+        assert_eq!(render_literal(&Literal::Int(7)).unwrap(), "7");
+        assert_eq!(render_literal(&Literal::Bool(true)).unwrap(), "TRUE");
+        assert_eq!(
+            render_literal(&Literal::Float("1.5".into())).unwrap(),
+            "1.5"
+        );
+    }
+
+    /// A `%00` in a query string reaches `parse_literal` as a real NUL.
+    #[test]
+    fn select_filter_value_with_nul_is_rejected() {
+        let q = q(&[("name", "eq.a\0b")]);
+        let err = build_select_sql("t", &q, 100, 1000).unwrap_err();
+        assert_nul_rejection(&err);
+    }
+
+    #[test]
+    fn in_list_element_with_nul_is_rejected() {
+        let q = q(&[("name", "in.(ok,bad\0)")]);
+        let err = build_select_sql("t", &q, 100, 1000).unwrap_err();
+        assert_nul_rejection(&err);
+    }
+
+    #[test]
+    fn delete_filter_value_with_nul_is_rejected() {
+        let q = q(&[("name", "eq.\0")]);
+        let err = build_delete_sql("t", &q).unwrap_err();
+        assert_nul_rejection(&err);
+    }
+
+    #[test]
+    fn patch_body_value_with_nul_is_rejected() {
+        let q = q(&[("id", "eq.1")]);
+        let body = serde_json::json!({ "name": "a\u{0000}b" });
+        let err = build_update_sql("t", &q, &body).unwrap_err();
+        assert_nul_rejection(&err);
+    }
+
+    #[test]
+    fn insert_row_value_with_nul_is_rejected() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let rows = vec![vec![Literal::Int(1), Literal::Text("a\0".into())]];
+        let err = build_insert_sql("t", &cols, &rows).unwrap_err();
+        assert_nul_rejection(&err);
+    }
+
+    /// `serde_json` decodes `\u0000` to a real NUL, so a JSON body is a live
+    /// route for one; `json_to_literal` must hand it on as `Text` and the
+    /// splice site must refuse it.
+    #[test]
+    fn json_u0000_escape_reaches_the_guard() {
+        let v: serde_json::Value = serde_json::from_str(r#""a\u0000b""#).expect("valid JSON");
+        let lit = json_to_literal(&v).expect("classified as text");
+        assert_eq!(lit, Literal::Text("a\0b".to_string()));
+        assert_nul_rejection(&render_literal(&lit).unwrap_err());
+    }
+
+    /// The identifier paths — table, projection, filter column, `order`
+    /// column, PATCH key — were already closed by `Ident::new`'s whitelist.
+    /// Pin it, so the guard cannot be dropped from under them.
+    #[test]
+    fn identifier_paths_reject_nul() {
+        assert!(validate_ident("na\0me").is_err());
+        assert!(build_select_sql("ta\0ble", &Query::default(), 100, 1000).is_err());
+        assert!(parse_query([("na\0me", "eq.1")]).is_err());
+        assert!(parse_query([("select", "id,na\0me")]).is_err());
+        assert!(parse_query([("order", "na\0me.asc")]).is_err());
+        let q = q(&[("id", "eq.1")]);
+        assert!(build_update_sql("t", &q, &serde_json::json!({ "na\u{0000}me": 1 })).is_err());
+    }
+
+    /// A NUL must not be *quoted through* — the guard has to fire before the
+    /// escaping loop, or the byte lands inside a string literal where it is
+    /// syntactically inert but still unrepresentable in PostgreSQL `text`.
+    #[test]
+    fn no_generated_sql_ever_contains_a_nul() {
+        let bad = q(&[("name", "eq.a\0b")]);
+        assert!(build_select_sql("t", &bad, 100, 1000).is_err());
+        // And the successful paths stay NUL-free, trivially.
+        let ok = q(&[("name", "eq.plain")]);
+        let sql = build_select_sql("t", &ok, 100, 1000).unwrap();
+        assert!(!sql.contains('\0'));
     }
 
     #[test]

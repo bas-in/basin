@@ -97,14 +97,8 @@ QUERY 0054
 AREA NULL semantics
 SQL SELECT id FROM t ORDER BY name NULLS FIRST
 ORDER as-returned
-STATUS rows
-COL id	Int64	notnull
-NROWS 5
-ROW 100
-ROW 1
-ROW 101
-ROW 2
-ROW 3
+STATUS excluded
+EXCLUDED ORDER BY is not a total order: ids 1 and 101 both have name='a', so the first two rows are order-undefined. PostgreSQL 18.2 on the identical five rows returned (100 1 101 2 3) and (100 101 1 2 3) depending only on physical row order; both satisfy the ORDER BY. #0055 covers the same NULLS FIRST semantics with a total order
 END
 
 QUERY 0055

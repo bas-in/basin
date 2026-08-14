@@ -136,13 +136,13 @@ async fn build_rpc_sql(
                     Some(v) => json_to_literal(v),
                     None => Ok(crate::parser::Literal::Null),
                 };
-                lit.map(|l| render_literal(&l))
+                lit.and_then(|l| render_literal(&l))
             })
             .collect::<Result<Vec<_>, _>>()?
     } else {
         // No catalog entry — fall back to insertion order.
         args.values()
-            .map(|v| json_to_literal(v).map(|l| render_literal(&l)))
+            .map(|v| json_to_literal(v).and_then(|l| render_literal(&l)))
             .collect::<Result<Vec<_>, _>>()?
     };
 
