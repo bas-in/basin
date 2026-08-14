@@ -70,6 +70,64 @@
 //! `Unsupported` is the one to watch: it is exactly "resolved fine, but
 //! nothing downstream builds it yet", which is a to-do list, not noise.
 //!
+//! # Declining versus failing: the retry contract
+//!
+//! Everything above describes *why* an attempt did not serve the statement.
+//! The caller needs an answer to a different and much sharper question, and
+//! conflating the two is a data-loss bug waiting for a call-site change:
+//! **is it safe to run this statement again somewhere else?**
+//!
+//! Those are not the same question, and the stage that raised the error does
+//! not answer it. A [`Fallback::Exec`] raised before anything was written is
+//! perfectly safe to retry; a [`Fallback::Build`] raised *after* something
+//! was written is not. Only one fact decides it — has this attempt published
+//! anything a second execution would apply twice — and that fact is tracked
+//! by [`SideEffects`], a one-way latch threaded through [`try_execute_inner`].
+//!
+//! [`try_execute`] used to return `Option<ExecResult>`, and `None` meant both
+//! "declined, nothing happened" and "attempted, then failed". For a `SELECT`
+//! those coincide (see below), so the conflation cost nothing — but the whole
+//! reason `try_execute_inner` already lowers `INSERT`/`UPDATE`/`DELETE` is
+//! that a future call site will widen `executor.rs`'s `matches!(kind,
+//! StmtKind::Select)` gate, and on that day a mid-execution failure would
+//! have made the incumbent path re-execute a statement this one had already
+//! half-written. It returns [`Outcome`] instead:
+//!
+//! - [`Outcome`] is opaque, and [`Outcome::into_result`] is the only way to
+//!   get anything out of it. It renders a failed attempt as `Err`, so the
+//!   idiomatic call site — `try_execute(..).await.into_result()?` — propagates
+//!   it. Under the old shape the *idiomatic* call site (`if let Some(r) = ..`)
+//!   silently retried it. Making the safe thing the default thing is the
+//!   point: retrying an unsafe outcome now takes deliberately-written extra
+//!   code (`.ok()`, `unwrap_or`, an `Err(_) => {}` arm) rather than the
+//!   shortest expression that compiles.
+//! - The decision itself is not the call site's to make. [`classify`] takes
+//!   the [`SideEffects`] ledger and the [`Fallback`], and a caller cannot
+//!   receive a retryable answer once anything has been published, whatever it
+//!   does next. This is the same standard as decision 3 below
+//!   ([`is_side_effect_free`]): a structural guard, not a comment asking the
+//!   next author to remember.
+//!
+//! **Today nothing on this path can publish anything**, and that is a
+//! measured property, not an aspiration: `try_execute_inner` passes `None`
+//! as `build_in_session`'s `Option<&dyn DmlResolver>`, so every DML plan dies
+//! at `BuildError::Unsupported("… (no write resolver configured)")` before an
+//! operator is built. [`SideEffects::note_published`] therefore has no
+//! production caller yet — it is the seam the storage-backed staging sink
+//! must call *before* its first storage write or catalog commit, and until it
+//! does, [`classify`] returns `Declined` for every fallback and routing is
+//! byte-for-byte what it was.
+//!
+//! The same reasoning covers the read side, where the question is "could the
+//! client already have seen rows from the attempt that then failed?" It could
+//! not. `try_execute_inner` accumulates the whole result into a `Vec` and
+//! constructs `ExecResult::Rows` only after `Operator::next_batch` has
+//! returned `Ok(None)`; a mid-drain `Err` drops every accumulated batch and
+//! the caller is handed no `ExecResult` at all. Nothing is streamed, so a
+//! partially-emitted result set is not a state this bridge can be in, and
+//! every `exec_error` in the histogram is by construction raised before any
+//! output was produced.
+//!
 //! # Resolving against the real catalogs, safely
 //!
 //! [`RealOperators`] and [`RealFunctions`] resolve against
@@ -231,7 +289,7 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field};
 use pg_query::protobuf::{node::Node as NodeEnum, Node, SelectStmt, SetOperation, WithClause};
 
-use basin_common::{ProjectId, TableName};
+use basin_common::{BasinError, ProjectId, TableName};
 use basin_exec::build::{BuildError, ScanPushdown, TableResolver as ExecTableResolver};
 use basin_exec::operator::ExecError;
 use basin_exec::scan::BatchSource;
@@ -267,25 +325,28 @@ pub(crate) fn shadow_compare_enabled() -> bool {
 /// Attempt to serve `stmt_node` (a single `SELECT` statement's already-parsed
 /// `pg_query` node, as classified by the caller) through the owned pipeline.
 ///
-/// `Some(result)` only on genuine success; `None` in every other case
-/// (disabled, ineligible, or any lowering/build/exec failure) — the caller
-/// treats `None` identically to "this module was never called" and falls
-/// through to the existing DataFusion path unchanged. Every `None` is logged
-/// at debug with its reason so the served-vs-fallback ratio (the counters
-/// this bumps) can be explained, not just observed.
+/// Returns an [`Outcome`], which answers both "did this produce a result?"
+/// and — the question that actually matters to the caller — "is it safe to
+/// run this statement again somewhere else?". See the module docs' "Declining
+/// versus failing" for why those are two questions and why the second one is
+/// answered here rather than at the call site. Every non-served path is
+/// logged at debug with its reason so the served-vs-fallback ratio (the
+/// counters this bumps) can be explained, not just observed.
 ///
 /// `sql` is the original statement text, needed only for the shadow-compare
 /// mode (see the module docs) to re-run the same statement through
 /// [`crate::executor::exec_select`] — it is otherwise unused, since every
 /// other part of this bridge works from the already-parsed `stmt_node`.
-pub(crate) async fn try_execute(
-    sess: &ProjectSession,
-    stmt_node: &Node,
-    sql: &str,
-) -> Option<ExecResult> {
+pub(crate) async fn try_execute(sess: &ProjectSession, stmt_node: &Node, sql: &str) -> Outcome {
     if !enabled() {
-        return None;
+        return Outcome::declined();
     }
+
+    // What this attempt has published, i.e. what a retry elsewhere would
+    // apply a second time. Created empty here and threaded into
+    // `try_execute_inner`, so that every `Err` below is classified against
+    // what actually happened rather than against which stage raised it.
+    let mut effects = SideEffects::none();
 
     // A transaction may hold this session's own uncommitted writes; the
     // owned path's `StorageTableResolver` only ever sees committed cold
@@ -295,26 +356,161 @@ pub(crate) async fn try_execute(
     // hot-tier footprint yet (e.g. a fresh `CREATE TABLE` + `INSERT` still
     // inside the same `BEGIN`).
     if crate::session::tx_is_active(&sess.state) {
-        record_fallback(
-            sess,
-            &Fallback::Ineligible("inside an explicit transaction"),
-        );
-        return None;
+        let reason = Fallback::Ineligible("inside an explicit transaction");
+        record_fallback(sess, &reason, &effects);
+        return classify(reason, &effects);
     }
 
-    match try_execute_inner(sess, stmt_node).await {
+    match try_execute_inner(sess, stmt_node, &mut effects).await {
         Ok(result) => {
             sess.engine.note_owned_engine_served();
             tracing::debug!(target: "basin_engine::owned_engine", "owned engine served a SELECT");
             if shadow_compare_enabled() {
                 shadow_compare(sess, stmt_node, sql, &result).await;
             }
-            Some(result)
+            Outcome::served(result)
         }
         Err(reason) => {
-            record_fallback(sess, &reason);
-            None
+            record_fallback(sess, &reason, &effects);
+            classify(reason, &effects)
         }
+    }
+}
+
+/// What one attempt at the owned pipeline produced, and the only source of
+/// the caller's answer to "may I run this statement again somewhere else?".
+///
+/// Deliberately an opaque newtype rather than a three-variant `enum` the
+/// caller can `match` on. There is exactly one accessor,
+/// [`Outcome::into_result`], and it renders an unsafe outcome as `Err` — so
+/// the shortest call-site expression that compiles is also the one that
+/// propagates the failure instead of retrying it. See the module docs'
+/// "Declining versus failing".
+#[must_use = "an owned-engine outcome that is dropped is a silently discarded \
+              answer — and dropping a failed one is exactly the double-write \
+              this type exists to prevent"]
+pub(crate) struct Outcome(OutcomeInner);
+
+/// The three states an [`Outcome`] can be in. Private to this module on
+/// purpose: making the variants reachable from `executor.rs` would put the
+/// retry decision back at the call site, which is the shape this type
+/// replaced.
+enum OutcomeInner {
+    /// Nothing happened. Safe to run this statement anywhere else, because
+    /// this attempt published nothing a second execution would duplicate.
+    Declined,
+    /// The owned pipeline answered the statement. This is the answer.
+    Served(ExecResult),
+    /// The owned pipeline attempted the statement, published something, and
+    /// then failed. This error IS the answer to the client — the statement
+    /// must not be re-executed, because the published part would be applied
+    /// twice.
+    Failed(BasinError),
+}
+
+impl Outcome {
+    /// Nothing happened; the caller may fall through to the incumbent path.
+    fn declined() -> Self {
+        Outcome(OutcomeInner::Declined)
+    }
+
+    /// The owned pipeline's answer.
+    fn served(result: ExecResult) -> Self {
+        Outcome(OutcomeInner::Served(result))
+    }
+
+    /// An attempt that published something and then failed. Constructed only
+    /// by [`classify`], and only when [`SideEffects`] says something was
+    /// published — never from an error type alone, because "which stage
+    /// failed" does not determine whether a retry is safe.
+    fn failed(error: BasinError) -> Self {
+        Outcome(OutcomeInner::Failed(error))
+    }
+
+    /// Consume the outcome: `Ok(Some(result))` to answer the client,
+    /// `Ok(None)` to fall through to the incumbent path, `Err(e)` when the
+    /// statement must not be retried and this error is the answer.
+    ///
+    /// The only accessor, and the whole point of the type. A call site that
+    /// writes `try_execute(..).await.into_result()?` cannot retry a failed
+    /// attempt; one that wants to would have to reach for `.ok()`,
+    /// `unwrap_or`, or an explicit `Err(_) => {}` arm, none of which anyone
+    /// writes by accident. `executor.rs`'s single call site is pinned to the
+    /// propagating form by a test in this file.
+    pub(crate) fn into_result(self) -> Result<Option<ExecResult>, BasinError> {
+        match self.0 {
+            OutcomeInner::Declined => Ok(None),
+            OutcomeInner::Served(result) => Ok(Some(result)),
+            OutcomeInner::Failed(error) => Err(error),
+        }
+    }
+}
+
+/// Whether this attempt has published anything a re-execution would apply a
+/// second time — the one fact that decides whether a [`Fallback`] is safe to
+/// retry.
+///
+/// A one-way latch holding *what* was published, not just that something was,
+/// so the error the client eventually sees can name it. It is threaded by
+/// `&mut` rather than returned, because it has to survive the `Err` path: an
+/// error type that carried it could be constructed by any of the three
+/// crates this bridge calls into, none of which know what this one has
+/// written.
+#[derive(Debug)]
+struct SideEffects {
+    published: Option<&'static str>,
+}
+
+impl SideEffects {
+    /// A fresh attempt, having published nothing.
+    fn none() -> Self {
+        SideEffects { published: None }
+    }
+
+    /// Record that this attempt has published something a retry would apply
+    /// twice — a data file written to storage, a catalog commit, an
+    /// allocated sequence value.
+    ///
+    /// **Call this BEFORE the write it describes, not after.** A process that
+    /// dies between the write and this call is the exact case the ordering
+    /// protects against; recording it first can only cost a spurious refusal
+    /// to retry, and recording it second can cost the write twice.
+    ///
+    /// One-way: the first thing published is what the error names, because
+    /// that is the earliest point at which a retry became unsafe. There is no
+    /// un-publish.
+    ///
+    /// No production caller today, by construction rather than by oversight:
+    /// `try_execute_inner` hands `build_in_session` a `None` DML resolver, so
+    /// nothing downstream of this module can write. This is the seam the
+    /// storage-backed staging sink plugs into (see the module docs'
+    /// "Declining versus failing"), and the tests below pin the behaviour it
+    /// will get when it does.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn note_published(&mut self, what: &'static str) {
+        if self.published.is_none() {
+            self.published = Some(what);
+        }
+    }
+
+    /// What this attempt published, if anything.
+    fn published(&self) -> Option<&'static str> {
+        self.published
+    }
+}
+
+/// Turn a [`Fallback`] into the [`Outcome`] the caller is allowed to see.
+///
+/// This is the structural guard the module docs' "Declining versus failing"
+/// describes, and it is deliberately a pure function of the ledger rather
+/// than a rule the call site is asked to remember: while `effects` is clean
+/// every fallback is `Declined` and the caller falls through exactly as it
+/// always has; from the first [`SideEffects::note_published`] onward, no
+/// fallback can produce a retryable answer no matter which stage raised it.
+fn classify(reason: Fallback, effects: &SideEffects) -> Outcome {
+    match effects.published() {
+        None => Outcome::declined(),
+        Some(published) => Outcome::failed(reason.into_error_after_publishing(published)),
     }
 }
 
@@ -323,16 +519,34 @@ pub(crate) async fn try_execute(
 /// every non-served path (the transaction guard included) funnels through,
 /// so the two counters can never drift apart and every decline is logged
 /// exactly once. See the module docs' "Reporting why, not just how many".
-fn record_fallback(sess: &ProjectSession, reason: &Fallback) {
+///
+/// `effects` is here only so the log can tell the truth. "Fell back to
+/// DataFusion" is what happens while nothing has been published, and it is
+/// flatly false once something has — that attempt failed and the statement
+/// was not re-run — so the message says which of the two it was rather than
+/// asserting the common one. The counters are bumped either way: a
+/// post-publish failure is at least as worth steering on as a decline, and
+/// splitting the histogram would make the ratio it exists to report
+/// incomparable with every earlier measurement of it.
+fn record_fallback(sess: &ProjectSession, reason: &Fallback, effects: &SideEffects) {
     sess.engine.note_owned_engine_fallback();
     sess.engine
         .note_owned_engine_fallback_reason(reason.reason_kind());
-    tracing::debug!(
-        target: "basin_engine::owned_engine",
-        reason = %reason,
-        category = ?reason.reason_kind(),
-        "owned engine fell back to DataFusion"
-    );
+    match effects.published() {
+        None => tracing::debug!(
+            target: "basin_engine::owned_engine",
+            reason = %reason,
+            category = ?reason.reason_kind(),
+            "owned engine fell back to DataFusion"
+        ),
+        Some(published) => tracing::error!(
+            target: "basin_engine::owned_engine",
+            reason = %reason,
+            category = ?reason.reason_kind(),
+            published = %published,
+            "owned engine failed AFTER publishing; the statement was not retried"
+        ),
+    }
 }
 
 /// Why the owned path did not serve the statement. Distinct from a single
@@ -387,6 +601,36 @@ impl Fallback {
             Fallback::Build(BuildError::Exec(_)) => FallbackReasonKind::ExecError,
             Fallback::Build(_) => FallbackReasonKind::BuildError,
             Fallback::Exec(_) => FallbackReasonKind::ExecError,
+        }
+    }
+
+    /// The error the client sees when this fallback arrived too late to be
+    /// one — i.e. after the attempt had already published `published`, so the
+    /// statement cannot be handed to the incumbent path instead. See
+    /// [`classify`], its only caller.
+    ///
+    /// Every message says what was published and that no retry happened,
+    /// because the alternative reading of a bare "internal error" here is
+    /// "the statement did nothing", and that would be false: some of it
+    /// landed. The two `ExecError`s with an established SQLSTATE keep it
+    /// ([`BasinError::QueryCanceled`] is 57014,
+    /// [`BasinError::CardinalityViolation`] is 21000); everything else is
+    /// `Internal` rather than guessing, and the constraint-violation
+    /// plumbing a real write path needs is P4's, not this function's.
+    fn into_error_after_publishing(self, published: &'static str) -> BasinError {
+        let context = format!(
+            "the owned engine failed after it had already published {published}; \
+             the statement was NOT retried on the incumbent path, because \
+             re-executing it would apply that a second time"
+        );
+        match self {
+            Fallback::Exec(ExecError::Cancelled) => {
+                BasinError::QueryCanceled(format!("{context}: {}", ExecError::Cancelled))
+            }
+            Fallback::Exec(ExecError::CardinalityViolation(detail)) => {
+                BasinError::CardinalityViolation(format!("{context}: {detail}"))
+            }
+            other => BasinError::Internal(format!("{context}: {other}")),
         }
     }
 }
@@ -1017,9 +1261,19 @@ pub fn compare_shadow_results(
     compare_results(select, owned, reference)
 }
 
+/// One attempt, from parse tree to `ExecResult`.
+///
+/// `effects` is this attempt's side-effect ledger (see [`SideEffects`] and
+/// the module docs' "Declining versus failing"). Nothing here writes anything
+/// today, so nothing here touches it — the parameter exists because the
+/// storage-backed staging sink will, and the day it does, every `Err` this
+/// function returns after that point stops being retryable without a single
+/// change at the call site. It is `&mut` and not a return value precisely
+/// because it has to survive the `?`s below.
 async fn try_execute_inner(
     sess: &ProjectSession,
     stmt_node: &Node,
+    effects: &mut SideEffects,
 ) -> Result<ExecResult, Fallback> {
     let resolver = build_resolver(sess, stmt_node).await?;
 
@@ -1081,7 +1335,28 @@ async fn try_execute_inner(
         match op.next_batch() {
             Ok(Some(batch)) => batches.push(batch),
             Ok(None) => break,
-            Err(e) => return Err(Fallback::Exec(e)),
+            // This is where every `exec_error` in the fallback histogram is
+            // raised, and it is worth being explicit about what has and has
+            // not happened at this point, because "the statement failed
+            // part-way through" reads like a correctness question even for a
+            // read. Rows are ACCUMULATED, not streamed: `batches` is a local
+            // that is dropped right here, `ExecResult::Rows` is constructed
+            // only below (after `Ok(None)`), and the caller therefore
+            // receives no result at all — so a client cannot have seen a
+            // partial result set that a retry would then repeat or contradict.
+            // The ledger is only consulted, never updated: whether this is
+            // retryable is decided by what was published EARLIER in this
+            // attempt, not by the fact that the drain is what failed.
+            Err(e) => {
+                tracing::debug!(
+                    target: "basin_engine::owned_engine",
+                    published = ?effects.published(),
+                    discarded_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    "owned engine failed mid-drain; the partial result is discarded here and \
+                     never reached the client"
+                );
+                return Err(Fallback::Exec(e));
+            }
         }
     }
 
@@ -1820,6 +2095,177 @@ mod tests {
             Fallback::Exec(ExecError::Cancelled).reason_kind(),
             FallbackReasonKind::ExecError
         );
+    }
+
+    // ── The retry contract: declined vs failed ───────────────────────────
+    //
+    // See the module docs' "Declining versus failing". These are the tests
+    // that have to survive the day someone widens `executor.rs`'s
+    // `matches!(kind, StmtKind::Select)` gate: on that day a mid-execution
+    // failure stops being a wasted retry and becomes a double-write, and the
+    // only thing standing between the two is that `classify` cannot hand back
+    // a retryable answer once anything has been published.
+
+    /// One of each [`Fallback`] shape, so the properties below are stated
+    /// over the whole type rather than over whichever variant came to mind.
+    ///
+    /// The `match` at the bottom is the exhaustiveness lock: adding a variant
+    /// to `Fallback` fails to compile here, which is what brings the next
+    /// author to this list and to the two properties that read from it.
+    fn one_of_each_fallback() -> Vec<Fallback> {
+        let all = vec![
+            Fallback::Ineligible("a table this bridge declines"),
+            Fallback::Lower(LowerError::Unsupported("some construct".into())),
+            Fallback::Build(BuildError::Unsupported("some operator".into())),
+            Fallback::Exec(ExecError::Internal("something broke mid-drain".into())),
+            Fallback::Exec(ExecError::Cancelled),
+            Fallback::Exec(ExecError::CardinalityViolation("more than one row".into())),
+        ];
+        for reason in &all {
+            match reason {
+                Fallback::Ineligible(_) => {}
+                Fallback::Lower(_) => {}
+                Fallback::Build(_) => {}
+                Fallback::Exec(_) => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn while_nothing_is_published_every_fallback_is_a_retryable_decline() {
+        let clean = SideEffects::none();
+        assert!(clean.published().is_none());
+        for reason in one_of_each_fallback() {
+            let rendered = reason.to_string();
+            let outcome = classify(reason, &clean);
+            assert!(
+                matches!(outcome.into_result(), Ok(None)),
+                "{rendered} must decline (and so stay retryable on the incumbent path) \
+                 while this attempt has published nothing — anything else would change \
+                 today's SELECT routing"
+            );
+        }
+    }
+
+    #[test]
+    fn once_anything_is_published_no_fallback_can_produce_a_retry() {
+        let mut dirty = SideEffects::none();
+        dirty.note_published("a data file");
+        for reason in one_of_each_fallback() {
+            let rendered = reason.to_string();
+            let outcome = classify(reason, &dirty);
+            let Err(error) = outcome.into_result() else {
+                panic!(
+                    "{rendered} produced a retryable outcome after a publish — a caller \
+                     that re-ran the statement on the incumbent path would write twice"
+                );
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("a data file"),
+                "the error must name what was already published, or an operator reading \
+                 it will assume the statement did nothing: {message}"
+            );
+            assert!(
+                message.contains("NOT retried"),
+                "the error must say the statement was not re-run, since that is the \
+                 fact that distinguishes it from an ordinary failure: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_post_publish_failure_keeps_the_sqlstate_bearing_exec_errors() {
+        let mut dirty = SideEffects::none();
+        dirty.note_published("a catalog commit");
+        assert!(
+            matches!(
+                classify(Fallback::Exec(ExecError::Cancelled), &dirty).into_result(),
+                Err(BasinError::QueryCanceled(_))
+            ),
+            "a cancellation after a publish is still a cancellation (57014), not an \
+             internal error"
+        );
+        assert!(
+            matches!(
+                classify(
+                    Fallback::Exec(ExecError::CardinalityViolation("two rows".into())),
+                    &dirty
+                )
+                .into_result(),
+                Err(BasinError::CardinalityViolation(_))
+            ),
+            "a cardinality violation after a publish keeps SQLSTATE 21000"
+        );
+    }
+
+    #[test]
+    fn a_served_outcome_is_the_answer_and_a_declined_one_is_not() {
+        let served = Outcome::served(ExecResult::Empty { tag: "X".into() });
+        assert!(matches!(served.into_result(), Ok(Some(_))));
+        assert!(matches!(Outcome::declined().into_result(), Ok(None)));
+    }
+
+    #[test]
+    fn note_published_is_a_one_way_latch_that_keeps_the_earliest_publish() {
+        let mut effects = SideEffects::none();
+        effects.note_published("a data file");
+        effects.note_published("a catalog commit");
+        assert_eq!(
+            effects.published(),
+            Some("a data file"),
+            "the first publish is the point at which a retry became unsafe, so it is the \
+             one the error names; there is no un-publish and no overwrite"
+        );
+    }
+
+    /// The call-site half of the contract, checked structurally rather than
+    /// by comment.
+    ///
+    /// `Outcome` makes the safe call site the shortest one, but it cannot by
+    /// itself stop someone writing the unsafe one — `.ok()`, `unwrap_or`, or
+    /// an `Err(_) => {}` arm all compile, and all of them silently reinstate
+    /// exactly the double-write this type was introduced to remove. So the
+    /// single call site's shape is pinned here: the outcome must be opened
+    /// with `into_result()?`, which propagates a failed attempt instead of
+    /// falling through to the incumbent path, and there must be exactly one
+    /// call site to pin.
+    #[test]
+    fn the_only_call_site_propagates_a_failed_outcome_instead_of_retrying_it() {
+        const EXECUTOR: &str = include_str!("executor.rs");
+        let lines: Vec<&str> = EXECUTOR.lines().collect();
+        let sites: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("owned_engine::try_execute("))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "expected exactly one `owned_engine::try_execute` call site in executor.rs, \
+             found {}: every one of them has to handle a failed outcome, so a new one \
+             must be added to this test deliberately rather than inherit the old one's \
+             guarantee",
+            sites.len()
+        );
+        let site = sites[0];
+        let window = lines[site..(site + 4).min(lines.len())].join("\n");
+        assert!(
+            window.contains("into_result()?"),
+            "the call site must open the outcome with `into_result()?` so that an \
+             attempt which published something and then failed is propagated to the \
+             client, NOT re-executed on the DataFusion path below it. Found:\n{window}"
+        );
+        for retry_in_disguise in [".ok()", "unwrap_or", "unwrap_or_else", "Err(_)"] {
+            assert!(
+                !window.contains(retry_in_disguise),
+                "the call site discards the failed outcome via `{retry_in_disguise}` and \
+                 falls through to the incumbent path, which re-executes the statement. \
+                 Found:\n{window}"
+            );
+        }
     }
 
     // ── FallbackReasonCounters ───────────────────────────────────────────

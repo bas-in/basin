@@ -763,6 +763,40 @@ with `Declined` / `Served` / `Failed` — and it is a small change. It is small
 *now*. It is small only while the answer to "has anything been written?" is
 always "no".
 
+**Landed.** `try_execute` returns an opaque `Outcome`
+(`owned_engine.rs`), whose only accessor `into_result() -> Result<Option<ExecResult>, BasinError>`
+renders "declined, nothing happened" as `Ok(None)` and "attempted, published,
+then failed" as `Err`. Two things make it structural rather than documentary:
+
+- The retry decision is not the call site's. `classify(reason, &effects)`
+  reads a `SideEffects` ledger — a one-way latch carrying *what* was
+  published — and can only return a retryable answer while that ledger is
+  clean. The stage that raised the error is irrelevant to it, which is the
+  correction this section asked for: a `Fallback::Exec` before the first write
+  is retryable and a `Fallback::Build` after one is not.
+- The safe call site is now the shortest one. `executor.rs:2109` reads
+  `outcome.into_result()?`; retrying a failure would take a deliberately
+  written `.ok()`, `unwrap_or`, or `Err(_) => {}`, and a unit test in
+  `owned_engine.rs` pins the single call site against exactly those.
+
+Routing is unchanged, and that too is structural rather than hoped for:
+nothing on this path can publish (the bridge still passes `None` as
+`build_in_session`'s `DmlResolver`), so `classify` returns `Declined` for
+every fallback and `into_result()` yields the same `Ok(None)` where the old
+signature yielded `None`. What P2 inherits is one rule with one call:
+`SideEffects::note_published(what)` **before** the first storage write or
+catalog commit. Everything from that call onward is un-retryable
+automatically, with no change at the call site.
+
+One thing this section did not raise, established while landing it: the
+`exec_error` bucket cannot represent a partially-emitted result set either.
+`try_execute_inner` accumulates batches into a local `Vec` and builds
+`ExecResult::Rows` only after `next_batch()` returns `Ok(None)`, and
+`protocol.rs:394`–`:409` emits `RowDescription`/`DataRow` only from a returned
+`ExecResult`. A mid-drain failure therefore drops every accumulated batch
+before the caller sees anything, so "the client already saw rows" is not a
+state this bridge can reach — for reads, the retry was only ever wasted work.
+
 ### 3.5 Multi-statement transactions are out of scope, and already are
 
 `try_execute` declines outright when `crate::session::tx_is_active(&sess.state)`
@@ -802,12 +836,15 @@ Sizes are rough person-weeks for one agent working the way this branch has been
 worked, and they are estimates, not measurements. `blocks` means the gate cannot
 open for the named shape without it.
 
-### P0 — The fallback contract (§3.4). **~0.2 wk. Blocks everything. Do first.**
+### P0 — The fallback contract (§3.4). **LANDED. Blocked everything; no longer does.**
 
 Change `try_execute`'s return type to distinguish declined from failed-after-
 writing, and assert in a test that no code path can return `None` after a
 publish. Independent of every other item; can land today while the gate is still
 shut, and is *cheaper* to land now than later.
+
+Done — see §3.4's "Landed" note for the shape. What P2 must not forget is one
+line: `SideEffects::note_published(what)` before the first irreversible write.
 
 ### P1 — Re-host CHECK / generated / RLS-`WITH CHECK` evaluation off DataFusion. **~3 wk. Not a write-path precondition.**
 

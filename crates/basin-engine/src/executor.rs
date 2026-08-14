@@ -2101,12 +2101,25 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 // Owned-engine bridge (behind `BASIN_OWNED_ENGINE`, default
                 // OFF — see `owned_engine` module docs). Attempted for every
                 // single-statement SELECT once the flag is on; `try_execute`
-                // itself is a no-op (returns `None` immediately) when the
-                // flag is off, and falls back to the unchanged path below on
-                // any ineligibility or lowering/build/exec error, so this
-                // call changes nothing about today's behaviour by default.
+                // itself is a no-op (declines immediately) when the flag is
+                // off, and falls back to the unchanged path below on any
+                // ineligibility or lowering/build/exec error, so this call
+                // changes nothing about today's behaviour by default.
+                //
+                // The `?` is load-bearing, not idiom. `into_result` is the
+                // only way to open an `Outcome`, and it distinguishes
+                // "declined — nothing happened, fall through" (`Ok(None)`,
+                // the only retryable answer) from "attempted, published
+                // something, then failed" (`Err`), which must NOT be re-run
+                // on the path below: doing so would apply the published part
+                // twice. Today the second case is unreachable — the owned
+                // path has no write resolver — and widening the
+                // `StmtKind::Select` gate above is exactly what makes it
+                // reachable. See the module docs' "Declining versus failing"
+                // and the test there that pins this call site's shape.
                 let node = tree.stmts().next().expect("kinds[0] implies stmts[0]");
-                if let Some(result) = crate::owned_engine::try_execute(sess, node, sql).await {
+                let outcome = crate::owned_engine::try_execute(sess, node, sql).await;
+                if let Some(result) = outcome.into_result()? {
                     return Ok(result);
                 }
             }
