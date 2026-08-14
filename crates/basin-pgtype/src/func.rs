@@ -740,11 +740,15 @@ pub static FUNCS: &[FuncSig] = &[
     // separately for that reason.
     //
     // Row order mirrors the `date_part` block directly above, deliberately:
-    // an argument that reaches [`resolve`] as `unknown` (which every bare
-    // column does today — see the `unknown_argument_still_lands_on_the_int4_
-    // monomorphization` test for the same effect on `array_agg`) lands on
-    // whichever row comes first, and these two sibling functions landing on
-    // the *same* argument type is less surprising than them disagreeing.
+    // a call whose arguments are *all* `unknown` ties in [`resolve`]'s
+    // stage-1 pass and lands on whichever row comes first, and these two
+    // sibling functions landing on the *same* argument type is less
+    // surprising than them disagreeing. This order is no longer what decides
+    // `extract(YEAR FROM <date column>)` — a bare column carries its catalog
+    // type into resolution since `798b5e9c`, and the known argument elects
+    // 6199 whatever the order — but it still decides the genuinely
+    // all-`unknown` call, which a live server answers with ERROR 42725
+    // rather than a row. See [`resolve`]'s own docs.
     FuncSig::new(
         6203,
         "extract",
@@ -797,10 +801,22 @@ pub static FUNCS: &[FuncSig] = &[
     // 2049 to_char(timestamp, text)     1776 to_char(float8, text)
     // ```
     //
-    // `to_char(day, 'YYYY-MM-DD')` on a `date` column therefore resolves to
-    // **2049**, `to_char(timestamp, text)`, by the implicit `date ->
+    // `to_char(day, 'YYYY-MM-DD')` on a `date` column therefore resolves here
+    // to **2049**, `to_char(timestamp, text)`, by the implicit `date ->
     // timestamp` cast (`pg_cast` reports `castcontext = 'i'` for that pair,
-    // also read off the server). Inventing a `(date, text)` row here would
+    // also read off the server). A live PostgreSQL 18.2 picks **1770**,
+    // `to_char(timestamptz, text)`, instead — measured by deparsing a view
+    // over a `date` column, which prints `to_char((d)::timestamp with time
+    // zone, 'YYYY'::text)`. Neither row is an exact match, so the choice
+    // falls to stage 2 of `func_select_candidate` (preferred type within the
+    // input's own category), and `timestamptz` is the preferred type of the
+    // date/time category; [`resolve`] implements stage 1 only and keeps the
+    // first tabulated row. Named as a known divergence, with its cause, so it
+    // is not rediscovered as a mystery: it is visible for the format fields
+    // that a session timezone can move, and closing it means implementing
+    // that stage, not reordering this table.
+    //
+    // Inventing a `(date, text)` row here would
     // report an oid no PostgreSQL has and make `\df to_char` disagree with
     // every real server, so there is none — `crates/basin-exec/src/eval.rs`
     // performs the same widening PostgreSQL's inserted cast would, at
@@ -814,11 +830,14 @@ pub static FUNCS: &[FuncSig] = &[
     // *name that now resolves* turns what is currently a clean "no such
     // function" into a call that resolves and then fails at execution. Named
     // here so their absence is a decision rather than an oversight.
-    // 2049 comes first so that the `unknown`-argument call a bare column
-    // produces today lands on the overload PostgreSQL itself picks for the
-    // shape that motivated these rows — `to_char(<date or timestamp column>,
-    // fmt)` — rather than on the `timestamptz` one. Same first-match
-    // ordering dependence as the `extract` block above.
+    // 2049 comes first so that a call whose first argument is `unknown` lands
+    // on the overload PostgreSQL picks for a `timestamp` column — confirmed
+    // live, `to_char(ts, 'YYYY')` deparses with `ts` uncast — rather than on
+    // the `timestamptz` one. For a `date` column the live server picks 1770
+    // instead, per the divergence recorded above. Same first-in-table
+    // ordering dependence as the `extract` block above: [`resolve`]'s
+    // stage-1 pass only discriminates when an argument's type is *known*,
+    // and neither of these rows matches a `date` or an `unknown` exactly.
     FuncSig::new(
         2049,
         "to_char",
@@ -2506,27 +2525,109 @@ fn args_match(declared: &[Oid], given: &[Oid], matches: impl Fn(Oid, Oid) -> boo
     declared.len() == given.len() && declared.iter().zip(given).all(|(&d, &g)| matches(d, g))
 }
 
+/// How many of `declared`'s parameters the call matches *exactly*, counting
+/// only the arguments whose given type is actually known.
+///
+/// This is Postgres's first elimination stage in `func_select_candidate`
+/// (`parse_func.c`), transcribed:
+///
+/// ```c
+/// if (input_base_typeids[i] != UNKNOWNOID &&
+///     current_typeids[i] == input_base_typeids[i])
+///     nmatch++;
+/// ```
+///
+/// An `unknown` argument — a bare string literal, which Postgres types
+/// `unknown` too — contributes to *no* candidate's score, so it cannot vote;
+/// only the arguments whose type the caller actually knows do. That is the
+/// whole reason `date_part('month', day)` picks `date_part(text, date)`: the
+/// literal abstains and the `date` argument elects the `date` overload.
+///
+/// [`PSEUDO_ANY`] deliberately does **not** count, even though
+/// [`arg_matches_exact`] accepts it. Postgres compares raw oids here, and
+/// `"any"` is never equal to a concrete input type, so a polymorphic
+/// candidate scores zero at that position and loses to a candidate that
+/// names the type — which is exactly Postgres's own preference order.
+fn exact_match_count(declared: &[Oid], given: &[Oid]) -> usize {
+    declared
+        .iter()
+        .zip(given)
+        .filter(|(&d, &g)| g != oid::UNKNOWN && d == g)
+        .count()
+}
+
 /// Resolve a function call to the [`FuncSig`] Postgres would pick.
 ///
-/// Mirrors [`crate::operator::resolve`]'s two-phase approach, which itself
-/// mirrors Postgres's `func_select_candidate` / `oper_select_candidate`:
-/// first look for a candidate every argument matches without coercion (an
-/// exact type match, or Postgres's `"any"` pseudo-type — see
-/// [`arg_matches_exact`]), then fall back to a candidate reachable by
-/// *implicit* coercion of the given argument types
-/// ([`crate::cast::cast_kind`] `== Some(CastKind::Implicit)`). A function
-/// whose match requires an assignment-only or explicit-only cast is never
-/// chosen implicitly, same as for operators — see
-/// `lower_text_resolves_but_lower_int4_does_not` below, which pins that
-/// `int4 -> text` is assignment-only (Postgres's string I/O fallback), not
-/// implicit.
+/// Three passes, the first two shared with [`crate::operator::resolve`]:
 ///
-/// Like [`crate::operator::resolve`], this is narrower than Postgres's full
-/// overload resolution (no "most exact matches" / preferred-type
-/// tie-breaking among several implicit candidates): the first-in-table match
-/// wins. For the functions tabulated here that is not an observable
-/// difference — see the module docs for the one case (`avg`) where it is a
-/// deliberate, documented one.
+/// 1. **Exact.** A candidate every argument matches without coercion (a
+///    literal type match, or Postgres's `"any"` pseudo-type — see
+///    [`arg_matches_exact`]). Postgres's own fast path, before
+///    `func_select_candidate` is ever reached.
+/// 2. **Implicit candidates.** Every candidate reachable by *implicit*
+///    coercion of the given argument types ([`crate::cast::cast_kind`]
+///    `== Some(CastKind::Implicit)`) — Postgres's `func_match_argtypes`. A
+///    function whose match needs an assignment-only or explicit-only cast is
+///    never chosen implicitly, same as for operators — see
+///    `lower_text_resolves_but_lower_int4_does_not` below, which pins that
+///    `int4 -> text` is assignment-only (Postgres's string I/O fallback), not
+///    implicit.
+/// 3. **Most exact matches on the known arguments** ([`exact_match_count`]),
+///    keeping only the candidates that tie for the best score. This is
+///    **stage 1 of four** in Postgres's `func_select_candidate`.
+///
+/// # Which stages of `func_select_candidate` are *not* implemented
+///
+/// Postgres runs three further eliminations when stage 1 leaves more than one
+/// candidate. None of them is implemented here:
+///
+///   * **Stage 2 — preferred type in the *same* category.** Re-scores the
+///     known arguments counting a match when the declared type is either
+///     exact *or* the preferred type of the input's own type category
+///     (`IsPreferredType`; cross-category conversions to a preferred type
+///     score nothing).
+///   * **Stage 3 — resolving the `unknown` slots by category.** For each
+///     `unknown` argument position, take the category of the candidates'
+///     declared types there — `STRING` always wins a conflict, since untyped
+///     literals look like strings; otherwise all candidates must agree or the
+///     stage fails. Then drop the candidates that take the wrong category,
+///     and, if any candidate takes the category's *preferred* type, drop the
+///     ones that do not. This is why `abs('5')` is `double precision` live
+///     and not ambiguous: `float8` is the numeric category's preferred type.
+///   * **Stage 4 — the "last gasp".** If some arguments are known and all the
+///     known ones share one type, assume the `unknown` ones are that type too
+///     and take the match if that is now unique.
+///
+/// Implementing 2 and 3 needs `pg_type.typcategory` / `typispreferred`, which
+/// this crate does not tabulate today. Where they would run, this function
+/// instead keeps the **first row in [`FUNCS`]** among the stage-1 survivors —
+/// the historical behaviour, and the reason table order is load-bearing (the
+/// module docs' `avg` note, and [`crate::operator`]'s `^` note, both depend
+/// on it). Measured over every argument vector drawable from the table's own
+/// declared types plus `unknown` (1,202 vectors): of the 78 `FUNCS` names
+/// carrying more than one signature, 47 have at least one vector where stage
+/// 1 still leaves two or more oids tied — almost always the all-`unknown`
+/// call. That set is the size of the remaining gap.
+///
+/// # Ambiguity
+///
+/// When every stage fails, Postgres's `func_select_candidate` returns NULL
+/// and `ParseFuncOrColumn` raises SQLSTATE **42725**:
+///
+/// ```text
+/// ERROR:  function date_part(unknown, unknown) is not unique
+/// HINT:  Could not choose a best candidate function. You might need to add
+///        explicit type casts.
+/// ```
+///
+/// (verified live: `SELECT date_part('month','2020-01-01')` is that error).
+/// This function cannot report it, because a tie *here* is not evidence of a
+/// tie *there* — stages 2 to 4 are missing, and they resolve most ties rather
+/// than failing. Reporting ambiguity at the end of stage 1 would refuse calls
+/// the real server answers, so a residual tie takes the first-in-table row
+/// instead, and a genuinely ambiguous call gets an answer where Postgres
+/// gets an error. That is the one direction in which this is still wrong,
+/// and closing it means implementing stages 2 to 4, not tightening this one.
 pub fn resolve(name: &str, args: &[Oid]) -> Option<&'static FuncSig> {
     if let Some(f) = FUNCS
         .iter()
@@ -2535,13 +2636,24 @@ pub fn resolve(name: &str, args: &[Oid]) -> Option<&'static FuncSig> {
         return Some(f);
     }
 
-    FUNCS.iter().find(|f| {
+    let implicitly_matches = |f: &&FuncSig| {
         f.name == name
             && args_match(f.args, args, |declared, given| {
                 arg_matches_exact(declared, given)
                     || cast_kind(given, declared) == Some(CastKind::Implicit)
             })
-    })
+    };
+
+    let best = FUNCS
+        .iter()
+        .filter(implicitly_matches)
+        .map(|f| exact_match_count(f.args, args))
+        .max()?;
+
+    FUNCS
+        .iter()
+        .filter(implicitly_matches)
+        .find(|f| exact_match_count(f.args, args) == best)
 }
 
 /// Whether `oid` names a builtin aggregate function (`pg_proc.prokind = 'a'`).
@@ -2828,12 +2940,14 @@ mod tests {
         assert_eq!(tstz.oid, Oid(1770));
     }
 
-    /// The `unknown`-argument call every bare column produces today lands on
-    /// the first matching row, so the row order in the `extract`/`to_char`
-    /// blocks is load-bearing and pinned here. `extract` mirrors
-    /// `date_part`'s own first row deliberately; `to_char` leads with the
-    /// `timestamp` overload, the one a real server picks for the
-    /// date/timestamp column shape these rows were added for.
+    /// A call whose arguments are all `unknown` ties [`resolve`]'s stage-1
+    /// pass — nothing is known, so nothing can discriminate — and lands on
+    /// the first matching row, which is why the row order in the
+    /// `extract`/`to_char` blocks is load-bearing and pinned here. `extract`
+    /// mirrors `date_part`'s own first row deliberately; `to_char` leads with
+    /// the `timestamp` overload, the one a real server picks for a
+    /// `timestamp` column (for a `date` column it picks the `timestamptz`
+    /// row, a stage-2 divergence recorded on the table itself).
     #[test]
     fn unknown_arguments_land_on_the_documented_first_row() {
         let ex = resolve("extract", &[oid::UNKNOWN, oid::UNKNOWN]).unwrap();
@@ -3573,6 +3687,137 @@ mod tests {
                 f.args,
                 &[oid::INT4],
                 "{name}(unknown) must still pick the int4 row"
+            );
+        }
+    }
+
+    /// A bare `'month'` is `unknown` — Postgres types it that way too — so
+    /// the all-exact pass fails as a whole and every date/time overload
+    /// survives implicit coercion. Postgres's `func_select_candidate` then
+    /// discards the candidates with fewer exact matches on the arguments
+    /// whose type *is* known, which leaves exactly the overload named after
+    /// the second argument's type. Without that stage the implicit pass takes
+    /// whichever row is first in [`FUNCS`], and `timestamptz` sits ahead of
+    /// `date` — which is how `date_part('month', day)` on a `date` column
+    /// resolved to 1171 and fed a `Date32` to a `timestamptz` evaluator.
+    ///
+    /// Every expectation below is the live server's own answer, read off the
+    /// deparse of a view over a table with one column of each type
+    /// (`pg_get_viewdef` prints the argument casts Postgres inserted, so the
+    /// overload it chose is visible): `date_part('month'::text, d)` with `d`
+    /// *uncast* is `date_part(text, date)`, oid 1384.
+    #[test]
+    fn a_known_argument_elects_its_own_overload_against_an_unknown_literal() {
+        let cases: &[(&str, Oid, u32)] = &[
+            ("date_part", oid::DATE, 1384),
+            ("date_part", oid::TIME, 1385),
+            ("date_part", oid::TIMESTAMP, 2021),
+            ("extract", oid::DATE, 6199),
+            ("extract", oid::TIME, 6200),
+            ("extract", oid::TIMESTAMP, 6202),
+        ];
+        for &(name, arg, want) in cases {
+            let f = resolve(name, &[oid::UNKNOWN, arg])
+                .unwrap_or_else(|| panic!("{name}(unknown, {arg}) must resolve"));
+            assert_eq!(
+                f.oid,
+                Oid(want),
+                "{name}(unknown, {arg}) must pick the overload the known argument names"
+            );
+            assert_eq!(f.args[1], arg, "and it must take that type uncoerced");
+        }
+
+        // The timestamptz overloads stay reachable when that IS the argument
+        // type — this stage narrows the choice, it does not delete rows.
+        assert_eq!(
+            resolve("date_part", &[oid::UNKNOWN, oid::TIMESTAMPTZ])
+                .unwrap()
+                .oid,
+            Oid(1171)
+        );
+        assert_eq!(
+            resolve("extract", &[oid::UNKNOWN, oid::TIMESTAMPTZ])
+                .unwrap()
+                .oid,
+            Oid(6203)
+        );
+    }
+
+    /// The same stage, where it changes the *result* type rather than only
+    /// the oid — so it is not a cosmetic difference in a catalog column.
+    ///
+    /// `date_trunc('day', ts)` on a `timestamp` column is
+    /// `date_trunc(text, timestamp) -> timestamp` (oid 2020), not
+    /// `date_trunc(text, timestamptz) -> timestamptz` (oid 1217): confirmed
+    /// live, `pg_typeof(date_trunc('day', now()::timestamp))` is `timestamp
+    /// without time zone`. `power('2', n)` on a `numeric` column is
+    /// `power(numeric, numeric) -> numeric` (2169), not the `float8` row
+    /// (1368) — `pg_typeof(power('2', 3::numeric))` is `numeric` live, and
+    /// answering that in `float8` would round a numeric result through binary
+    /// floating point.
+    #[test]
+    fn the_elected_overload_carries_its_own_return_type() {
+        let dt = resolve("date_trunc", &[oid::UNKNOWN, oid::TIMESTAMP]).unwrap();
+        assert_eq!(dt.oid, Oid(2020));
+        assert_eq!(dt.ret, oid::TIMESTAMP);
+
+        for (name, want) in [("pow", 1738u32), ("power", 2169)] {
+            let left = resolve(name, &[oid::UNKNOWN, oid::NUMERIC]).unwrap();
+            let right = resolve(name, &[oid::NUMERIC, oid::UNKNOWN]).unwrap();
+            assert_eq!(left.oid, Oid(want), "{name}(unknown, numeric)");
+            assert_eq!(right.oid, Oid(want), "{name}(numeric, unknown)");
+            assert_eq!(left.ret, oid::NUMERIC);
+        }
+
+        // `age` picks the timestamp pair (2058) over the timestamptz pair
+        // (1199) for the same reason, in either argument position: live,
+        // `age('2020-01-01', ts)` deparses with the literal typed
+        // `timestamp without time zone` and `ts` uncast.
+        assert_eq!(
+            resolve("age", &[oid::UNKNOWN, oid::TIMESTAMP]).unwrap().oid,
+            Oid(2058)
+        );
+        assert_eq!(
+            resolve("age", &[oid::TIMESTAMP, oid::UNKNOWN]).unwrap().oid,
+            Oid(2058)
+        );
+    }
+
+    /// The stage counts only arguments whose type is *known*, so an
+    /// all-`unknown` call is a tie at zero and nothing moves — the
+    /// first-in-table row still wins. This is load-bearing in both
+    /// directions: it is what keeps `avg(int4)` on the `avg(int8)` row and
+    /// the polymorphic monomorphizations on their `int4` rows, and it is
+    /// also where this resolver is still *unlike* Postgres, which runs three
+    /// further stages here (see [`resolve`]). `abs('5')` is the cheapest
+    /// example: live it is `abs(float8)` (1395) by the preferred-type rule of
+    /// stage 3, here it is `abs(int2)` (1398) because that row is first.
+    /// Pinned so the divergence is visible rather than latent.
+    #[test]
+    fn an_all_unknown_call_ties_and_keeps_the_first_row() {
+        assert_eq!(resolve("avg", &[oid::INT4]).unwrap().oid, Oid(2100));
+        assert_eq!(resolve("abs", &[oid::UNKNOWN]).unwrap().oid, Oid(1398));
+        assert_eq!(
+            resolve("date_part", &[oid::UNKNOWN, oid::UNKNOWN])
+                .unwrap()
+                .oid,
+            Oid(1171),
+            "live this call is ERROR 42725 'function date_part(unknown, unknown) \
+             is not unique'; stages 2-4 are unimplemented, so it still gets an answer"
+        );
+    }
+
+    /// `count(any)` must keep resolving even though [`exact_match_count`]
+    /// scores the `"any"` pseudo-type zero: the all-exact pass answers it
+    /// before the counting stage is ever reached, and a candidate that is
+    /// alone after implicit coercion wins its tie by default.
+    #[test]
+    fn the_any_pseudo_type_is_unaffected_by_the_counting_stage() {
+        for arg in [oid::INT4, oid::TEXT, oid::DATE, oid::UNKNOWN] {
+            assert_eq!(
+                resolve("count", &[arg]).unwrap().oid,
+                Oid(2147),
+                "count({arg}) must stay on the any row"
             );
         }
     }
