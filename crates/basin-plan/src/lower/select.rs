@@ -93,6 +93,7 @@ use pg_query::protobuf::{
 
 use basin_pgtype::PgType;
 
+use crate::lower::colname::figure_colname_or_unnamed;
 use crate::lower::expr::{
     best_effort_type, lower_expr, lower_sort_by, ColumnResolver, FunctionResolver, LowerCtx,
     OperatorResolver, SubqueryLowerer,
@@ -2280,10 +2281,14 @@ fn lower_target_list(
         // `ProjectSet`, run in lockstep, not one each — see that function's
         // docs).
         let expr = lower_expr(val, ctx)?;
+        // Named from the RAW parse node, not from `expr` — that is where
+        // Postgres computes it (`FigureColname` in `transformTargetEntry`)
+        // and the only place a function's *name* still exists: lowering has
+        // already replaced `count` with an OID. See `lower::colname`.
         let alias = if !rt.name.is_empty() {
             rt.name.clone()
         } else {
-            default_alias(&expr)
+            figure_colname_or_unnamed(val)
         };
         out.push((expr, alias));
     }
@@ -2313,10 +2318,18 @@ fn star_marker(cr: &pg_query::protobuf::ColumnRef) -> Result<Option<Option<Strin
     }
 }
 
-/// Postgres's own default column name for an unaliased target-list entry,
-/// simplified the same way `crate::schema`'s private `display_name` is: a
-/// bare column keeps its name, a cast passes the name of what it wraps
-/// through, everything else is `?column?`.
+/// A label for an **internal, non-user-visible** column: the materialized
+/// slots this module inserts for a `DISTINCT ON` key, a sort key, or an
+/// aggregate's argument, none of which a client ever sees in
+/// `RowDescription` (a final `Project` carrying the real target-list names
+/// always sits above them).
+///
+/// This is deliberately NOT Postgres's target-list naming rule — that is
+/// [`crate::lower::colname::figure_colname`], which runs on the raw parse
+/// tree because a function's name does not survive lowering. Using it here
+/// would be wrong in the other direction: these slots are addressed by
+/// position, and giving two different aggregate arguments the same borrowed
+/// name would make the plan harder to read for no gain.
 fn default_alias(expr: &Expr) -> String {
     match expr {
         Expr::Column(cr) => cr.name.clone(),
@@ -3457,6 +3470,43 @@ mod tests {
                 (col(2, "b"), "b".to_string()),
             ]
         );
+    }
+
+    /// The output names a client actually reads back in `RowDescription`.
+    ///
+    /// Before this was wired to [`crate::lower::colname`], every one of these
+    /// came out `?column?`, because the alias was derived from the *lowered*
+    /// `Expr` — by which point `count` is only an oid. The names below are
+    /// PostgreSQL 18.2's, read off the server; note in particular that the
+    /// window functions are named plainly, with no frame or ORDER BY
+    /// decoration (the incumbent's `row_number() ORDER BY [...]` labels are a
+    /// DataFusion-ism PostgreSQL never emits, so they are not the target).
+    #[test]
+    fn a_target_list_entry_is_named_the_way_postgres_names_it() {
+        for (sql, expected) in [
+            ("SELECT count(*) FROM t", "count"),
+            ("SELECT count(a) FROM t", "count"),
+            ("SELECT sum(a) FROM t", "sum"),
+            ("SELECT upper(b) FROM t", "upper"),
+            ("SELECT rank() OVER (ORDER BY a) FROM t", "rank"),
+            ("SELECT sum(a) OVER (PARTITION BY b) FROM t", "sum"),
+            ("SELECT coalesce(a, 1) FROM t", "coalesce"),
+            ("SELECT CASE WHEN a > 0 THEN 1 ELSE 2 END FROM t", "case"),
+            ("SELECT a::text FROM t", "a"),
+            ("SELECT (a + 1)::text FROM t", "text"),
+            ("SELECT a FROM t", "a"),
+            ("SELECT count(*) AS n FROM t", "n"),
+        ] {
+            let plan = lower(sql).unwrap();
+            let LogicalPlan::Project { exprs, .. } = plan else {
+                panic!("expected Project for {sql}");
+            };
+            assert_eq!(
+                exprs.last().expect("one target entry").1,
+                expected,
+                "for {sql}"
+            );
+        }
     }
 
     #[test]

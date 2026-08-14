@@ -7,6 +7,7 @@
 //! operators resolved against a catalog by argument type, removes the reason
 //! for it to exist.
 
+pub(crate) mod colname;
 pub mod dml;
 pub mod expr;
 pub mod select;

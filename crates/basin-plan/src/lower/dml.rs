@@ -73,6 +73,7 @@ use pg_query::protobuf::{
 use crate::lower::expr::{
     lower_expr, ColumnResolver, FunctionResolver, LowerCtx, OperatorResolver, SubqueryLowerer,
 };
+use crate::lower::colname::figure_colname_or_unnamed;
 use crate::lower::select::{self, TableResolver};
 use crate::lower::LowerError;
 use crate::{ColId, ColumnRef, Expr, LogicalPlan, OnConflict, Schema, SnapshotId, TableId};
@@ -354,17 +355,6 @@ fn star_marker(cr: &pg_query::protobuf::ColumnRef) -> Result<Option<Option<Strin
     }
 }
 
-/// Postgres's own default column name for an unaliased `RETURNING` entry —
-/// the DML analogue of `lower::select`'s identically-behaved (and again,
-/// private) `default_alias`.
-fn default_alias(expr: &Expr) -> String {
-    match expr {
-        Expr::Column(cr) => cr.name.clone(),
-        Expr::Cast { arg, .. } => default_alias(arg),
-        _ => "?column?".to_string(),
-    }
-}
-
 /// Lower a `RETURNING` list against `scope`, expanding a bare `*` / `t.*`
 /// the same way a `SELECT` list does. `None` for no `RETURNING` clause at
 /// all — distinct from `Some(vec![])`, which cannot actually occur (an empty
@@ -405,10 +395,12 @@ fn lower_returning(
         }
 
         let expr = lower_expr(val, ctx)?;
+        // Same rule, and for the same reason, as a `SELECT` list's — see
+        // `lower::select`'s `lower_target_list` and `lower::colname`.
         let alias = if !rt.name.is_empty() {
             rt.name.clone()
         } else {
-            default_alias(&expr)
+            figure_colname_or_unnamed(val)
         };
         out.push((expr, alias));
     }
