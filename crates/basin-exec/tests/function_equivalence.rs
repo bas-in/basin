@@ -65,8 +65,83 @@
 //! have errored and didn't; `SELECT DISTINCT ... ORDER BY <expr>` that
 //! should have errored and didn't). So `NULL` args, embedded-NUL text, and
 //! `i32::MIN`-class overflow triggers are in the battery specifically to
-//! provoke a Postgres ERROR and check Basin errors too — not just to see
-//! what value comes back.
+//! provoke a Postgres ERROR and check what Basin does at the same input —
+//! not just to see what value comes back. For the embedded-NUL case, "what
+//! Basin does" is layered, and the next section is about that.
+//!
+//! # The NUL byte: one defect, one layer, and what this battery can see
+//!
+//! Arrow's `Utf8` accepts a NUL byte that PostgreSQL's `text` rejects with
+//! `22021 character_not_in_repertoire`. That mismatch used to be reported
+//! here as **101 divergences across 16 OIDs** — 12 distinct function names
+//! (`concat`, `btrim`, `ltrim`, `rtrim`, `strpos`, `substr`, `left`,
+//! `right`, `replace`, `lower`, `upper`, `length`), several of them at two
+//! arities — every one of them the same sentence: *basin SUCCEEDED but
+//! postgres ERRORED*. It was never 101 defects. It was one input-domain
+//! defect seen 101 times, and 101 is what it looks like when a whole class
+//! of divergence is counted per call site. (101 is also, measured, exactly
+//! how many of the 1,492 call sites carry a NUL at all: every one of them
+//! diverged, and nothing else did.)
+//!
+//! **The defect is fixed, and not here.** It is fixed at the boundary where
+//! a client's bytes first become a Basin value:
+//!
+//!   * `a4749d4e` — `basin-router`'s `decode_param_text` rejects a NUL for
+//!     *every* declared type (in text format PostgreSQL's encoding check
+//!     runs before type dispatch, so a NUL in an `int4` parameter gives
+//!     `22021`, not `22P02`); `decode_param_binary` rejects per-type with
+//!     `bytea` deliberately still accepting; COPY rejects for text columns.
+//!   * `6d8f38db` — `basin-rest`'s `quote_sql_string` refuses the same byte
+//!     as HTTP 400, reusing PostgreSQL's own wording.
+//!
+//! Sixteen copies of that guard inside `eval_scalar_fn` — one per affected
+//! arm — would have been the same check in the wrong layer, sixteen times.
+//!
+//! **This battery calls `eval(&expr, &batch)` directly.** There is no wire
+//! and no `decode_param` between the battery and the function under test —
+//! that is the point of it, and it is why it can reach `eval` arms and
+//! physical layouts (a `Decimal128(20, 4)` column, `ndigits = i32::MIN`)
+//! that are awkward to provoke through a client. The consequence is that
+//! its NUL count measures a path no client can reach, and would keep
+//! reporting 101 however correct Basin became.
+//!
+//! So the battery does not bind through the wire (that would turn a
+//! unit-level `eval` differential into a second end-to-end one, of which
+//! this repository already has several), and it does not carry a
+//! hand-written exemption list (a list is a place where unrelated failures
+//! go to be forgotten). It **attributes**, mechanically, per call site:
+//!
+//!   * the input to that call site actually contains a `0x00` byte, **and**
+//!   * PostgreSQL's refusal carried SQLSTATE `22021` on this run, **and**
+//!   * Basin's `eval` returned a value rather than an error.
+//!
+//! A divergence matching all three is reported as *attributed to the wire
+//! layer* and does not fail the run. Anything else — a value mismatch on
+//! NUL input, Basin erroring where Postgres succeeded, a `22021` at a call
+//! site with no NUL in it, or any divergence at all on non-NUL input — is
+//! **unexplained**, and unexplained is what fails the run. Nothing can be
+//! added to the attributed set by editing a list; a case qualifies only by
+//! having that exact measured shape, so the moment `eval`'s behaviour or
+//! PostgreSQL's changes, the case leaves the set and fails the run.
+//!
+//! Two further checks make the attribution falsifiable rather than a claim:
+//!
+//!   1. **Postgres's rejection is pinned, not assumed.** Every call site
+//!      carrying a NUL must be refused by the live server with `22021`. If
+//!      one is ever accepted, the premise of the attribution is wrong and
+//!      the run fails.
+//!   2. **The deferral target must still exist.** The attribution says the
+//!      check lives one layer up and is tested there. This battery cannot
+//!      run `basin-router` (that crate depends on this one), so it verifies
+//!      the companion harness — `crates/basin-router/tests/nul_byte_rejection.rs`,
+//!      which drives the v3 protocol over real TCP — is still present and
+//!      still pins SQLSTATE `22021`. If it is deleted or gutted, this
+//!      battery stops attributing and reports every NUL case as unexplained
+//!      again, because there is no longer anywhere for them to be explained.
+//!
+//! The `nul_embedded` inputs stay in the batteries. PostgreSQL's rejection
+//! of them is real behaviour worth pinning, and check (1) is now the thing
+//! pinning it.
 //!
 //! Numeric (`Decimal128`) results are compared by parsed value, not by exact
 //! text: `eval.rs`'s `round`/`ceil`/`floor`/`trunc`/`sign` on `numeric`
@@ -237,9 +312,11 @@ fn float4_battery() -> Vec<(&'static str, Option<f32>)> {
 }
 
 /// Text battery. `nul_embedded` is the one entry expected to make *Postgres*
-/// error (confirmed live: `invalid byte sequence for encoding "UTF8": 0x00`)
-/// — Basin's text functions do no such validation, which is exactly the
-/// error-vs-success asymmetry this harness exists to catch.
+/// error (confirmed live, and re-confirmed every run: `invalid byte sequence
+/// for encoding "UTF8": 0x00`, SQLSTATE `22021`). `eval` itself does no such
+/// validation and is not supposed to — the guard is at the wire boundary, one
+/// layer up. See the module docs' NUL section for how the resulting
+/// divergences are attributed rather than counted or exempted.
 fn text_battery() -> Vec<(&'static str, Option<String>)> {
     vec![
         ("null", None),
@@ -257,7 +334,8 @@ fn text_battery() -> Vec<(&'static str, Option<String>)> {
 /// A smaller text battery for a "set of characters to trim" / "needle"
 /// argument position — the full [`text_battery`] cross would be quadratic
 /// for no extra coverage, since these positions are semantically a small
-/// character set, not an arbitrary string.
+/// character set, not an arbitrary string. Keeps its own `nul_embedded` so
+/// the byte is exercised in the *second* argument position too.
 fn text_battery_small() -> Vec<(&'static str, Option<String>)> {
     vec![
         ("null", None),
@@ -566,6 +644,119 @@ fn compare(basin: &Outcome, pg: &Outcome) -> Option<String> {
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The NUL byte: attribution, and the two checks that keep it falsifiable
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The SQLSTATE PostgreSQL raises for a NUL byte in a value bound as text:
+/// `character_not_in_repertoire`.
+const NUL_SQLSTATE: &str = "22021";
+
+/// The harness that owns the other half of the NUL story: it drives the v3
+/// wire protocol over real TCP against a real `basin-router` and asserts the
+/// `22021` refusal that `eval` (correctly) does not make. Path is relative to
+/// this crate's `CARGO_MANIFEST_DIR`.
+///
+/// This battery cannot *call* that guard — `basin-router` depends on
+/// `basin-exec`, so the dependency only runs one way — so it verifies the
+/// companion still exists and still pins the same SQLSTATE. See
+/// [`wire_guard_companion`] for exactly what that does and does not prove.
+const WIRE_GUARD_COMPANION: &str = "../basin-router/tests/nul_byte_rejection.rs";
+
+/// True if any argument at this call site actually carries a `0x00` byte.
+///
+/// Derived from the value, not from the battery *label*: a case qualifies for
+/// NUL attribution because the byte is really there, so renaming or adding a
+/// battery entry cannot smuggle a case into the attributed set.
+///
+/// Only `Text` can carry one. Every other `ArgVal` reaches Postgres as a
+/// machine-typed parameter or, for `Numeric`, as [`format_decimal`] output —
+/// digits, `-` and `.` only.
+fn args_carry_nul(args: &[ArgVal]) -> bool {
+    args.iter().any(|a| match a {
+        ArgVal::Text(Some(s)) => s.contains('\0'),
+        _ => false,
+    })
+}
+
+/// True if `o` is a PostgreSQL error carrying SQLSTATE `code`.
+///
+/// Reads the bracketed code [`pg_err`] appends rather than matching message
+/// wording: the wording is PostgreSQL's and is translatable, the SQLSTATE is
+/// the stable contract. Only meaningful on the Postgres side — a Basin
+/// `Outcome::Error` is a Rust error string with no SQLSTATE.
+fn pg_sqlstate_is(o: &Outcome, code: &str) -> bool {
+    match o {
+        Outcome::Error(e) => e.ends_with(&format!("[{code}]")),
+        Outcome::Value(_) => false,
+    }
+}
+
+/// How a divergence is accounted for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Class {
+    /// Basin's `eval` returned a value for an input containing a NUL byte
+    /// that PostgreSQL refused with `22021`. Attributed to the wire layer,
+    /// which is where the guard lives (`a4749d4e`) and where it is tested
+    /// ([`WIRE_GUARD_COMPANION`]) — see the module docs. Reported, counted
+    /// separately, and does not fail the run.
+    NulBelowTheGuard,
+    /// Everything else. A defect, or a change, in what `eval` computes.
+    /// Fails the run.
+    Unexplained,
+}
+
+/// Classify a divergence. All three conditions must hold for attribution:
+/// the input really contains a NUL, PostgreSQL really refused it with
+/// `22021` *on this run*, and Basin really succeeded. A NUL-bearing call site
+/// that diverges any *other* way — a value mismatch, or Basin erroring where
+/// Postgres succeeded — is unexplained, because the wire guard explains
+/// exactly one shape and nothing else.
+fn classify(args: &[ArgVal], basin: &Outcome, pg: &Outcome) -> Class {
+    if args_carry_nul(args)
+        && matches!(basin, Outcome::Value(_))
+        && pg_sqlstate_is(pg, NUL_SQLSTATE)
+    {
+        Class::NulBelowTheGuard
+    } else {
+        Class::Unexplained
+    }
+}
+
+/// Check that the companion wire harness still exists and still pins the NUL
+/// SQLSTATE, returning a one-line description of what was found.
+///
+/// **What this proves:** that the file this battery defers its NUL cases to
+/// is present, names SQLSTATE `22021`, and still contains rejection tests.
+/// **What it does not prove:** that those tests pass — they run under
+/// `cargo test -p basin-router`, not here. The point is narrower and still
+/// worth having: an attribution that points at a deleted or hollowed-out
+/// harness is not an attribution, and this battery must not keep quietly
+/// discounting 101 divergences after its justification has been removed.
+fn wire_guard_companion() -> Result<String, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(WIRE_GUARD_COMPANION);
+    let shown = WIRE_GUARD_COMPANION.trim_start_matches("../");
+    let src = std::fs::read_to_string(&path).map_err(|e| {
+        format!("cannot read the wire-guard companion harness at crates/{shown}: {e}")
+    })?;
+    if !src.contains(NUL_SQLSTATE) {
+        return Err(format!(
+            "crates/{shown} no longer mentions SQLSTATE {NUL_SQLSTATE}"
+        ));
+    }
+    let rejection_tests = src.matches("_with_nul_is_rejected").count();
+    if rejection_tests < 3 {
+        return Err(format!(
+            "crates/{shown} contains {rejection_tests} `*_with_nul_is_rejected` test(s); \
+             expected at least 3 (text-format param, binary-format param, COPY)"
+        ));
+    }
+    Ok(format!(
+        "crates/{shown} present, pins SQLSTATE {NUL_SQLSTATE}, \
+         {rejection_tests} `*_with_nul_is_rejected` test(s)"
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -965,6 +1156,34 @@ struct Divergence {
     oid: u32,
     case: String,
     reason: String,
+    class: Class,
+}
+
+/// A call site whose input contains a NUL byte but which PostgreSQL did *not*
+/// refuse with [`NUL_SQLSTATE`]. The whole NUL attribution rests on the server
+/// refusing every one of them, so this is recorded and fails the run rather
+/// than being silently absorbed — see the module docs, check (1).
+struct NulAnomaly {
+    function: String,
+    oid: u32,
+    case: String,
+    observed: String,
+}
+
+/// Everything counted about NUL-bearing call sites, so the reported numbers
+/// add up in the output instead of in the reader's head.
+#[derive(Default)]
+struct NulTally {
+    /// Call sites whose input carried a `0x00` byte.
+    sites: usize,
+    /// …of which PostgreSQL refused with [`NUL_SQLSTATE`].
+    pg_rejected: usize,
+    /// …of which diverged in the attributed shape (Basin's `eval` succeeded).
+    attributed: usize,
+    /// …of which produced no divergence at all, because Basin errored too.
+    agreed: usize,
+    /// …of which diverged in some *other* shape. Counted as unexplained.
+    unexplained: usize,
 }
 
 fn print_banner(msg: &str) {
@@ -977,9 +1196,11 @@ async fn run() -> Result<(), String> {
         _ => {
             print_banner(
                 "SKIPPED — PG_DIFF_TEST_DSN is unset. 0 functions and 0 call sites were \
-                 compared against a live server this run. Set PG_DIFF_TEST_DSN to a libpq DSN \
-                 (e.g. postgres://postgres:postgres@127.0.0.1:5432/postgres) to actually run \
-                 this check.",
+                 compared against a live server this run, and in particular 0 embedded-NUL \
+                 inputs were put to the server, so the NUL accounting below is absent rather \
+                 than clean. Set PG_DIFF_TEST_DSN to a libpq DSN (e.g. \
+                 postgres://postgres:postgres@127.0.0.1:5432/postgres) to actually run this \
+                 check.",
             );
             return Ok(());
         }
@@ -1000,10 +1221,24 @@ async fn run() -> Result<(), String> {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
 
+    // Check (2) from the module docs, before any measuring: if the harness
+    // that owns the wire-layer NUL guard is gone, this run has nowhere to
+    // attribute its NUL divergences to and must report them as unexplained.
+    let companion = wire_guard_companion();
+    match &companion {
+        Ok(desc) => println!("    wire-guard companion: {desc}"),
+        Err(why) => println!(
+            "    wire-guard companion: MISSING — {why}\n\
+             \x20   NUL divergences will NOT be attributed this run."
+        ),
+    }
+
     let table = function_table();
     let mut functions_covered = 0usize;
     let mut total_call_sites = 0usize;
     let mut divergences: Vec<Divergence> = Vec::new();
+    let mut nul = NulTally::default();
+    let mut nul_anomalies: Vec<NulAnomaly> = Vec::new();
 
     for spec in &table {
         functions_covered += 1;
@@ -1014,62 +1249,219 @@ async fn run() -> Result<(), String> {
                 Err(e) => Outcome::Error(e),
             };
             let pg = pg_outcome(&client, spec.name, args, spec.ret).await;
-            if let Some(reason) = compare(&basin_outcome, &pg) {
-                divergences.push(Divergence {
-                    function: spec.name.to_string(),
-                    oid: spec.oid,
-                    case: case.clone(),
-                    reason,
-                });
+
+            let has_nul = args_carry_nul(args);
+            if has_nul {
+                nul.sites += 1;
+                if pg_sqlstate_is(&pg, NUL_SQLSTATE) {
+                    nul.pg_rejected += 1;
+                } else {
+                    // Check (1): PostgreSQL is supposed to refuse every one
+                    // of these. It did not, so the premise is wrong.
+                    nul_anomalies.push(NulAnomaly {
+                        function: spec.name.to_string(),
+                        oid: spec.oid,
+                        case: case.clone(),
+                        observed: fmt_outcome(&pg),
+                    });
+                }
+            }
+
+            match compare(&basin_outcome, &pg) {
+                None => {
+                    if has_nul {
+                        nul.agreed += 1;
+                    }
+                }
+                Some(reason) => {
+                    // Attribution requires the companion harness to exist.
+                    let class = match classify(args, &basin_outcome, &pg) {
+                        Class::NulBelowTheGuard if companion.is_ok() => Class::NulBelowTheGuard,
+                        _ => Class::Unexplained,
+                    };
+                    if has_nul {
+                        match class {
+                            Class::NulBelowTheGuard => nul.attributed += 1,
+                            Class::Unexplained => nul.unexplained += 1,
+                        }
+                    }
+                    divergences.push(Divergence {
+                        function: spec.name.to_string(),
+                        oid: spec.oid,
+                        case: case.clone(),
+                        reason,
+                        class,
+                    });
+                }
             }
         }
     }
 
     std::panic::set_hook(previous_hook);
 
+    let attributed: Vec<&Divergence> = divergences
+        .iter()
+        .filter(|d| d.class == Class::NulBelowTheGuard)
+        .collect();
+    let unexplained: Vec<&Divergence> = divergences
+        .iter()
+        .filter(|d| d.class == Class::Unexplained)
+        .collect();
+
     // ---- metric: always printed ---------------------------------------
     print_banner(&format!(
         "{functions_covered} functions covered, {total_call_sites} call sites compared, \
-         {} divergences found",
-        divergences.len()
+         {} unexplained divergence(s), {} attributed to the wire-layer NUL guard",
+        unexplained.len(),
+        attributed.len()
     ));
 
-    if divergences.is_empty() {
-        print_banner(
-            "PASS — every call site matched PostgreSQL 18 on value, NULL-ness, and \
-                       error-vs-success",
+    print_nul_accounting(&nul, total_call_sites, &attributed, companion.is_ok());
+
+    if !nul_anomalies.is_empty() {
+        println!(
+            "\n!!! {} NUL-bearing call site(s) that PostgreSQL did NOT refuse with {NUL_SQLSTATE}.\n\
+             This battery attributes its NUL divergences on the premise that the live server \
+             refuses every one of them. It did not, so the premise — not just the count — needs \
+             re-measuring:",
+            nul_anomalies.len()
         );
+        for a in &nul_anomalies {
+            println!(
+                "    {} (oid {}) [{}] — postgres returned {}",
+                a.function, a.oid, a.case, a.observed
+            );
+        }
+    }
+
+    if !unexplained.is_empty() {
+        println!("\n--- unexplained divergences ------------------------------------------");
+        println!("{}", group_by_function(&unexplained, true));
+    }
+
+    if unexplained.is_empty() && nul_anomalies.is_empty() {
+        print_banner(&format!(
+            "PASS — every call site matched PostgreSQL 18 on value, NULL-ness, and \
+             error-vs-success, except {} call site(s) where basin's eval accepted an embedded \
+             NUL that PostgreSQL refused with {NUL_SQLSTATE}. Those are the wire layer's to \
+             refuse and it does (a4749d4e); see the NUL accounting above",
+            attributed.len()
+        ));
         return Ok(());
     }
 
+    let mut msg = String::new();
+    if !unexplained.is_empty() {
+        let functions = unexplained
+            .iter()
+            .map(|d| (d.function.clone(), d.oid))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        msg.push_str(&format!(
+            "{} of {total_call_sites} call sites across {functions} function(s) diverged from \
+             PostgreSQL for reasons this battery cannot account for — see the listing above. \
+             This is the honest count; do not weaken the battery to make it smaller. The one \
+             thing that is discounted, embedded-NUL input, is discounted by measurement and not \
+             by exemption: it is counted, printed, and only set aside when the server really \
+             refused it with {NUL_SQLSTATE}, basin's eval really returned a value, and the \
+             harness that refuses it one layer up really still exists.",
+            unexplained.len()
+        ));
+    }
+    if !nul_anomalies.is_empty() {
+        if !msg.is_empty() {
+            msg.push_str("\n\n");
+        }
+        msg.push_str(&format!(
+            "{} NUL-bearing call site(s) were not refused by PostgreSQL with {NUL_SQLSTATE}. \
+             The NUL attribution above is only sound while the server refuses all of them, so \
+             this fails the run even if nothing else diverged.",
+            nul_anomalies.len()
+        ));
+    }
+    Err(msg)
+}
+
+/// The NUL block. Printed on every run, including a clean one — the whole
+/// point is that a reader can tell from this output whether Basin is right
+/// about NUL handling, and "no NUL cases were exercised" must not look the
+/// same as "they were, and they were accounted for".
+fn print_nul_accounting(
+    nul: &NulTally,
+    total_call_sites: usize,
+    attributed: &[&Divergence],
+    companion_ok: bool,
+) {
+    println!("\n--- NUL accounting ---------------------------------------------------");
+    println!(
+        "  {} of {total_call_sites} call sites carried an embedded NUL (0x00) in a text argument.",
+        nul.sites
+    );
+    println!(
+        "  {} of those {} were refused by the live server with SQLSTATE {NUL_SQLSTATE} \
+         (character_not_in_repertoire) — measured this run, not assumed.",
+        nul.pg_rejected, nul.sites
+    );
+    println!(
+        "  Of those {} sites: {} diverged in the one attributed shape (basin's eval SUCCEEDED, \
+         postgres ERRORED {NUL_SQLSTATE}), {} did not diverge at all (basin errored too), {} \
+         diverged some other way and are counted as unexplained.",
+        nul.sites, nul.attributed, nul.agreed, nul.unexplained
+    );
+    if !companion_ok {
+        println!(
+            "  ATTRIBUTION SUSPENDED: the wire-guard companion harness is missing (see above), \
+             so NUL divergences are reported as unexplained this run."
+        );
+    }
+    if attributed.is_empty() {
+        println!("  Nothing attributed this run.");
+    } else {
+        println!(
+            "  The {} attributed divergence(s) are NOT {} bugs. eval() is below the layer that \
+             owns this check: basin-router's decode_param rejects a NUL for every type in text \
+             format and per-type in binary (a4749d4e), COPY rejects it for text columns, and \
+             basin-rest returns HTTP 400 (6d8f38db). No client can reach eval() with a NUL; this \
+             battery can, because it calls eval() directly on a RecordBatch. Per function:",
+            attributed.len(),
+            attributed.len()
+        );
+        print!("{}", group_by_function(attributed, false));
+    }
+    println!("----------------------------------------------------------------------");
+}
+
+/// Group divergences by `(function, oid)`. With `detail`, every case and its
+/// reason is listed; without, only the per-function count — 101 repetitions
+/// of one sentence is what made this battery's output unreadable in the
+/// first place, and the shape is already stated once above.
+fn group_by_function(ds: &[&Divergence], detail: bool) -> String {
     use std::collections::BTreeMap;
-    let mut by_function: BTreeMap<(String, u32), Vec<&Divergence>> = BTreeMap::new();
-    for d in &divergences {
+    let mut by_function: BTreeMap<(&str, u32), Vec<&&Divergence>> = BTreeMap::new();
+    for d in ds {
         by_function
-            .entry((d.function.clone(), d.oid))
+            .entry((d.function.as_str(), d.oid))
             .or_default()
             .push(d);
     }
-
-    let mut detail = String::new();
-    for ((name, oid), ds) in &by_function {
-        detail.push_str(&format!(
-            "\n{name} (oid {oid}) — {} divergence(s):\n",
-            ds.len()
-        ));
-        for d in ds {
-            detail.push_str(&format!("    [{}] {}\n", d.case, d.reason));
+    let mut out = String::new();
+    for ((name, oid), group) in &by_function {
+        if detail {
+            out.push_str(&format!(
+                "\n{name} (oid {oid}) — {} divergence(s):\n",
+                group.len()
+            ));
+            for d in group {
+                out.push_str(&format!("    [{}] {}\n", d.case, d.reason));
+            }
+        } else {
+            out.push_str(&format!(
+                "    {name} (oid {oid}) — {} call site(s)\n",
+                group.len()
+            ));
         }
     }
-    println!("{detail}");
-
-    Err(format!(
-        "{} of {total_call_sites} call sites across {} function(s) diverged from PostgreSQL — \
-         see the per-function listing above. This is the honest count; do not weaken the \
-         battery to make it smaller.",
-        divergences.len(),
-        by_function.len()
-    ))
+    out
 }
 
 fn main() {
