@@ -100,7 +100,10 @@ async fn create_domain_with_timestamp_succeeds() {
     assert_eq!(col_i64(&batches, "id"), vec![1]);
 }
 
-#[ignore = "C5: to_char returns format-string literal instead of formatted date when called via SQL UDF — blocked on #40 cluster"]
+// Was `#[ignore]`d as "to_char returns the format-string literal instead of a
+// formatted date". It did — in the subset of processes where DataFusion's
+// built-in `to_char` won the name through its `date_format` alias. With
+// `session::flatten_registry` pinning the winner, it no longer can.
 #[tokio::test]
 async fn create_function_with_timestamp_arg() {
     let dir = TempDir::new().unwrap();

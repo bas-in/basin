@@ -737,30 +737,33 @@ async fn a_table_named_only_inside_a_subquery_is_served_and_matches_postgres() {
     std::env::remove_var("BASIN_OWNED_ENGINE");
 }
 
-/// Property 11: the three subquery shapes this walk now prefetches correctly
-/// but that still are not *executable* by the owned pipeline fall back
-/// **safely** — the client gets PostgreSQL's answer via DataFusion — rather
-/// than erroring or, worse, serving a wrong one. That is the property the
-/// flag's whole safety argument rests on, and it is the reason widening the
-/// walk is not the same as widening the blast radius.
+/// Property 11: the three subquery shapes this walk prefetches are now
+/// SERVED by the owned pipeline, and return PostgreSQL's answers.
 ///
-/// Why each is not servable, all downstream of this bridge:
+/// This test used to pin the opposite. It asserted that all three fell back
+/// *safely* — the client getting PostgreSQL's answer via DataFusion — and its
+/// doc explained at length why each was unservable: `opt::decorrelate` refuses
+/// an uncorrelated `IN` (its trap 2, there is no correlation predicate to join
+/// on) and refuses every `NotIn` unconditionally (its trap 1, an anti-join
+/// answers `true` where three-valued logic says NULL), so an
+/// `Expr::Subquery { kind: In | NotIn }` reached `eval.rs` and reported
+/// `ExecError::Internal`.
 ///
-/// * `opt::decorrelate` refuses an *uncorrelated* `IN` on purpose (its trap 2:
-///   there is no correlation predicate to join on, and evaluating it once
-///   beats joining), and refuses every `NotIn` unconditionally (its trap 1:
-///   without nullability tracking an anti-join is a wrong-answer bug under
-///   three-valued logic). Neither survives to a form `basin-exec` can run, so
-///   an `Expr::Subquery { kind: In | NotIn }` reaches `eval.rs`, which reports
-///   `ExecError::Internal("subqueries must be decorrelated into a join ...")`.
-/// * A *correlated* scalar subquery in a target list is refused rather than
-///   folded. It used to be folded once with an unbound outer row and answer
-///   `0, 0, 0` where Postgres answers `2, 1, 0`; that silent wrong answer is
-///   fixed, and the shape now declines. Declining is the correct outcome
-///   here, so this test pins the decline together with the answer, not the
-///   serve.
+/// All of that reasoning was correct and is now obsolete. `basin-exec` grew a
+/// three-valued `quantified_expr` that evaluates these WITHOUT decorrelating
+/// — so `decorrelate`'s two refusals remain right and are simply no longer
+/// the last word. The correlated scalar was never really declining either: its
+/// probe batch failed `RecordBatch::try_new` on any `NOT NULL` outer column,
+/// which is every row of `t`.
+///
+/// The row-value assertions are unchanged and still come from live PostgreSQL
+/// 18.2. Only the routing assertion flipped, from `fallback + 1` to
+/// `served + 1` — which is strictly stronger: a fallback merely had to not be
+/// wrong, whereas serving these means the owned engine computes three-valued
+/// `IN`/`NOT IN` and per-row correlation itself and still agrees with the
+/// server.
 #[tokio::test]
-async fn subquery_shapes_that_are_not_servable_yet_fall_back_with_postgres_answers() {
+async fn subquery_shapes_the_walk_prefetches_are_served_with_postgres_answers() {
     let _guard = env_lock();
     std::env::remove_var("BASIN_OWNED_ENGINE");
 
@@ -814,18 +817,18 @@ async fn subquery_shapes_that_are_not_servable_yet_fall_back_with_postgres_answe
 
         assert_eq!(
             eng.owned_engine_served_count(),
-            before_served,
-            "{sql:?} is not servable yet — see this test's doc comment"
+            before_served + 1,
+            "{sql:?} is served by the owned engine now — see this test's doc comment"
         );
         assert_eq!(
             eng.owned_engine_fallback_count(),
-            before_fell + 1,
-            "{sql:?} must fall back, not error"
+            before_fell,
+            "{sql:?} must not fall back"
         );
         assert_eq!(
             got,
             expected.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
-            "a fallback must still return PostgreSQL's answer for {sql:?}"
+            "the owned engine must return PostgreSQL's answer for {sql:?}"
         );
     }
 

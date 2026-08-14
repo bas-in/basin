@@ -182,58 +182,14 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
         // extracts the raw i64 value at runtime and handles all forms.
         signature: Signature::any(2, Volatility::Immutable),
     }));
-    // to_char — one combined UDF covering timestamp, date, and numeric inputs.
-    // Registering a single UDF avoids the DataFusion registry overwrite that
-    // would occur if two UDFs share the same name.
-    // Use TypeSignature::UserDefined so the UDF matches any 2-arg call
-    // regardless of timestamp timezone/unit variant, then validates at runtime.
-    ctx.register_udf(ScalarUDF::from(ToCharPgUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Nanosecond, None),
-                    DataType::Utf8,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
-                    DataType::Utf8,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                    DataType::Utf8,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Second, None),
-                    DataType::Utf8,
-                ]),
-                // Timestamptz (with timezone) variants — NOW() may produce these.
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                    DataType::Utf8,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                    DataType::Utf8,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
-                    DataType::Utf8,
-                ]),
-                TypeSignature::Exact(vec![
-                    DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
-                    DataType::Utf8,
-                ]),
-                TypeSignature::Exact(vec![DataType::Date32, DataType::Utf8]),
-                // Numeric overloads.
-                TypeSignature::Exact(vec![DataType::Float64, DataType::Utf8]),
-                TypeSignature::Exact(vec![DataType::Float32, DataType::Utf8]),
-                TypeSignature::Exact(vec![DataType::Int64, DataType::Utf8]),
-                TypeSignature::Exact(vec![DataType::Int32, DataType::Utf8]),
-                TypeSignature::Exact(vec![DataType::Int16, DataType::Utf8]),
-            ],
-            Volatility::Immutable,
-        ),
-    }));
+    // `to_char` is NOT registered here. It lives in
+    // `datetime_more_udf::ToCharMoreUdf`, which is the single implementation
+    // of that SQL name in the tree. There used to be a second one right here
+    // (`ToCharPgUdf`); because `register_datetime_more_udfs` runs later in
+    // `session::build_stateless_udf_cache`, this one was silently overwritten
+    // and never executed — while still leaving a duplicate for the registry
+    // to trip over. Its numeric picture formatter was the better of the two
+    // and survives as `format_numeric_pg` below, which `ToCharMoreUdf` calls.
     ctx.register_udf(ScalarUDF::from(ToTimestampPgUdf {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
@@ -2360,43 +2316,6 @@ fn pg_format_to_chrono(fmt: &str) -> String {
     out
 }
 
-/// Post-process a chrono-formatted string by substituting Basin-private
-/// placeholders (`\x01CC\x01`, `\x01Q\x01`, `\x01W\x01`, `\x01J\x01`) with
-/// computed values derived from the source `NaiveDateTime`.
-fn pg_format_postprocess(s: String, dt: chrono::NaiveDateTime) -> String {
-    use chrono::Datelike;
-    if !s.contains('\x01') {
-        return s;
-    }
-    let year = dt.year();
-    let month = dt.month();
-    let day = dt.day();
-
-    // Century: year 2001-2100 → CC=21.
-    let cc = ((year - 1) / 100) + 1;
-    // Quarter: 1-4.
-    let q = ((month - 1) / 3) + 1;
-    // Week-in-month: ceil(day/7).
-    let w = ((day - 1) / 7) + 1;
-    // Julian day number (days since Jan 1, 4713 BC = JD 0). The Unix epoch
-    // is JD 2440588.
-    let julian = {
-        let epoch_jd: i64 = 2_440_588;
-        let days_since_epoch = dt
-            .signed_duration_since(chrono::NaiveDateTime::new(
-                chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-            ))
-            .num_days();
-        epoch_jd + days_since_epoch
-    };
-
-    s.replace("\x01CC\x01", &format!("{cc:02}"))
-        .replace("\x01Q\x01", &format!("{q}"))
-        .replace("\x01W\x01", &format!("{w}"))
-        .replace("\x01J\x01", &format!("{julian}"))
-}
-
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ModUdf {
     signature: Signature,
@@ -2706,97 +2625,6 @@ fn days_in_month(year: i32, month: u32) -> u32 {
             }
         }
         _ => 30, // unreachable; guard against bad input.
-    }
-}
-
-/// PG-format-aware `to_char(timestamp, format)`. Translates PG directives
-/// to chrono and renders via `chrono::DateTime::format`.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct ToCharPgUdf {
-    signature: Signature,
-}
-
-impl ScalarUDFImpl for ToCharPgUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "to_char"
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    #[allow(deprecated)]
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = &args.args;
-        if args.len() != 2 {
-            return exec_err!("to_char expects 2 arguments, got {}", args.len());
-        }
-        let n = args
-            .iter()
-            .filter_map(|a| match a {
-                ColumnarValue::Array(arr) => Some(arr.len()),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(1);
-        let val_arr = args[0].clone().into_array(n)?;
-        let fmt_arr = args[1].clone().into_array(n)?;
-        let fmt = fmt_arr
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("to_char: arg 2 must be Utf8".into()))?;
-
-        // Dispatch on the first argument type.
-        let is_numeric = matches!(
-            val_arr.data_type(),
-            DataType::Float64
-                | DataType::Float32
-                | DataType::Int64
-                | DataType::Int32
-                | DataType::Int16
-        );
-
-        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
-        if is_numeric {
-            // Numeric picture formatting path.
-            let val_f64 = datafusion::arrow::compute::cast(&val_arr, &DataType::Float64)
-                .map_err(|e| DataFusionError::Execution(format!("to_char(numeric): {e}")))?;
-            let val_f64 = val_f64
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution("to_char(numeric): cast to Float64 failed".into())
-                })?;
-            for i in 0..n {
-                if val_f64.is_null(i) || fmt.is_null(i) {
-                    out.push(None);
-                    continue;
-                }
-                out.push(Some(format_numeric_pg(fmt.value(i), val_f64.value(i))?));
-            }
-        } else {
-            // Datetime formatting path.
-            for i in 0..n {
-                if fmt.is_null(i) {
-                    out.push(None);
-                    continue;
-                }
-                let chrono_fmt = pg_format_to_chrono(fmt.value(i));
-                let dt = ts_array_to_naive(&val_arr, i)?;
-                match dt {
-                    Some(dt) => {
-                        let raw = dt.format(&chrono_fmt).to_string();
-                        out.push(Some(pg_format_postprocess(raw, dt)));
-                    }
-                    None => out.push(None),
-                }
-            }
-        }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
     }
 }
 
@@ -3134,8 +2962,15 @@ impl ScalarUDFImpl for LengthPgUdf {
 //   FM        — fill mode (suppress leading/trailing spaces and zeros)
 //
 // The result is padded with spaces on the left like real PG unless FM is set.
-
-fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
+//
+// This is the numeric half of `to_char`. The datetime half lives in
+// `datetime_more_udf::ToCharMoreUdf`, which owns the SQL name and calls this
+// function for numeric first arguments. Measured against PostgreSQL 18.2 it
+// beats the formatter it replaced on `S9999` (`  +42`, exact), `XXXX`,
+// `9.99EEEE` and `999,999.99` (grouping present, one leading space short of
+// PG's sign slot); both are still wrong for pictures that overflow, where PG
+// emits `###`.
+pub(crate) fn format_numeric_pg(template: &str, value: f64) -> DFResult<String> {
     // Detect FM prefix.
     let (fm, tpl) = if template.starts_with("FM") || template.starts_with("fm") {
         (true, &template[2..])

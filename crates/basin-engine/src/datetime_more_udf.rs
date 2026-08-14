@@ -584,15 +584,30 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 // to_char(ts|date, fmt) → text
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `to_char(timestamp|date, format) → text`
+/// `to_char(timestamp|date|numeric, format) → text`
 ///
-/// Accepts all timestamp unit/timezone variants and `Date32`.
-/// For numeric inputs (Float64, Int64, etc.) falls back to a simple
-/// `format!("{:.prec}")` rendering with `9`/`0` picture codes.
+/// **The only `to_char` in the tree.** A second implementation used to live in
+/// `udf.rs`; between them they made the function's answer depend on which
+/// process asked, so they were merged here — the datetime path is this one's,
+/// the numeric path is the other one's (`udf::format_numeric_pg`), each
+/// picked by measurement against PostgreSQL 18.2.
+///
+/// Accepts all timestamp unit/timezone variants and `Date32`; numeric inputs
+/// (Float64, Int64, …) go to `udf::format_numeric_pg`.
 ///
 /// **Not supported:** interval inputs (use `to_char_interval` from
 /// `interval_tz_udf`), `BC`/`AD` era, `SSSS`, `OF`, `TZH`/`TZM`, locale
 /// month/day names (always English via chrono).
+///
+/// **Known divergences from PostgreSQL 18.2**, measured, not guessed:
+/// `Month` is not blank-padded to 9 characters (`January 15` vs PG's
+/// `January   15`); `DY` and `DAY` do not upper-case (`Mon` vs PG's `MON`),
+/// because chrono's `%a`/`%A` render in title case and the `FM`/case
+/// distinction PG draws between `Day`/`DAY` is lost in translation; `DDD` and
+/// `IYYY` are not recognised at all and fall through as literals; `WW` uses
+/// chrono's `%U` and lands one short of PG's `ceil(DDD/7)`. Numeric pictures
+/// that overflow render the digits instead of PG's `###`. Fixing those is a
+/// separate job from the name collision this merge closed.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ToCharMoreUdf {
     signature: Signature,
@@ -654,7 +669,10 @@ impl ScalarUDFImpl for ToCharMoreUdf {
                 if f64_arr.is_null(i) || fmts.is_null(i) {
                     out.push(None);
                 } else {
-                    out.push(Some(format_numeric_pg(fmts.value(i), f64_arr.value(i))?));
+                    out.push(Some(crate::udf::format_numeric_pg(
+                        fmts.value(i),
+                        f64_arr.value(i),
+                    )?));
                 }
             }
         } else {
@@ -677,44 +695,6 @@ impl ScalarUDFImpl for ToCharMoreUdf {
         }
         Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
     }
-}
-
-/// Format a floating-point value using a PG numeric picture string.
-///
-/// Supported picture codes: `9` (digit, suppress leading zero), `0` (digit,
-/// keep leading zero), `.` (decimal point), `,` (grouping separator — kept
-/// verbatim in output), `FM` (fill mode — strip trailing zeros/spaces).
-/// Everything else is passed through verbatim.
-fn format_numeric_pg(picture: &str, v: f64) -> DFResult<String> {
-    // Count digits before and after the decimal point in the picture.
-    let dot_pos = picture.find('.');
-    let int_pic: &str = dot_pos.map(|p| &picture[..p]).unwrap_or(picture);
-    let frac_pic: &str = dot_pos.map(|p| &picture[p + 1..]).unwrap_or("");
-    // Count significant-digit placeholders (9 or 0).
-    let int_digits = int_pic.chars().filter(|&c| c == '9' || c == '0').count();
-    let frac_digits = frac_pic.chars().filter(|&c| c == '9' || c == '0').count();
-    let _ = int_digits; // informational; we use frac_digits for precision.
-    let fill_mode = picture.contains("FM");
-
-    let formatted = if frac_digits > 0 {
-        format!("{:.prec$}", v, prec = frac_digits)
-    } else {
-        format!("{:.0}", v)
-    };
-    let result = if fill_mode {
-        // Strip trailing zeros after decimal point.
-        if formatted.contains('.') {
-            formatted
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string()
-        } else {
-            formatted
-        }
-    } else {
-        formatted
-    };
-    Ok(result)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

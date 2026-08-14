@@ -412,10 +412,159 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     // session-open time is O(n) Arc ref-count bumps with no allocation.
     let optimizer_rules = datafusion::optimizer::Optimizer::default().rules;
     StatelessUdfCache {
-        scalar: state.scalar_functions().values().cloned().collect(),
-        aggregate: state.aggregate_functions().values().cloned().collect(),
+        scalar: flatten_registry(state.scalar_functions(), |f| f.name(), |f| f.aliases()),
+        aggregate: flatten_registry(state.aggregate_functions(), |f| f.name(), |f| f.aliases()),
         optimizer_rules,
     }
+}
+
+/// Flatten a DataFusion function registry map into the `Vec` that
+/// `SessionStateBuilder::with_*_functions` wants, **deterministically**.
+///
+/// ## Why this is not `map.values().cloned().collect()`
+///
+/// It used to be, and that was a live wrong-answer bug (`to_char` returned
+/// the literal string `YYYY-MM-DD` in roughly half of all processes).
+///
+/// The registry is keyed by name, but a single function can occupy *several*
+/// keys: `FunctionRegistry::register_udf` inserts the function under every
+/// entry of `aliases()` as well as under `name()`. DataFusion's built-in
+/// `to_char` carries the alias `date_format`, so once Basin's own `to_char`
+/// overwrites key `"to_char"`, the built-in survives at key `"date_format"` —
+/// two map entries, two distinct implementations, both answering to the name
+/// `to_char`.
+///
+/// `SessionStateBuilder::build` then walks the `Vec` and calls `register_udf`
+/// on each element, re-inserting each function under its own `name()`. So the
+/// *last* element of the `Vec` claiming a given name wins — and the `Vec` came
+/// out of `HashMap::values()`, whose order `std`'s `RandomState` re-seeds per
+/// process. Same binary, same query, different answer per process.
+///
+/// The fix orders the `Vec` so that the rebuild reproduces the map it came
+/// from, exactly. Read the map as an ownership claim — key `K` belongs to
+/// `map[K]` — and note that replaying element `F` overwrites every key in
+/// `{F.name()} ∪ F.aliases()`. So whenever `F` would claim a key owned by
+/// some other `G`, `F` must be replayed *before* `G`. Those are edges in a
+/// DAG; a topological sort of it, with ties broken by name so the result is
+/// byte-identical run to run, is an order under which every key ends up back
+/// with its owner.
+///
+/// Two real collisions in this tree are resolved by that rule: `to_char`
+/// (Basin's own vs. DataFusion's built-in, reachable via its `date_format`
+/// alias) and `array_contains` (Basin's own vs. DataFusion's `array_has`,
+/// which lists `array_contains` among its aliases). Both used to be coin
+/// flips decided by the process's hash seed.
+fn flatten_registry<T, N, A>(
+    map: &std::collections::HashMap<String, Arc<T>>,
+    name_of: N,
+    aliases_of: A,
+) -> Vec<Arc<T>>
+where
+    N: Fn(&T) -> &str,
+    A: Fn(&T) -> &[String],
+{
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // One node per distinct function. Identity is the `Arc`'s address (the
+    // same function sits at several keys); the label is the lowest key it
+    // occupies, which is unique and stable.
+    let mut fn_of: BTreeMap<usize, &Arc<T>> = BTreeMap::new();
+    let mut label_of: BTreeMap<usize, &str> = BTreeMap::new();
+    for (key, f) in map {
+        let id = Arc::as_ptr(f) as usize;
+        fn_of.insert(id, f);
+        let label = label_of.entry(id).or_insert(key.as_str());
+        if key.as_str() < *label {
+            *label = key.as_str();
+        }
+    }
+    let by_label: BTreeMap<&str, usize> = label_of.iter().map(|(id, l)| (*l, *id)).collect();
+
+    // Edge `id -> owner`: `id` claims a key that `owner` owns, so `id` first.
+    let mut succs: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    let mut indeg: BTreeMap<usize, usize> = fn_of.keys().map(|id| (*id, 0)).collect();
+    for (id, f) in &fn_of {
+        let claims = std::iter::once(name_of(f)).chain(aliases_of(f).iter().map(String::as_str));
+        for key in claims {
+            let Some(owner) = map.get(key) else { continue };
+            let owner_id = Arc::as_ptr(owner) as usize;
+            if owner_id != *id && succs.entry(*id).or_default().insert(owner_id) {
+                *indeg.get_mut(&owner_id).expect("owner is a registry entry") += 1;
+            }
+        }
+    }
+
+    // Kahn's algorithm, draining the ready set in label order.
+    let mut ready: BTreeSet<&str> = by_label
+        .iter()
+        .filter(|(_, id)| indeg[id] == 0)
+        .map(|(label, _)| *label)
+        .collect();
+    let mut out: Vec<Arc<T>> = Vec::with_capacity(fn_of.len());
+    let mut emitted: BTreeSet<usize> = BTreeSet::new();
+    while let Some(label) = ready.iter().next().copied() {
+        ready.remove(label);
+        let id = by_label[label];
+        out.push(Arc::clone(fn_of[&id]));
+        emitted.insert(id);
+        for succ in succs.get(&id).into_iter().flatten() {
+            let deg = indeg.get_mut(succ).expect("successor is a registry entry");
+            *deg -= 1;
+            if *deg == 0 {
+                ready.insert(label_of[succ]);
+            }
+        }
+    }
+    // A cycle — two functions each shadowing a name the other owns — cannot be
+    // satisfied by any order. Append the survivors in label order so the build
+    // stays deterministic; `scalar_udf_name_collisions_are_declared` is the
+    // test that makes such a pair visible.
+    for id in by_label.values() {
+        if !emitted.contains(id) {
+            out.push(Arc::clone(fn_of[id]));
+        }
+    }
+    out
+}
+
+/// For every SQL name claimed by more than one cached scalar UDF, the
+/// implementation that actually wins it once the cache is replayed.
+///
+/// Used by the registry-collision test below; never called at runtime.
+#[cfg(test)]
+fn contested_scalar_names(cache: &StatelessUdfCache) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+
+    // The `Debug` form of the inner impl starts with the struct name for every
+    // `#[derive(Debug)]` UDF in the tree — enough to tell two implementations
+    // of one SQL name apart.
+    fn label(f: &datafusion::logical_expr::ScalarUDF) -> String {
+        format!("{:?}", f.inner())
+            .split([' ', '{', '('])
+            .next()
+            .unwrap_or("?")
+            .to_string()
+    }
+
+    let mut claimants: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut winner: BTreeMap<&str, String> = BTreeMap::new();
+    for f in &cache.scalar {
+        for name in std::iter::once(f.name()).chain(f.aliases().iter().map(String::as_str)) {
+            let l = label(f);
+            let seen = claimants.entry(name).or_default();
+            if !seen.contains(&l) {
+                seen.push(l.clone());
+            }
+            // Replaying the cache is last-write-wins, so the final assignment
+            // here is the implementation the session will resolve to.
+            winner.insert(name, l);
+        }
+    }
+    claimants
+        .into_iter()
+        .filter(|(_, impls)| impls.len() > 1)
+        .map(|(name, _)| (name.to_string(), winner[name].clone()))
+        .collect()
 }
 
 /// `OVERRIDING { SYSTEM | USER } VALUE` clause on INSERT. Tracked
@@ -6587,6 +6736,109 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering::Relaxed;
     use std::time::Duration;
+
+    /// The UDF cache must flatten to the *same* `Vec` in every process.
+    ///
+    /// Regression gate for the `to_char` coin-flip: the cache used to be
+    /// `HashMap::values().collect()`, whose order `std`'s `RandomState`
+    /// re-seeds per process, and `SessionStateBuilder::build` resolves a
+    /// name collision by "last element of the `Vec` wins". Two runs of the
+    /// same binary therefore disagreed on which `to_char` they called.
+    ///
+    /// Building the cache twice inside one process is not enough to catch a
+    /// regression (one process has one hash seed), so this pins the *outcome*
+    /// that the ordering exists to guarantee: replaying the cache the way
+    /// `SessionStateBuilder::build` replays it must resolve every SQL name to
+    /// the implementation that actually owns it, never to a bystander that
+    /// merely happens to sit later in the vector.
+    #[test]
+    fn udf_cache_resolves_every_name_to_its_owner() {
+        let cache = build_stateless_udf_cache();
+
+        // Replay `build`'s loop: for each element, insert under `name()` and
+        // under every alias. Last write wins.
+        use datafusion::logical_expr::ScalarUDF;
+        let mut resolved: std::collections::HashMap<&str, &Arc<ScalarUDF>> = Default::default();
+        for f in &cache.scalar {
+            for alias in f.aliases() {
+                resolved.insert(alias.as_str(), f);
+            }
+            resolved.insert(f.name(), f);
+        }
+
+        // Every name that some element claims as its own `name()` must resolve
+        // to an element whose `name()` is that name — not to a different
+        // function that only reached the key through an alias.
+        let mut hijacked = Vec::new();
+        for f in &cache.scalar {
+            let winner = resolved[f.name()];
+            if winner.name() != f.name() {
+                hijacked.push(format!(
+                    "{:?} resolves to {:?}, whose own name is {:?}",
+                    f.name(),
+                    winner.inner(),
+                    winner.name()
+                ));
+            }
+        }
+        assert!(
+            hijacked.is_empty(),
+            "UDF names hijacked by an alias of another function: {hijacked:#?}"
+        );
+
+        // And the flattened order itself is reproducible within a process.
+        let again = build_stateless_udf_cache();
+        let names = |c: &StatelessUdfCache| -> Vec<String> {
+            c.scalar.iter().map(|f| f.name().to_string()).collect()
+        };
+        assert_eq!(
+            names(&cache),
+            names(&again),
+            "UDF cache order is not reproducible"
+        );
+    }
+
+    /// Every SQL name claimed by two implementations, and which one wins.
+    ///
+    /// A collision is not automatically a bug — Basin deliberately shadows
+    /// several DataFusion built-ins — but an *undeclared* one is, because
+    /// that is the shape of defect that made `to_char` a coin flip. Both the
+    /// set of contested names and the winner of each are pinned here, so
+    /// adding a colliding UDF, or quietly flipping which implementation
+    /// answers, fails this test.
+    #[test]
+    fn scalar_udf_name_collisions_are_declared() {
+        // (SQL name, implementation that must win it). Every entry is a
+        // DataFusion built-in shadowed by a Basin UDF of the same name, or
+        // reachable through one of its aliases. Winners are fixed by
+        // `flatten_registry`, not by the process's hash seed.
+        const DECLARED: &[(&str, &str)] = &[
+            // DataFusion's `array_has` lists `array_contains` as an alias.
+            ("array_contains", "ArrayContainsUdf"),
+            // DataFusion's `array_has_any` lists `arrays_overlap` as an alias.
+            ("arrays_overlap", "ArraysOverlapUdf"),
+            ("btrim", "TrimCharsUdf"),
+            ("length", "LengthPgUdf"),
+            ("power", "PowerFloat64Udf"),
+            // DataFusion's built-in `to_char` survives at its `date_format`
+            // alias and must not recapture `to_char` itself.
+            ("to_char", "ToCharMoreUdf"),
+        ];
+
+        let cache = build_stateless_udf_cache();
+        let actual = contested_scalar_names(&cache);
+        let expected: std::collections::BTreeMap<String, String> = DECLARED
+            .iter()
+            .map(|(n, i)| (n.to_string(), i.to_string()))
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "contested scalar UDF names (or their winners) changed.\n\
+             Two implementations under one name resolve by registration order; \
+             declare the winner here rather than leaving it to the registry."
+        );
+    }
 
     /// Complete-by-construction: after `reset_gucs()`, every session GUC must
     /// match a freshly-constructed `SessionState`. This is the gate that
