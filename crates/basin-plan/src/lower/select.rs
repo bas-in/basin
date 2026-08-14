@@ -123,7 +123,7 @@ pub fn lower_select(
     operators: &dyn OperatorResolver,
     functions: &dyn FunctionResolver,
 ) -> Result<LogicalPlan, LowerError> {
-    lower_select_with_outer(node, tables, operators, functions, None)
+    lower_select_with_outer(node, tables, operators, functions, None, &[])
 }
 
 /// [`lower_select`]'s real body, plus the one seam that entry point cannot
@@ -137,12 +137,19 @@ pub fn lower_select(
 /// with [`LowerError::UnknownName`] — see [`ScopeResolver`] and [`OUTER_REF`]
 /// for how the resulting reference is tagged so `opt::decorrelate` can later
 /// tell it apart from an ordinary, local one.
+/// `ctes` is the second such seam, and closes the same kind of gap for names
+/// that `outer` closes for columns: the `WITH`-list entries visible where the
+/// subquery was written. Postgres scopes a CTE lexically over the whole
+/// statement, so `WITH a AS (...) SELECT (SELECT count(*) FROM a)` is legal
+/// there; this argument is what makes it legal here, where the recursion used
+/// to restart from an empty list and report `UnknownName("a")`.
 fn lower_select_with_outer(
     node: &Node,
     tables: &dyn TableResolver,
     operators: &dyn OperatorResolver,
     functions: &dyn FunctionResolver,
     outer: Option<&dyn ColumnResolver>,
+    ctes: &[CteBinding],
 ) -> Result<LogicalPlan, LowerError> {
     let Some(NodeEnum::SelectStmt(stmt)) = node.node.as_ref() else {
         return Err(LowerError::Malformed("expected a SelectStmt node"));
@@ -152,8 +159,9 @@ fn lower_select_with_outer(
         operators,
         functions,
         outer,
+        ctes,
     };
-    let (plan, _schema) = lower_select_stmt(stmt, &res)?;
+    let (plan, _schema) = lower_select_stmt_ctx(stmt, &res, ctes)?;
     Ok(plan)
 }
 
@@ -183,6 +191,18 @@ struct Resolvers<'a> {
     /// so [`Resolvers::subqueries`] can hand the *current* clause's resolver
     /// down as the next nesting level's `outer`.
     outer: Option<&'a dyn ColumnResolver>,
+    /// The `WITH`-list entries in scope for this statement, so that a
+    /// subquery lowered out of any clause can still see them.
+    ///
+    /// This duplicates the `ctes: &[CteBinding]` argument already threaded
+    /// down the `FROM`-building path, and does so deliberately: that argument
+    /// reaches [`build_range_var`], which is what makes `FROM a` resolve, but
+    /// it never reaches [`SelectSubqueries`], which is what makes `(SELECT
+    /// ... FROM a)` resolve. Rather than add the argument to the six clause
+    /// helpers that sit between them, [`lower_select_stmt_body`] republishes
+    /// it here once, on entry — see there for why that keeps the two copies
+    /// from drifting.
+    ctes: &'a [CteBinding],
 }
 
 impl<'a> Resolvers<'a> {
@@ -191,12 +211,17 @@ impl<'a> Resolvers<'a> {
     /// nested subquery as *its* `outer`, one level further in. This is the
     /// single seam that turns a fixed, statement-wide `outer` into the
     /// correctly-nested chain a multiply-nested correlated subquery needs.
+    ///
+    /// `ctes` rides along unchanged, and unlike `outer` needs no re-tagging:
+    /// a CTE name is lexically scoped, so the enclosing statement's list is
+    /// exactly the list the subquery should see.
     fn subqueries(&self, columns: &'a dyn ColumnResolver) -> SelectSubqueries<'a> {
         SelectSubqueries {
             tables: self.tables,
             operators: self.operators,
             functions: self.functions,
             outer: columns,
+            ctes: self.ctes,
         }
     }
 }
@@ -212,6 +237,9 @@ struct SelectSubqueries<'a> {
     operators: &'a dyn OperatorResolver,
     functions: &'a dyn FunctionResolver,
     outer: &'a dyn ColumnResolver,
+    /// The `WITH`-list entries visible where the subquery was written — see
+    /// [`Resolvers::ctes`].
+    ctes: &'a [CteBinding],
 }
 
 impl<'a> SubqueryLowerer for SelectSubqueries<'a> {
@@ -222,6 +250,7 @@ impl<'a> SubqueryLowerer for SelectSubqueries<'a> {
             self.operators,
             self.functions,
             Some(self.outer),
+            self.ctes,
         )
     }
 }
@@ -240,12 +269,59 @@ struct ScopeRelation {
     schema: Schema,
 }
 
+/// A column that `JOIN … USING (c)` / `NATURAL JOIN` merged: the *one* column
+/// named `c` that such a join produces, in place of the two the inputs
+/// contributed.
+///
+/// All three of Postgres's rules for it are measured against a live
+/// PostgreSQL 18.2 server rather than recalled, by reading back what the
+/// server deparses for a view over each join kind:
+///
+/// - `ut JOIN uu USING (id)` and `ut LEFT JOIN uu USING (id)` deparse the
+///   merged column as `ut.id` — the LEFT input's column. Sound because an
+///   inner join matched both sides and a left join null-extends only the
+///   right.
+/// - `ut RIGHT JOIN uu USING (id)` deparses it as `uu.id` — the RIGHT
+///   input's, by the mirror argument.
+/// - `ut FULL JOIN uu USING (id)` deparses it as a bare `id` that belongs to
+///   neither input: it is `COALESCE(ut.id, uu.id)`, and measurably so — with
+///   `ut(id)` = 10, 20 and `uu(id)` = 20, 30, `SELECT id FROM ut FULL JOIN uu
+///   USING (id)` returns 10, 20, 30 while `ut.id` returns 10, 20, NULL. This
+///   is the case where picking a side is silently wrong rather than an error,
+///   so it is the one [`build_join_expr`] materializes through a real
+///   [`LogicalPlan::Project`] instead of pointing at an input column.
+///
+/// The merged column is also *unqualified*: `SELECT id` finds it, while
+/// `SELECT ut.id` still reaches the underlying column past it. Hence
+/// [`Scope::resolve`] consulting `merged` only on the unqualified path.
+#[derive(Debug, Clone)]
+struct MergedColumn {
+    name: String,
+    /// Flat index, in the enclosing [`Scope`], of the column whose value *is*
+    /// the merged value.
+    index: u16,
+    /// Flat indices `*` must not expand — the underlying column of each side,
+    /// plus anything an earlier `USING` on the same name already hid.
+    /// `index` itself is excluded by [`Scope::star_columns`] separately, since
+    /// for every kind but `FULL` it is one of these.
+    hidden: Vec<u16>,
+}
+
 /// The ordered, concatenated column list a clause resolves column references
 /// against — built up as `FROM` items are processed, and unchanged by
 /// `WHERE`/`Filter` (a predicate narrows rows, never columns).
 #[derive(Debug, Clone, Default)]
 struct Scope {
     relations: Vec<ScopeRelation>,
+    /// Columns merged away by `JOIN … USING` / `NATURAL JOIN`, in the order
+    /// `*` must emit them — which is *before* every remaining column of
+    /// either side. Measured: with `nt(a, id, b, k)` and `nu(c, k, id, d)`,
+    /// `SELECT * FROM nt JOIN nu USING (k, id)` yields `k, id, a, b, c, d` —
+    /// so the merged block leads, in the order the `USING` clause wrote them,
+    /// not in either table's order. `NATURAL JOIN` instead orders them by the
+    /// left input (`nt NATURAL JOIN nu` yields `id, k, a, b, c, d`), which
+    /// [`natural_using_columns`] produces by walking the left scope.
+    merged: Vec<MergedColumn>,
 }
 
 impl Scope {
@@ -256,11 +332,26 @@ impl Scope {
     fn single(qualifier: String, schema: Schema) -> Self {
         Scope {
             relations: vec![ScopeRelation { qualifier, schema }],
+            merged: Vec::new(),
         }
     }
 
+    /// Place `other`'s columns after this scope's own.
+    ///
+    /// `other`'s merged columns come along, re-addressed into the combined
+    /// flat space: a `USING` join nested on the right of another join keeps
+    /// exactly one visible copy of its own merged column, and forgetting to
+    /// shift it here would silently point at one of *this* scope's columns.
     fn concat(mut self, mut other: Scope) -> Self {
+        let shift = self.total_len() as u16;
         self.relations.append(&mut other.relations);
+        for mut m in other.merged {
+            m.index += shift;
+            for h in &mut m.hidden {
+                *h += shift;
+            }
+            self.merged.push(m);
+        }
         self
     }
 
@@ -293,14 +384,31 @@ impl Scope {
             return None;
         }
         let name = parts.first()?;
-        let mut offset = 0usize;
+        // A `USING`/`NATURAL` merged column REPLACES the two columns it
+        // merged, so it enters the ambiguity count as one candidate and they
+        // enter as none. That is what makes `SELECT id FROM ut JOIN uu USING
+        // (id)` legal while `SELECT id FROM ut JOIN uu USING (id), uv` — a
+        // third relation also carrying `id` — is still "column reference
+        // \"id\" is ambiguous", both measured on PostgreSQL 18.2.
         let mut found = None;
-        for rel in &self.relations {
-            if let Some(pos) = rel.schema.iter().position(|(n, _)| n == name) {
+        for m in &self.merged {
+            if &m.name == name {
                 if found.is_some() {
                     return None; // ambiguous
                 }
-                found = Some(offset + pos);
+                found = Some(m.index as usize);
+            }
+        }
+        let mut offset = 0usize;
+        for rel in &self.relations {
+            if let Some(pos) = rel.schema.iter().position(|(n, _)| n == name) {
+                let flat = offset + pos;
+                if !self.is_merged_away(flat as u16) {
+                    if found.is_some() {
+                        return None; // ambiguous
+                    }
+                    found = Some(flat);
+                }
             }
             offset += rel.schema.len();
         }
@@ -309,6 +417,17 @@ impl Scope {
             index: idx as u16,
             name: name.clone(),
         })
+    }
+
+    /// Whether the flat index `i` is one a `USING`/`NATURAL` join subsumed —
+    /// either an underlying column of a merged pair, or the visible
+    /// representative itself (which for every kind but `FULL` is one of that
+    /// pair). Such a column is unreachable unqualified and absent from `*`,
+    /// but still reachable as `t.c`.
+    fn is_merged_away(&self, i: u16) -> bool {
+        self.merged
+            .iter()
+            .any(|m| m.index == i || m.hidden.contains(&i))
     }
 
     /// The `(name, type)` at a given flat column index, if any — the whole
@@ -337,17 +456,61 @@ impl Scope {
     }
 
     /// Every `(name, flat index)` pair `*` or `t.*` expands to.
+    ///
+    /// Unqualified `*` leads with the `USING`/`NATURAL` merged columns and
+    /// then skips the columns they subsumed — measured, not inferred: with
+    /// `nt(a, id, b, k)` and `nu(c, k, id, d)`, PostgreSQL 18.2 gives
+    /// `SELECT * FROM nt JOIN nu USING (k, id)` the columns `k, id, a, b, c,
+    /// d`. So the merged block leads, in `USING`-clause order, and neither
+    /// `nt.k`/`nt.id` nor `nu.k`/`nu.id` appears again behind it.
+    ///
+    /// Qualified `t.*` is deliberately NOT merged: the same server gives
+    /// `SELECT ut.* FROM ut JOIN uu USING (id)` the columns `a, id, b` — `ut`'s
+    /// own three, in `ut`'s own order, with `id` in its natural position
+    /// rather than hoisted or dropped. Hence `qualifier.is_some()` taking the
+    /// plain path.
     fn star_columns(&self, qualifier: Option<&str>) -> Vec<(String, u16)> {
         let mut out = Vec::new();
+        if qualifier.is_none() {
+            for m in &self.merged {
+                out.push((m.name.clone(), m.index));
+            }
+        }
         let mut offset = 0usize;
         for rel in &self.relations {
             let matches = qualifier.is_none_or(|q| rel.qualifier == q);
             if matches {
                 for (i, (name, _)) in rel.schema.iter().enumerate() {
-                    out.push((name.clone(), (offset + i) as u16));
+                    let flat = (offset + i) as u16;
+                    if qualifier.is_none() && self.is_merged_away(flat) {
+                        continue;
+                    }
+                    out.push((name.clone(), flat));
                 }
             }
             offset += rel.schema.len();
+        }
+        out
+    }
+
+    /// Every `(name, flat index)` in the scope, in plain flat order, with no
+    /// `USING` merging applied at all.
+    ///
+    /// This is the *plan's* column list, not SQL's `*`. The distinction only
+    /// began to matter once [`Scope::star_columns`] learned to reorder and
+    /// drop columns: an identity projection built to widen a plan (see
+    /// [`materialize_agg_inputs`]) must reproduce indices `0..total_len()`
+    /// exactly, so appended expressions land at the indices their callers
+    /// already computed. Feeding it `*` semantics under a `USING` join would
+    /// silently renumber every column below.
+    fn flat_columns(&self) -> Vec<(String, u16)> {
+        let mut out = Vec::new();
+        let mut i = 0u16;
+        for rel in &self.relations {
+            for (name, _) in &rel.schema {
+                out.push((name.clone(), i));
+                i += 1;
+            }
         }
         out
     }
@@ -508,15 +671,6 @@ struct CteBinding {
     /// window result reports [`PgType::UNKNOWN`] rather than a guess, for the
     /// same reason `Values`'s schema does).
     schema: Schema,
-}
-
-/// Lower a top-level (or nested, e.g. a `UNION` arm or a `WITH`-list body)
-/// `SELECT`, with no `WITH`-list of its own currently in scope.
-fn lower_select_stmt(
-    stmt: &SelectStmt,
-    res: &Resolvers,
-) -> Result<(LogicalPlan, Schema), LowerError> {
-    lower_select_stmt_ctx(stmt, res, &[])
 }
 
 /// Lower a `SELECT` with `ctes` — the `WITH`-list entries of the enclosing
@@ -728,6 +882,22 @@ fn lower_select_stmt_body(
     res: &Resolvers,
     ctes: &[CteBinding],
 ) -> Result<(LogicalPlan, Schema), LowerError> {
+    // Republish `ctes` onto the resolver bundle, once, at the single point
+    // every clause of a statement body is lowered from. Every `expr_ctx` below
+    // reads it back out through [`Resolvers::subqueries`], so a `(SELECT ...
+    // FROM a)` anywhere in this statement — SELECT list, WHERE, HAVING, an
+    // `IN`/`EXISTS`, a `VALUES` row, even `LIMIT` — sees the same `WITH` list
+    // that `FROM a` sees.
+    //
+    // Done here rather than by adding a `ctes` argument to `apply_where`,
+    // `lower_values`, `apply_limit` and the rest precisely so the two copies
+    // cannot drift: `ctes` is the caller's authority and this line is the only
+    // thing that reads it into `res`, so they are equal by construction from
+    // here down. `lower_with_clause` extends the list and then calls straight
+    // back into this function, which re-runs the same line with the extended
+    // one.
+    let res = &Resolvers { ctes, ..*res };
+
     // `WINDOW w AS (...)` itself builds nothing: it only names a window
     // definition for an `OVER w` in the SELECT list to reference, which
     // `lower::expr`'s `lower_window_def` resolves out of
@@ -1899,16 +2069,6 @@ fn build_join_expr(
     res: &Resolvers,
     ctes: &[CteBinding],
 ) -> Result<FromBuilt, LowerError> {
-    if je.is_natural {
-        return Err(LowerError::Unsupported(
-            "NATURAL JOIN is not yet lowered".into(),
-        ));
-    }
-    if !je.using_clause.is_empty() {
-        return Err(LowerError::Unsupported(
-            "JOIN ... USING is not yet lowered".into(),
-        ));
-    }
     let jt = JoinType::try_from(je.jointype).unwrap_or(JoinType::Undefined);
     let kind = match jt {
         JoinType::JoinInner => JoinKind::Inner,
@@ -1934,7 +2094,34 @@ fn build_join_expr(
     let right = build_from_item(rarg, res, ctes, Some(&left.scope))?;
 
     if right.correlated {
+        if je.is_natural || !je.using_clause.is_empty() {
+            return Err(LowerError::Unsupported(
+                "a LATERAL right side under a JOIN ... USING or NATURAL JOIN is not yet lowered"
+                    .into(),
+            ));
+        }
         return build_lateral_join_expr(je, kind, left, right);
+    }
+
+    // `USING`/`NATURAL` names the join columns instead of writing a condition,
+    // and merges each pair into one column — a different enough shape to get
+    // its own builder. `NATURAL` with no column in common is NOT an error and
+    // not handled there: it falls through to the ordinary no-`quals` path
+    // below, which produces the `JoinKind::Cross` that Postgres itself
+    // produces (`nt NATURAL JOIN nx`, no shared name, deparses back as
+    // `nt CROSS JOIN nx` on PostgreSQL 18.2).
+    let using = if je.is_natural {
+        natural_using_columns(&left.scope, &right.scope)?
+    } else {
+        using_clause_columns(&je.using_clause)?
+    };
+    if !using.is_empty() {
+        if je.join_using_alias.is_some() {
+            return Err(LowerError::Unsupported(
+                "JOIN ... USING (...) AS alias is not yet lowered".into(),
+            ));
+        }
+        return build_using_join(kind, left, right, &using);
     }
 
     let left_len = left.scope.total_len();
@@ -1976,6 +2163,268 @@ fn build_join_expr(
         plan,
         scope,
         top_join_left_len,
+        correlated: false,
+    })
+}
+
+/// The column names in a `USING (a, b, c)` clause, in the order written.
+///
+/// That order is the one `*` uses, and it is the clause's, not either table's:
+/// with `nt(a, id, b, k)` and `nu(c, k, id, d)`, PostgreSQL 18.2 deparses
+/// `SELECT * FROM nt JOIN nu USING (k, id)` as `SELECT nt.k, nt.id, nt.a,
+/// nt.b, nu.c, nu.d` — `k` before `id`, matching the clause.
+fn using_clause_columns(clause: &[Node]) -> Result<Vec<String>, LowerError> {
+    clause
+        .iter()
+        .map(|n| match n.node.as_ref() {
+            Some(NodeEnum::String(s)) => Ok(s.sval.clone()),
+            _ => Err(LowerError::Malformed("USING clause entry is not a name")),
+        })
+        .collect()
+}
+
+/// The implicit `USING` list of a `NATURAL JOIN`: every column name the two
+/// sides have in common, **in the order the LEFT side presents them**.
+///
+/// Measured rather than assumed: `nt(a, id, b, k) NATURAL JOIN nu(c, k, id,
+/// d)` deparses on PostgreSQL 18.2 as `nt JOIN nu USING (id, k)` and yields
+/// `id, k, a, b, c, d` — `id` first because `nt` lists it first, even though
+/// `nu` lists `k` first. Hence walking the left scope, not the right and not
+/// the intersection in some canonical order.
+///
+/// Both sides are read through [`Scope::star_columns`], so a `NATURAL JOIN`
+/// over an already-`USING`-merged side sees the merged column once rather
+/// than the two it subsumed.
+///
+/// An empty result is a legitimate answer, not a failure: Postgres turns a
+/// `NATURAL JOIN` with nothing in common into a `CROSS JOIN` (`nt NATURAL
+/// JOIN nx` deparses as `nt CROSS JOIN nx` and returns all 2×1 rows), which
+/// is what [`build_join_expr`] does with it.
+fn natural_using_columns(left: &Scope, right: &Scope) -> Result<Vec<String>, LowerError> {
+    let right_names: Vec<String> = right
+        .star_columns(None)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let left_names: Vec<String> = left.star_columns(None).into_iter().map(|(n, _)| n).collect();
+    let mut out: Vec<String> = Vec::new();
+    for name in &left_names {
+        if !right_names.contains(name) || out.contains(name) {
+            continue;
+        }
+        // Postgres refuses rather than picking one, and says so precisely;
+        // the same wording is reproduced here because a `NATURAL JOIN` that
+        // quietly chose a side would be wrong in a way nothing downstream
+        // could detect. Measured: `(ut JOIN uv ON true) NATURAL JOIN uu`,
+        // where both `ut` and `uv` have an `id`, gives exactly this.
+        if left_names.iter().filter(|n| *n == name).count() > 1 {
+            return Err(LowerError::Unsupported(format!(
+                "common column name \"{name}\" appears more than once in left table"
+            )));
+        }
+        if right_names.iter().filter(|n| *n == name).count() > 1 {
+            return Err(LowerError::Unsupported(format!(
+                "common column name \"{name}\" appears more than once in right table"
+            )));
+        }
+        out.push(name.clone());
+    }
+    Ok(out)
+}
+
+/// `t JOIN u USING (c, …)` and its `NATURAL` spelling: an equijoin on the
+/// named columns whose result carries **one** column per name instead of two.
+///
+/// Two halves, and the second is the one that is easy to get silently wrong.
+///
+/// **The join itself** is ordinary: one `on` pair per name. `LogicalPlan::Join`
+/// stores the right side of each pair already rebased into the right input's
+/// own index space (see [`split_equijoin_conjuncts`], which calls
+/// [`rebase_columns`] for exactly this), and `right.scope`'s indices are in
+/// that space already, so they are used as-is.
+///
+/// **The merged column** is whichever column actually holds the merged value,
+/// which depends on the join kind — read off what PostgreSQL 18.2 deparses
+/// for a view over each:
+///
+/// | kind    | `pg_get_viewdef` renders the merged column as |
+/// |---------|-----------------------------------------------|
+/// | `INNER` | `ut.id`                                       |
+/// | `LEFT`  | `ut.id`                                       |
+/// | `RIGHT` | `uu.id`                                       |
+/// | `FULL`  | a bare `id` belonging to neither input        |
+///
+/// For the first three, one input's column *is* the answer: an inner join
+/// matched both sides, a left join null-extends only the right, a right join
+/// only the left. For `FULL` neither is — with `ut(id)` = 10, 20 and `uu(id)`
+/// = 20, 30, `SELECT id` returns 10, 20, 30 while `ut.id` returns 10, 20,
+/// NULL and `uu.id` returns NULL, 20, 30. So `FULL` (and only `FULL`)
+/// materializes `COALESCE(ut.id, uu.id)` through a real
+/// [`LogicalPlan::Project`], and the merged column points at that.
+///
+/// Picking a side there instead would be a *wrong answer* rather than an
+/// error, visible only on unmatched rows — which is why it is a `Project`
+/// here and not a comment saying it is close enough.
+fn build_using_join(
+    kind: JoinKind,
+    left: FromBuilt,
+    right: FromBuilt,
+    names: &[String],
+) -> Result<FromBuilt, LowerError> {
+    let left_len = left.scope.total_len() as u16;
+
+    // Resolve each name on both sides FIRST, while the two scopes are still
+    // separate: a name is looked up in one side or the other, never in the
+    // combined scope, where it would be ambiguous by construction.
+    let mut cols: Vec<(String, u16, u16, PgType)> = Vec::new();
+    for name in names {
+        let key = std::slice::from_ref(name);
+        let l = left.scope.resolve(key).ok_or_else(|| {
+            LowerError::UnknownName(format!(
+                "column \"{name}\" specified in USING clause does not exist in left table"
+            ))
+        })?;
+        let r = right.scope.resolve(key).ok_or_else(|| {
+            LowerError::UnknownName(format!(
+                "column \"{name}\" specified in USING clause does not exist in right table"
+            ))
+        })?;
+        // The merged column's type is the left side's; `USING` requires the
+        // two to be comparable, and Basin has no common-supertype resolution
+        // to run here. Falling back to the right side's when the left reads
+        // `UNKNOWN` keeps a subquery-derived side from erasing a real type.
+        let lty = left
+            .scope
+            .flat_entry(l.index)
+            .map(|(_, t)| t)
+            .unwrap_or(PgType::UNKNOWN);
+        let ty = if lty == PgType::UNKNOWN {
+            right
+                .scope
+                .flat_entry(r.index)
+                .map(|(_, t)| t)
+                .unwrap_or(PgType::UNKNOWN)
+        } else {
+            lty
+        };
+        cols.push((name.clone(), l.index, r.index, ty));
+    }
+
+    let on: Vec<(Expr, Expr)> = cols
+        .iter()
+        .map(|(name, l, r, _)| {
+            (
+                Expr::Column(ColumnRef {
+                    relation: 0,
+                    index: *l,
+                    name: name.clone(),
+                }),
+                Expr::Column(ColumnRef {
+                    relation: 0,
+                    index: *r,
+                    name: name.clone(),
+                }),
+            )
+        })
+        .collect();
+
+    let mut scope = left.scope.concat(right.scope);
+    let joined_len = scope.total_len() as u16;
+    let join = LogicalPlan::Join {
+        left: Box::new(left.plan),
+        right: Box::new(right.plan),
+        kind,
+        on,
+        filter: None,
+    };
+
+    let is_full = kind == JoinKind::Full;
+    let plan = if is_full {
+        let identity = scope.flat_columns().into_iter().map(|(name, index)| {
+            (
+                Expr::Column(ColumnRef {
+                    relation: 0,
+                    index,
+                    name: name.clone(),
+                }),
+                name,
+            )
+        });
+        let coalesced = cols.iter().map(|(name, l, r, _)| {
+            (
+                Expr::Coalesce(vec![
+                    Expr::Column(ColumnRef {
+                        relation: 0,
+                        index: *l,
+                        name: name.clone(),
+                    }),
+                    Expr::Column(ColumnRef {
+                        relation: 0,
+                        index: left_len + *r,
+                        name: name.clone(),
+                    }),
+                ]),
+                name.clone(),
+            )
+        });
+        LogicalPlan::Project {
+            input: Box::new(join),
+            exprs: identity.chain(coalesced).collect(),
+        }
+    } else {
+        join
+    };
+
+    if is_full {
+        // A relation qualified by `""`, which no SQL text can name: a
+        // zero-length delimited identifier is a *parse* error in Postgres
+        // (`SELECT ""."id"` → `zero-length delimited identifier`), so these
+        // columns are reachable only through `Scope::merged`. Registering them
+        // as a relation rather than as loose indices is what keeps
+        // `total_len` and `flat_entry` agreeing with the plan's real width.
+        scope.relations.push(ScopeRelation {
+            qualifier: String::new(),
+            schema: cols
+                .iter()
+                .map(|(name, _, _, ty)| (name.clone(), *ty))
+                .collect(),
+        });
+    }
+
+    for (i, (name, l, r, _)) in cols.iter().enumerate() {
+        let mut hidden = vec![*l, left_len + *r];
+        // Chained `USING` on one name — `ut JOIN uu USING (id) JOIN uv USING
+        // (id)` — merges the already-merged column again. Postgres still shows
+        // exactly one `id` there (measured: `id, a, b, c, d, e`), so the older
+        // entry is absorbed rather than left beside the new one.
+        scope.merged.retain(|m| {
+            if &m.name != name {
+                return true;
+            }
+            hidden.push(m.index);
+            hidden.extend(m.hidden.iter().copied());
+            false
+        });
+        let index = match kind {
+            JoinKind::Right => left_len + *r,
+            _ if is_full => joined_len + i as u16,
+            _ => *l,
+        };
+        scope.merged.push(MergedColumn {
+            name: name.clone(),
+            index,
+            hidden,
+        });
+    }
+
+    Ok(FromBuilt {
+        plan,
+        scope,
+        // `Some` only for a plain inner `USING` join, and then only because
+        // the root really is a `LogicalPlan::Join` — the `FULL` case has a
+        // `Project` on top, and folding a `WHERE` conjunct into a `FULL`
+        // join's `on` would be unsound regardless (see [`FromBuilt`]).
+        top_join_left_len: (kind == JoinKind::Inner).then_some(left_len as usize),
         correlated: false,
     })
 }
@@ -3029,7 +3478,12 @@ fn materialize_agg_inputs(input: LogicalPlan, scope: &Scope, aggs: &mut [Expr]) 
         return input;
     }
 
-    let identity = scope.star_columns(None).into_iter().map(|(name, index)| {
+    // `flat_columns`, not `star_columns`: this projection exists to keep every
+    // input column at the index it already had while appending computed ones
+    // after it. `*` semantics would hoist a `USING` merged column to the front
+    // and drop the columns it subsumed, renumbering everything the caller
+    // already resolved. See [`Scope::flat_columns`].
+    let identity = scope.flat_columns().into_iter().map(|(name, index)| {
         (
             Expr::Column(ColumnRef {
                 relation: 0,
@@ -3451,10 +3905,18 @@ mod tests {
         ]
     }
 
+    /// A relation sharing no column name with `t` or `u` — what a `NATURAL
+    /// JOIN` with nothing in common needs, so that case can be tested as the
+    /// `CROSS JOIN` Postgres makes it rather than assumed.
+    fn w_schema() -> Vec<(&'static str, PgType)> {
+        vec![("x", PgType::INT4), ("y", PgType::TEXT)]
+    }
+
     fn tables() -> MockTables {
         MockTables::default()
             .with("t", 100, &t_schema())
             .with("u", 200, &u_schema())
+            .with("w", 300, &w_schema())
     }
 
     fn lower(sql: &str) -> Result<LogicalPlan, LowerError> {
@@ -4212,6 +4674,217 @@ mod tests {
         assert_eq!(kind, JoinKind::Left);
         assert_eq!(on, vec![(col(0, "id"), col(1, "t_id"))]);
         assert!(filter.is_some());
+    }
+
+    // --- 7b: JOIN ... USING / NATURAL JOIN ----------------------------------
+    //
+    // Every expectation below is the answer a live PostgreSQL 18.2 server
+    // gives for the same shape, read back from `pg_get_viewdef` over a view
+    // on the join — see [`MergedColumn`] and [`build_using_join`] for the
+    // measurements themselves.
+
+    /// `t(id, a, b)` and `u(id, t_id, c)` have exactly `id` in common, so
+    /// `USING (id)` and `NATURAL JOIN` are the same join here — and `*` must
+    /// give `id, a, b, t_id, c`: the merged column first, then the rest of
+    /// the left, then the rest of the right, with `u.id` (flat index 3) gone.
+    fn star_names(plan: &LogicalPlan) -> Vec<(String, u16)> {
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project");
+        };
+        exprs
+            .iter()
+            .map(|(e, name)| match e {
+                Expr::Column(c) => (name.clone(), c.index),
+                other => panic!("expected a column in the star projection, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn join_using_merges_the_column_and_puts_it_first_in_star() {
+        let plan = lower("SELECT * FROM t JOIN u USING (id)").unwrap();
+        assert_eq!(
+            star_names(&plan),
+            vec![
+                ("id".to_string(), 0),
+                ("a".to_string(), 1),
+                ("b".to_string(), 2),
+                ("t_id".to_string(), 4),
+                ("c".to_string(), 5),
+            ]
+        );
+        let LogicalPlan::Project { input, .. } = plan else {
+            unreachable!();
+        };
+        let LogicalPlan::Join {
+            kind, on, filter, ..
+        } = *input
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(kind, JoinKind::Inner);
+        // The right side of an `on` pair is addressed in the RIGHT input's
+        // own index space, so `u.id` is 0 there, not 3.
+        assert_eq!(on, vec![(col(0, "id"), col(0, "id"))]);
+        assert!(filter.is_none());
+    }
+
+    #[test]
+    fn natural_join_is_using_over_the_common_columns() {
+        let natural = lower("SELECT * FROM t NATURAL JOIN u").unwrap();
+        let using = lower("SELECT * FROM t JOIN u USING (id)").unwrap();
+        assert_eq!(natural, using);
+    }
+
+    #[test]
+    fn natural_join_with_no_common_columns_is_a_cross_join() {
+        // `w(x, y)` shares no name with `t(id, a, b)`. Postgres deparses this
+        // exact shape back as `t CROSS JOIN w` and returns the full product,
+        // rather than raising — so nothing is merged and `*` is the plain
+        // concatenation.
+        let plan = lower("SELECT * FROM t NATURAL JOIN w").unwrap();
+        assert_eq!(
+            star_names(&plan),
+            vec![
+                ("id".to_string(), 0),
+                ("a".to_string(), 1),
+                ("b".to_string(), 2),
+                ("x".to_string(), 3),
+                ("y".to_string(), 4),
+            ]
+        );
+        let LogicalPlan::Project { input, .. } = plan else {
+            unreachable!();
+        };
+        let LogicalPlan::Join { kind, on, .. } = *input else {
+            panic!("expected Join");
+        };
+        assert_eq!(kind, JoinKind::Cross);
+        assert!(on.is_empty());
+    }
+
+    #[test]
+    fn a_using_merged_column_is_unqualified_while_a_qualified_one_reaches_past_it() {
+        let plan = lower("SELECT id, t.id, u.id FROM t JOIN u USING (id)").unwrap();
+        assert_eq!(
+            star_names(&plan),
+            vec![
+                ("id".to_string(), 0),
+                ("id".to_string(), 0),
+                ("id".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn right_join_using_takes_the_right_sides_column_as_the_merged_one() {
+        // A RIGHT join null-extends the LEFT, so the left column is NULL on
+        // an unmatched row and the right one is the answer. Postgres deparses
+        // it as `uu.id` for exactly this reason.
+        let plan = lower("SELECT id FROM t RIGHT JOIN u USING (id)").unwrap();
+        assert_eq!(star_names(&plan), vec![("id".to_string(), 3)]);
+    }
+
+    #[test]
+    fn left_join_using_takes_the_left_sides_column_as_the_merged_one() {
+        let plan = lower("SELECT id FROM t LEFT JOIN u USING (id)").unwrap();
+        assert_eq!(star_names(&plan), vec![("id".to_string(), 0)]);
+    }
+
+    /// The case that is silently wrong if a side is picked: on a FULL join
+    /// neither input's column is the merged value, so one is materialized as
+    /// `COALESCE(t.id, u.id)` and the merged column points at it.
+    #[test]
+    fn full_join_using_materializes_coalesce_rather_than_picking_a_side() {
+        let plan = lower("SELECT id FROM t FULL JOIN u USING (id)").unwrap();
+        // The merged column is the appended one at index 6, past the join's
+        // own six columns — not index 0 (the left) and not index 3 (the
+        // right).
+        assert_eq!(star_names(&plan), vec![("id".to_string(), 6)]);
+
+        let LogicalPlan::Project { input, .. } = plan else {
+            unreachable!();
+        };
+        let LogicalPlan::Project { input, exprs } = *input else {
+            panic!("expected the COALESCE Project under the select-list Project");
+        };
+        assert_eq!(exprs.len(), 7);
+        // The first six re-emit the join's own columns at their own indices,
+        // so nothing below is renumbered.
+        for (i, (e, name)) in exprs.iter().take(6).enumerate() {
+            assert_eq!(*e, col(i as u16, name));
+        }
+        assert_eq!(
+            exprs[6],
+            (
+                Expr::Coalesce(vec![col(0, "id"), col(3, "id")]),
+                "id".to_string()
+            )
+        );
+        let LogicalPlan::Join { kind, on, .. } = *input else {
+            panic!("expected Join under the COALESCE Project");
+        };
+        assert_eq!(kind, JoinKind::Full);
+        assert_eq!(on, vec![(col(0, "id"), col(0, "id"))]);
+    }
+
+    #[test]
+    fn using_a_column_absent_from_one_side_is_rejected_naming_that_side() {
+        // Postgres checks the left side first: `USING (zzz)`, absent from
+        // both, reports the LEFT table.
+        let Err(LowerError::UnknownName(msg)) = lower("SELECT * FROM t JOIN u USING (zzz)") else {
+            panic!("expected UnknownName");
+        };
+        assert!(msg.contains("does not exist in left table"), "{msg}");
+        // `a` exists on `t` only.
+        let Err(LowerError::UnknownName(msg)) = lower("SELECT * FROM t JOIN u USING (a)") else {
+            panic!("expected UnknownName");
+        };
+        assert!(msg.contains("does not exist in right table"), "{msg}");
+    }
+
+    #[test]
+    fn a_using_merged_column_is_still_ambiguous_against_a_third_relation() {
+        // `SELECT id FROM t JOIN u USING (id)` is legal, but adding another
+        // relation that also has `id` makes the name ambiguous again — the
+        // merged column counts as one candidate, not zero.
+        assert!(lower("SELECT id FROM t JOIN u USING (id)").is_ok());
+        assert!(matches!(
+            lower("SELECT id FROM t JOIN u USING (id), t AS t2"),
+            Err(LowerError::UnknownName(_))
+        ));
+    }
+
+    #[test]
+    fn using_still_hides_the_merged_column_from_star_when_chained() {
+        // `t JOIN u USING (id) JOIN t2 USING (id)` shows one `id`, not three.
+        let plan = lower("SELECT * FROM t JOIN u USING (id) JOIN t AS t2 USING (id)").unwrap();
+        let names: Vec<String> = star_names(&plan).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["id", "a", "b", "t_id", "c", "a", "b"]);
+    }
+
+    #[test]
+    fn a_qualified_star_under_using_is_not_merged() {
+        // `SELECT ut.* FROM ut JOIN uu USING (id)` gives `ut`'s own columns in
+        // `ut`'s own order on a live server — `id` stays in position, neither
+        // hoisted nor dropped.
+        let plan = lower("SELECT t.* FROM t JOIN u USING (id)").unwrap();
+        assert_eq!(
+            star_names(&plan),
+            vec![
+                ("id".to_string(), 0),
+                ("a".to_string(), 1),
+                ("b".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_using_join_alias_is_refused_rather_than_ignored() {
+        assert!(matches!(
+            lower("SELECT * FROM t JOIN u USING (id) AS j"),
+            Err(LowerError::Unsupported(_))
+        ));
     }
 
     // --- 8: VALUES -> Values; SELECT with no FROM -> Empty ------------------
@@ -5320,6 +5993,65 @@ mod tests {
         }
         walk(&input, &mut saw_cte_ref);
         assert!(saw_cte_ref, "the derived table's body must read the CTE");
+    }
+
+    /// A `WITH` entry is scoped over the whole statement, not just its `FROM`
+    /// clause. These are the positions that used to restart CTE resolution
+    /// from an empty list — [`SelectSubqueries`] re-entered lowering without
+    /// carrying `ctes`, so every one of them reported `UnknownName("a")`
+    /// while `SELECT * FROM a` in the same statement worked. A live
+    /// PostgreSQL 18.2 server accepts all four.
+    #[test]
+    fn a_cte_is_visible_inside_a_subquery_in_every_clause() {
+        // A subquery's plan hangs off an `Expr::Subquery`, not off
+        // `for_each_input` — which is exactly why this walk descends through
+        // expressions as well. Walking only plan inputs would report "no
+        // CteRef" for a plan that has one, which is the failure mode this
+        // whole test exists to rule out.
+        fn walk_expr(e: &Expr, saw: &mut bool) {
+            if let Expr::Subquery { subplan, .. } = e {
+                walk(subplan, saw);
+            }
+            e.for_each_child(&mut |c| walk_expr(c, saw));
+        }
+        fn walk(p: &LogicalPlan, saw: &mut bool) {
+            if matches!(p, LogicalPlan::CteRef { .. }) {
+                *saw = true;
+            }
+            p.for_each_expr(&mut |e| walk_expr(e, saw));
+            p.for_each_input(&mut |c| walk(c, saw));
+        }
+
+        fn reads_the_cte(sql: &str) {
+            let plan = lower(sql).unwrap_or_else(|e| panic!("{sql} failed to lower: {e:?}"));
+            let mut saw = false;
+            walk(&plan, &mut saw);
+            assert!(saw, "{sql} lowered without ever reading the CTE");
+        }
+
+        // The reported case: a scalar subquery in the SELECT list.
+        reads_the_cte("WITH a AS (SELECT id FROM t) SELECT (SELECT count(*) FROM a)");
+        // The same gap in WHERE, which the select-list fix must not leave open.
+        reads_the_cte("WITH a AS (SELECT id FROM t) SELECT id FROM t WHERE id IN (SELECT id FROM a)");
+        reads_the_cte(
+            "WITH a AS (SELECT id FROM t) SELECT id FROM t WHERE EXISTS (SELECT 1 FROM a)",
+        );
+        // HAVING, reached through the same per-clause `expr_ctx`.
+        reads_the_cte(
+            "WITH a AS (SELECT id FROM t) SELECT id FROM t GROUP BY id \
+             HAVING count(*) > (SELECT count(*) FROM a)",
+        );
+    }
+
+    /// The CTE list a subquery sees is the one in scope where it was written,
+    /// so a name that is NOT a CTE must still fail rather than silently
+    /// resolving against some other statement's list.
+    #[test]
+    fn a_subquery_still_rejects_a_name_that_is_not_a_cte() {
+        assert!(matches!(
+            lower("SELECT (SELECT count(*) FROM nosuch)"),
+            Err(LowerError::UnknownName(_))
+        ));
     }
 
     /// A derived table carrying a window function — the shape that motivates
