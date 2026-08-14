@@ -115,6 +115,16 @@
 //!    unaliased. Only the column TYPES, in position, must line up. See
 //!    [`SchemaRebind`] and
 //!    [`a_recursive_terms_unaliased_column_need_not_match_the_anchors_name`].
+//! 7. **A `NOT NULL` anchor does not make the CTE's column `NOT NULL`** — the
+//!    recursive term can contribute a NULL, and live Postgres serves exactly
+//!    that (`SELECT 1 UNION ALL SELECT NULL::int FROM r WHERE n IS NOT NULL`
+//!    returns 1 and a NULL). A recursive CTE is a `UNION`, and a `UNION`'s
+//!    nullability is `left || right` — `setop.rs`'s rule, which this file
+//!    shares rather than re-deciding. See [`recursive_cte_output_schema`] for
+//!    the rule, why the `right` half is assumed rather than consulted here,
+//!    and what it costs; and
+//!    [`a_null_from_the_recursive_term_under_a_not_null_anchor`] for the query
+//!    that failed without it.
 //!
 //! # The classic shapes, verified live against PostgreSQL 18.2
 //!
@@ -188,7 +198,7 @@ use std::sync::Arc;
 use arrow::compute::take;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 
 use crate::operator::{ExecError, Operator};
 
@@ -221,6 +231,95 @@ fn schema_types_match(a: &SchemaRef, b: &SchemaRef) -> bool {
             .iter()
             .zip(b.fields().iter())
             .all(|(x, y)| x.data_type() == y.data_type())
+}
+
+/// The schema a [`RecursiveCte`] over this `anchor` reports: the anchor's
+/// column names, types and metadata, with every column's nullability widened
+/// to nullable.
+///
+/// # Why the anchor's nullability is not the CTE's
+///
+/// `WITH RECURSIVE x AS (anchor UNION [ALL] recursive_term)` is a `UNION`, so
+/// its nullability rule is `setop.rs`'s [`crate::setop`] `Union` arm — an
+/// output column can hold a NULL if EITHER branch's can:
+///
+/// ```text
+/// UNION      left || right        <- this operator, always
+/// INTERSECT  left && right
+/// EXCEPT     left
+/// ```
+///
+/// Taking the anchor's nullability whole was `setop.rs`'s bug in exactly the
+/// shape fixed in 02251a4c, one branch later: every batch this operator yields
+/// — the anchor's own and every iteration's — is declared under ONE schema,
+/// and `RecordBatch::try_new` rejects a `NOT NULL` field holding a NULL. With
+/// a `NOT NULL` anchor and a recursive term that produces a NULL, the rebind
+/// in [`SchemaRebind::next_batch`] failed with `Column 'n' is declared as
+/// non-nullable but contains null values`, which the owned-engine bridge turns
+/// into a silent fallback (and, once DataFusion is gone, an error). Live
+/// PostgreSQL 18.2 serves that shape and returns the NULL:
+///
+/// ```sql
+/// WITH RECURSIVE r(n) AS (
+///   SELECT 1 UNION ALL SELECT NULL::int FROM r WHERE n IS NOT NULL)
+/// SELECT n FROM r;
+/// --  n
+/// -- ---
+/// --  1
+/// --          <- NULL
+/// -- (2 rows)
+/// ```
+/// See [`a_null_from_the_recursive_term_under_a_not_null_anchor`].
+///
+/// # Why `right` is assumed nullable rather than consulted
+///
+/// `SetOp` has both branches in hand at construction and evaluates `left ||
+/// right` for real. This operator does not and cannot: the recursive term is a
+/// [`RecursiveTermFactory`] that is only invoked once the anchor's working
+/// table exists (module docs item 2), and its schema therefore does not exist
+/// while `Operator::schema` — which the parent operators read at BUILD time,
+/// before a single batch is pulled — is already being answered. Nor may this
+/// operator invoke the factory early to find out: module docs item 5 requires
+/// that an empty anchor never invoke the recursive term at all (see
+/// [`empty_anchor_yields_zero_rows_and_never_invokes_the_recursive_term`]),
+/// and building the term is not free of failure or side effects.
+///
+/// So `right` is unknown, and the only sound value for an unknown branch in
+/// `left || right` is `true`. The rule is unchanged; it is evaluated with the
+/// only information available. That is a genuine loss of precision — DataFusion
+/// declares `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r
+/// WHERE n < 5)`'s `n` as `NOT NULL` and is right about the data — and it is
+/// the safe direction: a column declared nullable that never holds a NULL
+/// costs precision, while a column declared `NOT NULL` that does hold one
+/// costs the query. Postgres itself does not make the precise claim either —
+/// its planner keeps a `WHERE n IS NOT NULL` filter over a recursive CTE scan
+/// even when the values are provably non-NULL, where it DELETES that filter
+/// over a `UNION ALL` of two `NOT NULL` branches (`EXPLAIN (COSTS OFF)`,
+/// PostgreSQL 18.2).
+///
+/// Measured, not assumed: the golden corpus records that query's `n` as
+/// `notnull`, so this widening adds a `NULLABILITY: expected false, actual
+/// true` line to `base/CTEs #0154` — a query that ALREADY diverges there on
+/// type (`expected Int64, actual Int32`). Diverging queries stayed at 75, the
+/// CTE area at 1/10, and the owned engine still served 273 of 440 statements,
+/// before and after. The cost is one line of detail on an existing divergence,
+/// not a query.
+///
+/// Recovering the precision needs the recursive term's schema at construction,
+/// which means building the term once in `build.rs`'s `build_recursive_cte`
+/// and passing it in — a change to a file this operator does not reach into.
+/// `pub` so that when that happens there is ONE definition of the CTE's output
+/// schema rather than a second copy of the rule over there: `build.rs` also
+/// declares the working-table `VecFeed` the recursive term reads (its
+/// `schema_for_feed`) and today gives it the anchor's schema, which is this
+/// same over-claim one level down.
+pub fn recursive_cte_output_schema(anchor: &SchemaRef) -> SchemaRef {
+    let fields: Vec<Field> = anchor
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_nullable(true))
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, anchor.metadata().clone()))
 }
 
 /// Wraps an operator whose column TYPES match `target` positionally but
@@ -264,6 +363,15 @@ fn schema_types_match(a: &SchemaRef, b: &SchemaRef) -> bool {
 /// batches this operator yields", so every batch `RecursiveCte` actually
 /// yields — anchor or any iteration — must carry exactly `self.schema`, not
 /// merely something type-compatible with it.
+///
+/// The rebind CAN fail — `RecordBatch::try_new` rejects a `NOT NULL` field
+/// holding a NULL — and did, for a `NOT NULL` anchor and a recursive term
+/// that produced a NULL. `RecursiveCte` never hands it a target that can fail
+/// that way any more: the only targets it passes are
+/// [`recursive_cte_output_schema`]'s, which declares every column nullable.
+/// The check is kept rather than swapped for an unchecked `RecordBatch::new`
+/// so a future caller with a narrower target gets an error rather than an
+/// invalid batch.
 struct SchemaRebind {
     inner: Box<dyn Operator>,
     target: SchemaRef,
@@ -374,7 +482,23 @@ impl RecursiveCte {
         memory_budget: usize,
         max_iterations: usize,
     ) -> Self {
-        let schema = anchor.schema();
+        let anchor_schema = anchor.schema();
+        // NOT the anchor's schema: see `recursive_cte_output_schema` for the
+        // `UNION` rule this operator's output obeys and why the anchor's own
+        // nullability is not it.
+        let schema = recursive_cte_output_schema(&anchor_schema);
+        // The anchor's batches are yielded under that schema too, so they get
+        // the same rebind an iteration's do — `Operator::schema` promises
+        // EVERY batch carries exactly the reported schema, and the anchor is
+        // conceptually just iteration 0 (see `next_batch`). Widening a `NOT
+        // NULL` column to nullable can never fail: it claims less about data
+        // that is already there, the opposite direction from the failure
+        // being fixed.
+        let anchor: Box<dyn Operator> = if anchor_schema == schema {
+            anchor
+        } else {
+            Box::new(SchemaRebind::new(anchor, Arc::clone(&schema)))
+        };
         let row_converter = if all {
             None
         } else {
@@ -1235,6 +1359,73 @@ mod tests {
             Box::new(move |_working_table| Ok(Feed::boxed(schema_1i32("value"), vec![])));
         let op = RecursiveCte::new(anchor, recursive_term, true, 1 << 30, 100);
         assert_eq!(op.schema(), schema);
+    }
+
+    // ── Item 7: a NOT NULL anchor does not make the CTE NOT NULL ──
+
+    // The regression test for the whole class: a `NOT NULL` anchor and a
+    // recursive term that actually produces a NULL. Without
+    // `recursive_cte_output_schema` this fails with
+    //   Internal("Invalid argument error: Column 'n' is declared as
+    //            non-nullable but contains null values")
+    // from `SchemaRebind`'s `RecordBatch::try_new` — the same rejection, in
+    // the same place, that 02251a4c fixed for `SetOp`.
+    //
+    // Live PostgreSQL 18.2:
+    //   WITH RECURSIVE r(n) AS (
+    //     SELECT 1 UNION ALL SELECT NULL::int FROM r WHERE n IS NOT NULL)
+    //   SELECT n FROM r;
+    //    n
+    //   ---
+    //    1
+    //         <- NULL
+    //   (2 rows)
+    #[test]
+    fn a_null_from_the_recursive_term_under_a_not_null_anchor() {
+        let notnull = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let nullable = schema_1i32("n");
+        let anchor = Feed::boxed(notnull.clone(), vec![batch_i32(&notnull, vec![Some(1)])]);
+        let s = nullable.clone();
+        let recursive_term: RecursiveTermFactory = Box::new(move |working_table| {
+            // `SELECT NULL::int FROM r WHERE n IS NOT NULL` — one NULL per
+            // non-NULL input row, so the second iteration produces nothing
+            // and the fixpoint is reached.
+            let mut next: Vec<Option<i32>> = Vec::new();
+            for batch in &working_table {
+                for v in col_i32(batch, 0) {
+                    if v.is_some() {
+                        next.push(None);
+                    }
+                }
+            }
+            Ok(Feed::boxed(s.clone(), vec![batch_i32(&s, next)]))
+        });
+        let mut op = RecursiveCte::new(anchor, recursive_term, true, 1 << 30, 100);
+        assert_eq!(
+            op.schema(),
+            nullable,
+            "a UNION's column is nullable if EITHER branch's is, and the recursive term's \
+             half is not knowable here — see recursive_cte_output_schema"
+        );
+        let declared = op.schema();
+        let mut out: Vec<Option<i32>> = Vec::new();
+        loop {
+            match op.next_batch() {
+                Ok(Some(b)) => {
+                    // Including the ANCHOR's own batch, which arrives under
+                    // the NOT NULL schema and is rebound like any iteration's.
+                    assert_eq!(
+                        b.schema(),
+                        declared,
+                        "every yielded batch carries exactly the reported schema"
+                    );
+                    out.extend(col_i32(&b, 0));
+                }
+                Ok(None) => break,
+                Err(e) => panic!("live Postgres returns 1 and NULL here, got {e:?}"),
+            }
+        }
+        assert_eq!(out, vec![Some(1), None]);
     }
 
     #[test]
