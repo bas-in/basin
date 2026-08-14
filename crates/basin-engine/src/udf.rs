@@ -190,6 +190,17 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
     // and never executed — while still leaving a duplicate for the registry
     // to trip over. Its numeric picture formatter was the better of the two
     // and survives as `format_numeric_pg` below, which `ToCharMoreUdf` calls.
+    //
+    // `to_timestamp` and `to_date` are the two remaining registrations here
+    // that `register_datetime_more_udfs` overwrites in the same way, so these
+    // two never execute either. Unlike `to_char`, they are *not* a live wrong
+    // answer: the bodies are the same parse-with-chrono loop, and the only
+    // thing that differs is the PG→chrono format table. `pg_format_to_chrono`
+    // below lists `W` ahead of `WW`/`IW`, so it splits `WW` into two `W`s;
+    // `datetime_more_udf::pg_fmt_to_chrono` orders them correctly. The one
+    // that wins is the better one, so they are left where they are rather
+    // than churn a crate that is scheduled for deletion. Do not "restore"
+    // them by moving the registration later.
     ctx.register_udf(ScalarUDF::from(ToTimestampPgUdf {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
@@ -222,9 +233,15 @@ pub(crate) fn register_pg_compat_udfs(ctx: &SessionContext) {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
     // PG `to_number(text, format)` — converts a formatted numeric string to
-    // `Float64`. Handles thousands separators (`,`/`G`) and decimal point
-    // (`D`) in the format picture. Covers `to_number('1,234.56', '9,999.99')`
-    // and similar patterns used by PG-targeted ORMs / reporting tools.
+    // `Float64`. Handles thousands separators (`,`/`G`), the decimal point
+    // (`D`) and the sign indicators (`S`/`MI`/`PR`) in the format picture.
+    // Covers `to_number('1,234.56', '9,999.99')` and similar patterns used by
+    // PG-targeted ORMs / reporting tools.
+    //
+    // This is now the only `to_number` in the tree. A second one in
+    // `pg_scalar_aliases` used to shadow it — that module registers later —
+    // and threw the format picture away, which cost every trailing/bracketed
+    // sign its meaning. Deleted; see the note at its old site.
     ctx.register_udf(ScalarUDF::from(ToNumberPgUdf {
         signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
@@ -3290,6 +3307,21 @@ fn parse_pg_number(input: &str, fmt: &str) -> Result<f64, String> {
                 } else if ic == '-' || ic == '+' {
                     // trailing sign (MI/PR style)
                     cleaned.push(ic);
+                    ii += 1;
+                }
+                fi += 1;
+            }
+            // Currency symbol. `L` stands for whatever the locale's currency
+            // string is, so there is nothing to match it against — consume the
+            // run of input characters standing in for it. Without this,
+            // `to_number('$1,234.56','L9,999.99')` walked the whole picture
+            // with the input still parked on the `$` and produced `0.123456`
+            // where PostgreSQL 18.2 gives `1234.56`.
+            'L' => {
+                while ii < inp_chars.len()
+                    && !inp_chars[ii].is_ascii_digit()
+                    && !matches!(inp_chars[ii], '-' | '+' | '.' | ',')
+                {
                     ii += 1;
                 }
                 fi += 1;

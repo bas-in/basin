@@ -223,12 +223,19 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
         ),
     }));
 
-    // ── to_number(text, fmt) — stub cast ─────────────────────────────────────
-    // PG: to_number('12,345.67', '99G999D99') → numeric.
-    // We parse the numeric part of the text and return Float64.
-    ctx.register_udf(ScalarUDF::from(ToNumberUdf {
-        signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
-    }));
+    // `to_number` is NOT registered here. It lives in `udf::ToNumberPgUdf`,
+    // now the single implementation of that SQL name in the tree. There used
+    // to be a second one right here, and because `register_pg_scalar_aliases`
+    // runs *after* `register_pg_udfs` in `session::build_stateless_udf_cache`
+    // it was this one that won — silently, the same way `to_char`'s duplicate
+    // won before f97ba3ba. It was the worse of the two: it ignored the format
+    // picture entirely and kept `[0-9.-]` out of the input, so every trailing
+    // or bracketed sign lost its meaning. Measured against PostgreSQL 18.2:
+    //   to_number('12,454.8-','99G999D9S')  PG -12454.8, it gave NULL
+    //   to_number('1234-','9999MI')         PG -1234,    it gave NULL
+    //   to_number('<1234>','9999PR')        PG -1234,    it gave 1234
+    // Deleted rather than merged — unlike the `to_char` pair, this one had
+    // nothing the survivor lacks.
 
     // ── current_database() → TEXT ────────────────────────────────────────────
     // Returns the current database name. Basin uses "postgres" as the default.
@@ -1041,75 +1048,6 @@ impl ScalarUDFImpl for WidthBucketUdf {
                     out.append_value(bucket);
                 }
                 _ => out.append_null(),
-            }
-        }
-        Ok(ColumnarValue::Array(Arc::new(out.finish())))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// to_number(text, fmt) → Float64
-// Strips non-numeric characters and parses.  PG's format string defines
-// grouping/decimal separators; we simply strip all non-numeric characters
-// except `.` and `-` and parse the result.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct ToNumberUdf {
-    signature: Signature,
-}
-
-impl ScalarUDFImpl for ToNumberUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "to_number"
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Float64)
-    }
-    #[allow(deprecated)]
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = &args.args;
-        if args.len() != 2 {
-            return exec_err!("to_number expects 2 arguments, got {}", args.len());
-        }
-        let n = args
-            .iter()
-            .filter_map(|a| match a {
-                ColumnarValue::Array(arr) => Some(arr.len()),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(1);
-        let text_arr = args[0].clone().into_array(n)?;
-        let texts = text_arr
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                datafusion::common::DataFusionError::Execution(
-                    "to_number: first argument must be text".into(),
-                )
-            })?;
-        let mut out = Float64Array::builder(n);
-        for i in 0..n {
-            if texts.is_null(i) {
-                out.append_null();
-                continue;
-            }
-            let raw = texts.value(i);
-            // Strip everything except digits, decimal point, and leading minus.
-            let cleaned: String = raw
-                .chars()
-                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-                .collect();
-            match cleaned.parse::<f64>() {
-                Ok(v) => out.append_value(v),
-                Err(_) => out.append_null(),
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))

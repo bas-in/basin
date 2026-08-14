@@ -30,10 +30,11 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Builder, ListArray, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Int64Builder, LargeListArray, ListArray,
+    StringArray, TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
+use datafusion::common::{exec_err, DataFusionError, Result as DFResult, ScalarValue};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -442,10 +443,186 @@ impl ScalarUDFImpl for GenerateSubscriptsUdf {
 
 // ── array_contains / arrays_overlap ──────────────────────────────────────────
 
-/// `array_contains(lhs, rhs)` — PG `lhs @> rhs`: returns true if lhs contains
-/// all elements of rhs. Stub implementation: returns true when both arrays have
-/// the same data (exact match check). For a proper implementation we'd need
-/// set-membership tests; this stub is enough to flip the matrix row.
+/// Flatten one array value into its leaf elements, the way PostgreSQL compares
+/// arrays.
+///
+/// PG arrays are rectangular, and `@>` / `&&` are defined over the *flattened*
+/// element list — dimensionality plays no part at all. Measured on PG 18.2:
+/// `ARRAY[[1,2],[3,4]] @> ARRAY[1,4]` is true, and so is the reverse shape
+/// `ARRAY[1,2,3,4] @> ARRAY[[1,2]]`.
+///
+/// `None` entries are SQL NULL elements. They are carried rather than dropped
+/// because the two callers treat them differently, but neither ever matches
+/// one: NULL is not equal to anything, itself included.
+fn flatten_elements(arr: &dyn Array, out: &mut Vec<Option<ScalarValue>>) -> DFResult<()> {
+    match arr.data_type() {
+        DataType::List(_) => {
+            let l = arr
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("List data type implies ListArray");
+            for i in 0..l.len() {
+                if l.is_null(i) {
+                    out.push(None);
+                } else {
+                    flatten_elements(l.value(i).as_ref(), out)?;
+                }
+            }
+        }
+        DataType::LargeList(_) => {
+            let l = arr
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("LargeList data type implies LargeListArray");
+            for i in 0..l.len() {
+                if l.is_null(i) {
+                    out.push(None);
+                } else {
+                    flatten_elements(l.value(i).as_ref(), out)?;
+                }
+            }
+        }
+        DataType::FixedSizeList(_, _) => {
+            let l = arr
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("FixedSizeList data type implies FixedSizeListArray");
+            for i in 0..l.len() {
+                if l.is_null(i) {
+                    out.push(None);
+                } else {
+                    flatten_elements(l.value(i).as_ref(), out)?;
+                }
+            }
+        }
+        _ => {
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    out.push(None);
+                } else {
+                    out.push(Some(ScalarValue::try_from_array(arr, i)?));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Flattened elements of row `i` of an array column, or `None` when the array
+/// value itself is NULL (both operators are strict: `NULL @> ARRAY[1]` is NULL,
+/// not false).
+///
+/// A non-array argument is an error rather than a NULL — PG has no `@>` /
+/// `&&` overload that takes a scalar, and answering NULL would look like a
+/// value rather than the type mismatch it is.
+fn array_row_elements(
+    fn_name: &str,
+    col: &ArrayRef,
+    i: usize,
+) -> DFResult<Option<Vec<Option<ScalarValue>>>> {
+    if col.is_null(i) {
+        return Ok(None);
+    }
+    let value: ArrayRef = match col.data_type() {
+        DataType::List(_) => col
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("List data type implies ListArray")
+            .value(i),
+        DataType::LargeList(_) => col
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .expect("LargeList data type implies LargeListArray")
+            .value(i),
+        DataType::FixedSizeList(_, _) => col
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("FixedSizeList data type implies FixedSizeListArray")
+            .value(i),
+        other => {
+            return exec_err!("{fn_name}: arguments must be arrays, got {other:?}");
+        }
+    };
+    let mut out = Vec::with_capacity(value.len());
+    flatten_elements(value.as_ref(), &mut out)?;
+    Ok(Some(out))
+}
+
+/// SQL `=` between two non-NULL array elements.
+///
+/// Both UDFs take `Signature::any`, so DataFusion applies no coercion and the
+/// two sides can legitimately disagree on width — an `Int32` column against an
+/// `Int64` array literal, say. Falling back to a cast keeps those comparable,
+/// and requiring the cast to round-trip keeps `1.5` from equalling `1`.
+fn elements_equal(a: &ScalarValue, b: &ScalarValue) -> bool {
+    if a == b {
+        return true;
+    }
+    let (ta, tb) = (a.data_type(), b.data_type());
+    if ta == tb {
+        return false;
+    }
+    equal_after_cast(a, b, &tb) || equal_after_cast(b, a, &ta)
+}
+
+/// `from` cast to `ty` equals `to`, and casting back recovers `from` exactly.
+fn equal_after_cast(from: &ScalarValue, to: &ScalarValue, ty: &DataType) -> bool {
+    let Ok(forward) = from.cast_to(ty) else {
+        return false;
+    };
+    if &forward != to {
+        return false;
+    }
+    matches!(forward.cast_to(&from.data_type()), Ok(back) if &back == from)
+}
+
+/// PG `lhs @> rhs`: every element of `rhs` appears in `lhs`.
+///
+/// Set semantics — duplicates on either side change nothing — and an empty
+/// `rhs` is contained by every array, the empty one included.
+fn pg_array_contains(lhs: &[Option<ScalarValue>], rhs: &[Option<ScalarValue>]) -> bool {
+    rhs.iter().all(|needle| match needle {
+        // A NULL element is never *found*, so it is never contained. Measured:
+        // `ARRAY[1,2,NULL] @> ARRAY[NULL]` is false on PG 18.2 — not true, and
+        // not NULL either. NULLs on the `lhs` side are simply never matched.
+        None => false,
+        Some(needle) => lhs
+            .iter()
+            .any(|hay| hay.as_ref().is_some_and(|hay| elements_equal(hay, needle))),
+    })
+}
+
+/// PG `lhs && rhs`: the two arrays share at least one non-NULL element.
+///
+/// False whenever either side is empty, and NULL elements never pair up —
+/// `ARRAY[1,NULL] && ARRAY[NULL,2]` is false.
+fn pg_arrays_overlap(lhs: &[Option<ScalarValue>], rhs: &[Option<ScalarValue>]) -> bool {
+    lhs.iter()
+        .flatten()
+        .any(|l| rhs.iter().flatten().any(|r| elements_equal(l, r)))
+}
+
+/// `array_contains(lhs, rhs)` — PG `lhs @> rhs`: true when every element of
+/// `rhs` appears in `lhs`.
+///
+/// Semantics measured against PostgreSQL 18.2, because several of these read
+/// the other way from memory:
+///
+/// | case                              | PG      |
+/// |-----------------------------------|---------|
+/// | `ARRAY[1,2,3] @> ARRAY[2,2,2]`    | `true`  |
+/// | `ARRAY[1,2] @> ARRAY[]::int[]`    | `true`  |
+/// | `ARRAY[]::int[] @> ARRAY[]::int[]`| `true`  |
+/// | `ARRAY[]::int[] @> ARRAY[1]`      | `false` |
+/// | `ARRAY[1,2,NULL] @> ARRAY[NULL]`  | `false` |
+/// | `ARRAY[NULL] @> ARRAY[NULL]`      | `false` |
+/// | `ARRAY[1,NULL] @> ARRAY[1]`       | `true`  |
+/// | `NULL::int[] @> ARRAY[1]`         | `NULL`  |
+/// | `ARRAY[[1,2],[3,4]] @> ARRAY[1,4]`| `true`  |
+///
+/// So: set semantics, empty right operand always contained, NULL elements
+/// never contained but harmless on the left, NULL *array* propagates, and
+/// dimensionality is ignored entirely.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ArrayContainsUdf {
     signature: Signature,
@@ -477,33 +654,39 @@ impl ScalarUDFImpl for ArrayContainsUdf {
         let rhs = args[1].clone().into_array(n)?;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            if lhs.is_null(i) || rhs.is_null(i) {
-                out.push(None);
-                continue;
-            }
-            // Check if rhs elements are all in lhs (simplified: compare string repr).
-            let lhs_val = if let Some(l) = lhs.as_any().downcast_ref::<ListArray>() {
-                l.value(i)
-            } else {
+            let (Some(lhs), Some(rhs)) = (
+                array_row_elements("array_contains", &lhs, i)?,
+                array_row_elements("array_contains", &rhs, i)?,
+            ) else {
+                // Strict: a NULL array on either side yields NULL.
                 out.push(None);
                 continue;
             };
-            let rhs_val = if let Some(r) = rhs.as_any().downcast_ref::<ListArray>() {
-                r.value(i)
-            } else {
-                out.push(None);
-                continue;
-            };
-            // Stub: rhs is contained if rhs.len() <= lhs.len().
-            out.push(Some(rhs_val.len() <= lhs_val.len()));
+            out.push(Some(pg_array_contains(&lhs, &rhs)));
         }
         Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out))))
     }
 }
 
-/// `arrays_overlap(lhs, rhs)` — PG `lhs && rhs`: returns true when lhs and rhs
-/// share at least one common element. Stub: returns true when both arrays are
-/// non-empty (overlaps in the trivial sense).
+/// `arrays_overlap(lhs, rhs)` — PG `lhs && rhs`: true when the two arrays share
+/// at least one element.
+///
+/// This is the function `pg_operators` rewrites `&&` into, so unlike its
+/// sibling it is on a live path. Semantics measured against PostgreSQL 18.2:
+///
+/// | case                                | PG      |
+/// |-------------------------------------|---------|
+/// | `ARRAY[1,2,3] && ARRAY[3,4]`        | `true`  |
+/// | `ARRAY[1,2] && ARRAY[3,4]`          | `false` |
+/// | `ARRAY[1,2] && ARRAY[]::int[]`      | `false` |
+/// | `ARRAY[]::int[] && ARRAY[]::int[]`  | `false` |
+/// | `ARRAY[1,NULL] && ARRAY[NULL,2]`    | `false` |
+/// | `ARRAY[1,NULL] && ARRAY[NULL,1]`    | `true`  |
+/// | `NULL::int[] && ARRAY[1]`           | `NULL`  |
+/// | `ARRAY[[1,2],[3,4]] && ARRAY[4,9]`  | `true`  |
+///
+/// Note the pair in the middle: two arrays that both contain NULL do *not*
+/// overlap on that account. Only a shared non-NULL element counts.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ArraysOverlapUdf {
     signature: Signature,
@@ -535,24 +718,15 @@ impl ScalarUDFImpl for ArraysOverlapUdf {
         let rhs = args[1].clone().into_array(n)?;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            if lhs.is_null(i) || rhs.is_null(i) {
-                out.push(None);
-                continue;
-            }
-            let lhs_len = if let Some(l) = lhs.as_any().downcast_ref::<ListArray>() {
-                l.value(i).len()
-            } else {
-                out.push(None);
-                continue;
-            };
-            let rhs_len = if let Some(r) = rhs.as_any().downcast_ref::<ListArray>() {
-                r.value(i).len()
-            } else {
+            let (Some(lhs), Some(rhs)) = (
+                array_row_elements("arrays_overlap", &lhs, i)?,
+                array_row_elements("arrays_overlap", &rhs, i)?,
+            ) else {
+                // Strict: a NULL array on either side yields NULL.
                 out.push(None);
                 continue;
             };
-            // Stub: non-empty arrays are considered to overlap.
-            out.push(Some(lhs_len > 0 && rhs_len > 0));
+            out.push(Some(pg_arrays_overlap(&lhs, &rhs)));
         }
         Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out))))
     }
