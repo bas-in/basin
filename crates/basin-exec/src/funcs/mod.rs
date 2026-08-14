@@ -49,6 +49,8 @@ use basin_pgtype::{Oid, PgType};
 use crate::eval::EvalSession;
 use crate::operator::ExecError;
 
+pub mod dt_fns;
+pub mod num_fns;
 pub mod str_fns;
 
 /// The `pg_proc` row for `oid`, or `None`.
@@ -179,6 +181,31 @@ pub fn builtins() -> &'static FuncRegistry {
         // Phase 1 slices append their registrations here. Append-only, so two
         // agents porting different oid ranges conflict only on adjacent lines.
         r.register_scalar(Box::new(str_fns::Lower));
+        // num_fns — ported by the wave-15 numeric slice.
+        r.register_scalar(Box::new(num_fns::AbsInt2));
+        r.register_scalar(Box::new(num_fns::AbsInt4));
+        r.register_scalar(Box::new(num_fns::AbsInt8));
+        r.register_scalar(Box::new(num_fns::AbsFloat4));
+        r.register_scalar(Box::new(num_fns::AbsFloat8));
+        r.register_scalar(Box::new(num_fns::AbsNumeric));
+        r.register_scalar(Box::new(num_fns::RoundFloat8));
+        r.register_scalar(Box::new(num_fns::CeilFloat8));
+        r.register_scalar(Box::new(num_fns::CeilingFloat8));
+        r.register_scalar(Box::new(num_fns::FloorFloat8));
+        r.register_scalar(Box::new(num_fns::TruncFloat8));
+        r.register_scalar(Box::new(num_fns::SignFloat8));
+        // dt_fns — ported by the wave-15 date/time slice.
+        r.register_scalar(Box::new(dt_fns::Age));
+        r.register_scalar(Box::new(dt_fns::DateTruncTimestamp));
+        r.register_scalar(Box::new(dt_fns::DateTruncTimestamptz));
+        r.register_scalar(Box::new(dt_fns::DateTruncInterval));
+        r.register_scalar(Box::new(dt_fns::DatePartTimestamp));
+        r.register_scalar(Box::new(dt_fns::DatePartTimestamptz));
+        r.register_scalar(Box::new(dt_fns::DatePartDate));
+        r.register_scalar(Box::new(dt_fns::DatePartInterval));
+        r.register_scalar(Box::new(dt_fns::ToCharTimestamp));
+        r.register_scalar(Box::new(dt_fns::ToCharTimestamptz));
+        r.register_scalar(Box::new(dt_fns::MakeDate));
         r
     })
 }
@@ -192,15 +219,14 @@ mod tests {
     /// the migration incremental — an unported function must behave exactly
     /// as it did before this module existed.
     ///
-    /// Oid 1395 is `abs(float8)`, deliberately chosen as one that is still in
-    /// the `match`. When a slice ports it, pick another unported oid rather
+    /// Oid 1571 is one still in the `match`. When a slice ports it, pick another unported oid rather
     /// than deleting this test: the fallthrough is what keeps every
     /// intermediate commit runnable.
     #[test]
     fn an_unported_oid_misses_and_falls_through_to_the_match() {
         assert!(
-            builtins().scalar(Oid(1395)).is_none(),
-            "abs(float8) is not hosted, so it must fall through"
+            builtins().scalar(Oid(1571)).is_none(),
+            "an unported oid must fall through to the match"
         );
     }
 
@@ -211,9 +237,9 @@ mod tests {
     fn the_registry_reports_what_is_actually_hosted() {
         assert_eq!(
             builtins().len(),
-            1,
-            "one function is hosted (lower, oid 870); this number rises as \
-             Phase 1 slices land and is read from the registry, not tracked"
+            24,
+            "24 hosted: lower, the 12 numeric and the 11 date/time ports. Read \
+             from the registry, never tracked by hand"
         );
     }
 

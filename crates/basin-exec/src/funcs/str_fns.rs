@@ -34,10 +34,58 @@
 //! * **Verify against live PostgreSQL 18.2**, not against what the function
 //!   obviously does. `lower` looks obvious and is not: see the note on
 //!   `to_lowercase` below.
+//!
+//! ## The one divergence this whole family shares
+//!
+//! Appended by the slice that ported `upper`, `initcap`, the trims, the pads,
+//! `left`/`right`, `replace`, `strpos`/`position`, `repeat`, `split_part` and
+//! the `length` trio. Stated once here rather than three times below.
+//!
+//! PostgreSQL case-maps ONE CHARACTER AT A TIME through the C library
+//! (`towupper_l`/`towlower_l`) under the database collation. Rust's
+//! `str::to_uppercase`/`str::to_lowercase` implement Unicode's *full*
+//! mappings, which may change the character count and may depend on
+//! surrounding context. Measured on live PostgreSQL 18.2, `datcollate =
+//! en_US.UTF-8`, against `rustc`'s own output for the same inputs:
+//!
+//! ```text
+//!                    PostgreSQL 18.2      Basin
+//! upper('ß')         ß        (c39f)      SS       (5353)
+//! upper('ﬁ')         ﬁ        (efac81)    FI       (4649)
+//! upper('ﬆ')         ﬆ        (efac86)    ST       (5354)
+//! upper('ᾀ')         ᾈ        (e1be88)    ἈΙ       (e1bc88 ce99)
+//! lower('İ')         i        (69)        i̇        (69 cc87)
+//! lower('ΟΔΟΣ')      οδοσ     (…cf83)     οδος     (…cf82)
+//! initcap('ßeta')    ßeta                 SSeta
+//! initcap('ﬁne w')   ﬁne W                FIne W
+//! ```
+//!
+//! The last two rows of the `lower` block are worth separating: `lower('İ')`
+//! is the expansion the template already pins, but `lower('ΟΔΟΣ')` is a
+//! *context* disagreement — Rust applies Unicode's `Final_Sigma` conditional
+//! mapping and returns a final `ς`, while glibc's `towlower` has no notion of
+//! word position and always returns `σ`. It was found by this slice, not by
+//! the `lower` port, and is pinned in
+//! [`tests::lower_also_diverges_on_the_greek_final_sigma`].
+//!
+//! `initcap` escapes the sigma half by accident: it case-maps with
+//! `char::to_lowercase`, which is per-character and therefore contextless, so
+//! `initcap('ΟΔΟΣ ΟΔΟΣ')` agrees with the server exactly. It does not escape
+//! the expansion half, because `char::to_uppercase('ß')` is still `SS`.
+//!
+//! **None of it is fixed here.** A port moves behaviour. The fix is
+//! collation-aware case mapping for the whole family — `lower`, `upper`,
+//! `initcap`, `citext`, the `LIKE`/pattern paths — which is its own commit,
+//! and doing it inside a port would make a later bisect blame this one.
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, StringArray};
+// `Array`'s `len`/`is_null` are trait methods, not inherent ones, and the
+// implementations below that must raise a per-row error (`lpad`, `repeat`,
+// `split_part`) walk indices rather than iterators so that a NULL row is
+// skipped *before* the error can be raised. See [`Lpad2`] for why that
+// ordering is load-bearing.
+use arrow_array::{Array, ArrayRef, Int32Array, StringArray};
 use basin_pgtype::Oid;
 
 use crate::eval::{downcast_array, EvalSession};

@@ -3708,7 +3708,7 @@ fn pg_split_part(s: &str, delim: &str, field: i32) -> Result<String, ExecError> 
 /// into some canonical duration. That matters: `age` deliberately returns a
 /// *symbolic* difference, and "1 mon 1 day" is not interchangeable with any
 /// fixed number of nanoseconds.
-fn eval_age(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, ExecError> {
+pub(crate) fn eval_age(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, ExecError> {
     let l = downcast_array::<TimestampMicrosecondArray>(lhs, "timestamp")?;
     let r = downcast_array::<TimestampMicrosecondArray>(rhs, "timestamp")?;
     let n = l.len();
@@ -4166,7 +4166,7 @@ fn determine_time_zone_offset(tz: &Tz, local: NaiveDateTime) -> Result<i32, Exec
 /// `date_trunc(text, timestamp)` — oid 2020. No session involvement: a
 /// `timestamp without time zone` is already a civil reading, so truncating
 /// it is pure calendar arithmetic.
-fn eval_date_trunc_timestamp(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+pub(crate) fn eval_date_trunc_timestamp(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
     let u = downcast_array::<StringArray>(units, "text")?;
     let v = downcast_array::<TimestampMicrosecondArray>(values, "timestamp")?;
     let mut out: Vec<Option<i64>> = Vec::with_capacity(v.len());
@@ -4211,7 +4211,7 @@ fn trunc_unit(raw: &str, ty: &str) -> Result<DateUnit, ExecError> {
 /// the UTC instant. See [`unit_redetermines_zone`] and
 /// [`determine_time_zone_offset`] for the two rules that make it correct
 /// across a DST transition.
-fn eval_date_trunc_timestamptz(
+pub(crate) fn eval_date_trunc_timestamptz(
     units: &ArrayRef,
     values: &ArrayRef,
     session: &EvalSession,
@@ -4257,7 +4257,7 @@ fn eval_date_trunc_timestamptz(
 /// the month component rather than Postgres's off-by-one century arithmetic:
 /// `date_trunc('century', interval '137 years 5 mons')` is `100 years`, not
 /// `101 years`, because there is no year 1 to count from.
-fn eval_date_trunc_interval(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+pub(crate) fn eval_date_trunc_interval(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
     let u = downcast_array::<StringArray>(units, "text")?;
     let v = downcast_array::<IntervalMonthDayNanoArray>(values, "interval")?;
     let mut out: Vec<Option<IntervalMonthDayNano>> = Vec::with_capacity(v.len());
@@ -4434,7 +4434,7 @@ fn eval_date_part_rows(
 }
 
 /// `date_part(text, timestamp)` — oid 2021.
-fn eval_date_part_timestamp(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+pub(crate) fn eval_date_part_timestamp(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
     let v = downcast_array::<TimestampMicrosecondArray>(values, "timestamp")?.clone();
     let n = v.len();
     let w = v.clone();
@@ -4454,7 +4454,7 @@ fn eval_date_part_timestamp(units: &ArrayRef, values: &ArrayRef) -> Result<Array
 /// same instant gives `timezone = 37800` (`+10:30`) and `timezone_minute =
 /// 30` — a zone whose offset is not a whole number of hours, which is the
 /// case an implementation that stores offsets in hours gets wrong.
-fn eval_date_part_timestamptz(
+pub(crate) fn eval_date_part_timestamptz(
     units: &ArrayRef,
     values: &ArrayRef,
     session: &EvalSession,
@@ -4488,7 +4488,7 @@ fn eval_date_part_timestamptz(
 /// reusing that path, which is visible in its error messages: an unknown unit
 /// on a `date` argument is reported against `timestamp without time zone`,
 /// not against `date`. That is reproduced here rather than corrected.
-fn eval_date_part_date(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+pub(crate) fn eval_date_part_date(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
     let v = downcast_array::<Date32Array>(values, "date")?.clone();
     let n = v.len();
     let w = v.clone();
@@ -4644,7 +4644,7 @@ fn eval_date_part_date(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, 
 /// normalises between them; see the design block above this function for the
 /// full measured field table, the `quarter` sign rule, the 365.25/30-day
 /// `epoch` convention and the list of refused units.
-fn eval_date_part_interval(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+pub(crate) fn eval_date_part_interval(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
     const NS_PER_SEC: i64 = 1_000_000_000;
     const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
     const NS_PER_HOUR: i64 = 60 * NS_PER_MIN;
@@ -5064,7 +5064,7 @@ fn eval_extract(
 ///
 /// A `timestamptz` argument renders in the session's `TimeZone`, which is why
 /// both oids are `provolatile = 's'` in `pg_proc`.
-fn eval_to_char_datetime(
+pub(crate) fn eval_to_char_datetime(
     values: &ArrayRef,
     formats: &ArrayRef,
     session: &EvalSession,
@@ -6613,7 +6613,7 @@ fn eval_overlay_bytea(
 /// year `-1` is chrono's year `0` (there is no year 0 in Postgres, so every BC
 /// year shifts by one), and getting that wrong is a one-year error nothing
 /// downstream would catch.
-fn eval_make_date(
+pub(crate) fn eval_make_date(
     year: &ArrayRef,
     month: &ArrayRef,
     day: &ArrayRef,
