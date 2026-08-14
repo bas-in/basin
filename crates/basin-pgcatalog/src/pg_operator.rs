@@ -59,7 +59,7 @@
 //!   crate's `OPERATORS` table contains:
 //!
 //!   ```sql
-//!   SELECT DISTINCT oprowner FROM pg_operator WHERE oid IN (<all 298 oids
+//!   SELECT DISTINCT oprowner FROM pg_operator WHERE oid IN (<all 300 oids
 //!   OPERATORS covers>);  -- 10, and only 10
 //!   ```
 //!
@@ -77,7 +77,7 @@
 //!
 //!   ```sql
 //!   SELECT oprname, oprcanmerge, oprcanhash, count(*)
-//!     FROM pg_operator WHERE oid IN (<all 298 oids>) GROUP BY 1,2,3;
+//!     FROM pg_operator WHERE oid IN (<all 300 oids>) GROUP BY 1,2,3;
 //!   -- every non-'=' row: f,f. '=' rows: 25× t,t and 6× t,f (the cross-type
 //!   -- date/timestamp/timestamptz pairs above).
 //!   ```
@@ -101,13 +101,13 @@
 //!   [`crate::pg_am`]'s `amhandler` and [`crate::pg_type`]'s `typinput`. So
 //!   they are tabulated, one entry per oid `OPERATORS` covers, and
 //!   `catalog_fidelity`'s `diff_static_rows` re-verifies every one of the
-//!   1,490 cells against a live server on every run — which is the standard
+//!   1,500 cells against a live server on every run — which is the standard
 //!   this crate now holds transcribed data to, and the reason transcribing it
 //!   is safe where it previously was not.
 //!
-//!   `oprcom` is `0` for 67 of the 298 (an operator with no commutator),
-//!   `oprnegate` for 107, and `oprrest`/`oprjoin` for 99 each — those zeros
-//!   are the real values, not gaps. `oprcode` is non-zero for all 298; the
+//!   `oprcom` is `0` for 69 of the 300 (an operator with no commutator),
+//!   `oprnegate` for 109, and `oprrest`/`oprjoin` for 101 each — those zeros
+//!   are the real values, not gaps. `oprcode` is non-zero for all 300; the
 //!   oids it names are `pg_proc` rows [`crate::pg_proc`] mostly does not
 //!   have, the same admitted gap `pg_am` and `pg_type` already carry.
 //!
@@ -190,6 +190,13 @@ fn canmerge_canhash(op: &OperatorSig) -> (bool, bool) {
 /// meaning "none"; `oprcode` is never `0`, which
 /// `every_operator_has_an_implementing_function` below pins, and which is
 /// what makes a *missing* table entry detectable rather than silent.
+///
+/// The two `^` (exponentiation) rows, 965 and 1038, are the clearest instance
+/// of that "none" being real rather than missing: exponentiation is not
+/// commutative and has no boolean sense to negate, so `oprcom` and `oprnegate`
+/// are genuinely `0`, and it carries no selectivity estimators either — four
+/// of the five columns are `0` and only `oprcode` (`dpow`, `numeric_power`) is
+/// not. Read off a live PostgreSQL 18.2 like every other row here.
 const OPERATOR_FUNCTIONS: &[(u32, u32, u32, u32, u32, u32)] = &[
     (15, 416, 36, 852, 101, 105),       // integer = bigint (int48eq)
     (36, 417, 15, 853, 102, 106),       // integer <> bigint (int48ne)
@@ -311,6 +318,8 @@ const OPERATOR_FUNCTIONS: &[(u32, u32, u32, u32, u32, u32)] = &[
     (823, 0, 0, 942, 0, 0),             // smallint - bigint (int28mi)
     (824, 820, 0, 943, 0, 0),           // smallint * bigint (int28mul)
     (825, 0, 0, 948, 0, 0),             // smallint / bigint (int28div)
+    (965, 0, 0, 232, 0, 0),             // double precision ^ double precision (dpow)
+    (1038, 0, 0, 1739, 0, 0),           // numeric ^ numeric (numeric_power)
     (1054, 1054, 1057, 1048, 101, 105), // character = character (bpchareq)
     (1057, 1057, 1054, 1053, 102, 106), // character <> character (bpcharne)
     (1058, 1060, 1061, 1049, 103, 107), // character < character (bpcharlt)

@@ -390,6 +390,24 @@ const OID_DATE_PART_TIMESTAMPTZ: u32 = 1171; // date_part(text, timestamptz)
 const OID_DATE_PART_TIMESTAMP: u32 = 2021; // date_part(text, timestamp)
 const OID_DATE_PART_DATE: u32 = 1384; // date_part(text, date)
 
+// `extract`. **Not `date_part` with a cast** — see [`eval_extract`] and
+// `basin_pgtype::func`'s `extract` block for the measured pair of answers
+// that differ, in both the return type (`numeric`, not `float8`) and the set
+// of units each argument type accepts.
+const OID_EXTRACT_DATE: u32 = 6199; // extract(text, date)
+const OID_EXTRACT_TIME: u32 = 6200; // extract(text, time)
+const OID_EXTRACT_TIMETZ: u32 = 6201; // extract(text, timetz)
+const OID_EXTRACT_TIMESTAMP: u32 = 6202; // extract(text, timestamp)
+const OID_EXTRACT_TIMESTAMPTZ: u32 = 6203; // extract(text, timestamptz)
+const OID_EXTRACT_INTERVAL: u32 = 6204; // extract(text, interval)
+
+// `to_char`, the two temporal overloads. There is deliberately no
+// `to_char(date, text)` constant because **PostgreSQL has no such row** — a
+// `date` argument reaches 2049 through the implicit `date -> timestamp`
+// cast; see [`eval_to_char_datetime`].
+const OID_TO_CHAR_TIMESTAMPTZ: u32 = 1770; // to_char(timestamptz, text)
+const OID_TO_CHAR_TIMESTAMP: u32 = 2049; // to_char(timestamp, text)
+
 // ─── Math — trig/log/exp/power (see docs/migration/df-removal/19-expires-at-removal.md
 // entry 1: these OIDs already existed in `basin_pgtype::func::FUNCS` as
 // planner-resolution groundwork, unbacked here. Every OID below was read from
@@ -925,6 +943,16 @@ fn eval_binary(
         "*" => numeric::mul(&l, &r).map_err(|e| map_arrow(e, "integer multiplication")),
         "/" => eval_div(&l, &r),
         "%" => numeric::rem(&l, &r).map_err(|e| map_arrow(e, "modulo")),
+        // `^` is EXPONENTIATION in Postgres, not the bitwise XOR the same
+        // spelling means in C, Rust, Python and SQLite: `2 ^ 10` is 1024,
+        // confirmed live. It is also LEFT-associative, unlike the right
+        // associativity `**`/`^` has in most languages — `2 ^ 3 ^ 2` is
+        // `(2 ^ 3) ^ 2` = 64 live, not 512. That association is decided by
+        // the grammar before this file sees anything: `basin-plan` parses
+        // with `pg_query`, which is Postgres's own grammar, so the left
+        // operand of the outer `^` arrives already being `2 ^ 3`. Nothing
+        // here has to (or could) encode it.
+        "^" => eval_exponent(&l, &r),
         // `text || text` (oid 654). An ordinary strict operator: unlike
         // `concat()` (see [`eval_concat`]), `||` is NOT special about NULL —
         // it yields NULL if EITHER side is NULL, the same as `+` would for
@@ -1771,6 +1799,30 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
             let field = a(0)?;
             let value = a(1)?;
             eval_date_part_date(&field, &value)
+        }
+
+        // All six `extract` oids share ONE implementation, which reads the
+        // argument's actual Arrow type rather than trusting the oid. See
+        // [`eval_extract`] for why that is the correct dispatch and not a
+        // shortcut.
+        OID_EXTRACT_DATE
+        | OID_EXTRACT_TIME
+        | OID_EXTRACT_TIMETZ
+        | OID_EXTRACT_TIMESTAMP
+        | OID_EXTRACT_TIMESTAMPTZ
+        | OID_EXTRACT_INTERVAL => {
+            let value = a(1)?;
+            eval_extract(args.first(), &value, session)
+        }
+
+        // Both `to_char` oids likewise share one argument-type-dispatched
+        // implementation — which is also what lets a `date` argument work at
+        // all, since PostgreSQL reaches 2049 from a `date` by an implicit
+        // cast that Basin's lowering does not insert.
+        OID_TO_CHAR_TIMESTAMP | OID_TO_CHAR_TIMESTAMPTZ => {
+            let value = a(0)?;
+            let format = a(1)?;
+            eval_to_char_datetime(&value, &format, session)
         }
 
         OID_SQRT_FLOAT8 => float8_unary_checked(&a(0)?, pg_sqrt_f64),
@@ -3219,6 +3271,668 @@ fn eval_date_part_date(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, 
         },
         TY_TIMESTAMP,
     )
+}
+
+// ─── extract ────────────────────────────────────────────────────────────────
+//
+// `extract(FIELD FROM value)` is NOT `date_part` with a cast, and the two
+// differences were both measured on a live PostgreSQL 18.2:
+//
+//  1. **`extract` returns `numeric`; `date_part` returns `float8`.** That is
+//     not a rendering difference, it is digits:
+//
+//     ```text
+//     extract  (epoch  from '4024-03-15 12:34:56.654321+02'::timestamptz)
+//       = 64824402896.654321   -- numeric
+//     date_part('epoch',       '4024-03-15 12:34:56.654321+02'::timestamptz)
+//       = 64824402896.65432    -- float8, the last digit is gone
+//
+//     extract  (second from '2024-03-15 12:34:56.789123'::timestamp)
+//       = 56.789123
+//     date_part('second',   '2024-03-15 12:34:56.789123'::timestamp)
+//       = 56.789123000000004
+//     ```
+//
+//  2. **They accept different units on a `date`.** `date_part(text, date)`
+//     (1384) is a SQL wrapper whose body casts to `timestamp` first, so
+//     `date_part('hour', DATE '2024-03-15')` is `0`. `extract(text, date)`
+//     (6199) is the C function `extract_date`, which has no such cast, so
+//     `extract(hour FROM DATE '2024-03-15')` is the error `unit "hour" not
+//     supported for type date`. [`extract_scale`] is where that difference
+//     lives.
+//
+// The `numeric` return is the reason this is a separate implementation rather
+// than a cast of [`eval_date_part_rows`]'s `f64`: going through `f64` would
+// reintroduce exactly the rounding the first difference above is about.
+
+/// Which of the temporal types an `extract` call's second argument actually
+/// is, read from the argument's **Arrow type** rather than from the resolved
+/// `pg_proc` oid.
+///
+/// Reading the runtime type is not a shortcut around the catalog, it is the
+/// only sound dispatch available here. `basin_plan::lower::expr::
+/// best_effort_type` reports `unknown` (oid 705) for any expression that is
+/// not a literal, cast or parameter — a bare `ColumnRef` carries no type —
+/// so `extract(EPOCH FROM ts)` and `extract(YEAR FROM day)` both reach
+/// `basin_pgtype::func::resolve` as `extract(unknown, unknown)` and both come
+/// back as the *same* oid, whichever row is first in the table. The oid is
+/// therefore known-unreliable input, while the Arrow type of the evaluated
+/// argument is ground truth. Postgres's six `extract` oids are one function
+/// differing only by argument type, so dispatching on the type that is
+/// actually present reproduces Postgres's answer for every one of them;
+/// dispatching on the oid would reproduce it for at most one.
+///
+/// The same reasoning does not rescue `date_part`, whose three oids each
+/// downcast to a fixed array type — `date_part('month', day)` still resolves
+/// to 1171 (`timestamptz`) and still fails on a `Date32` argument. That is a
+/// pre-existing gap, left alone here rather than widened by accident.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TemporalKind {
+    Date,
+    Timestamp,
+    TimestampTz,
+}
+
+impl TemporalKind {
+    /// Postgres's own spelling of the type, for the error messages
+    /// [`unit_not_supported`] and [`unit_not_recognized`] build.
+    fn type_name(self) -> &'static str {
+        match self {
+            TemporalKind::Date => TY_DATE,
+            TemporalKind::Timestamp => TY_TIMESTAMP,
+            TemporalKind::TimestampTz => TY_TIMESTAMPTZ,
+        }
+    }
+}
+
+const TY_DATE: &str = "date";
+
+/// Classify an evaluated temporal argument, or explain what is missing.
+///
+/// `time`, `timetz` and `interval` are real `extract`/`to_char` argument
+/// types in Postgres (oids 6200, 6201, 6204, 1768) and are deliberately NOT
+/// handled: each needs its own field-extraction rules, and answering them
+/// from the `timestamp` rules would be a wrong answer rather than a missing
+/// one. They fail here, which falls back.
+fn temporal_kind(values: &ArrayRef, what: &'static str) -> Result<TemporalKind, ExecError> {
+    match values.data_type() {
+        DataType::Date32 => Ok(TemporalKind::Date),
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None) => {
+            Ok(TemporalKind::Timestamp)
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_)) => {
+            Ok(TemporalKind::TimestampTz)
+        }
+        other => Err(ExecError::Internal(format!(
+            "{what} on {other:?} is not implemented — only date, timestamp and timestamptz are"
+        ))),
+    }
+}
+
+/// One row's reading of a temporal value: the local (session-rendered, for a
+/// `timestamptz`) civil time, the UTC offset if the type has one, and the
+/// microseconds since the Unix epoch. The same triple
+/// [`eval_date_part_rows`] passes to [`date_part_of`], so the two functions
+/// agree on every field either of them derives from it.
+type TemporalReading = (NaiveDateTime, Option<i32>, i64);
+
+/// Read every row of `values` as a [`TemporalReading`], `None` for SQL NULL.
+fn temporal_readings(
+    kind: TemporalKind,
+    values: &ArrayRef,
+    session: &EvalSession,
+) -> Result<Vec<Option<TemporalReading>>, ExecError> {
+    let n = values.len();
+    let mut out = Vec::with_capacity(n);
+    match kind {
+        TemporalKind::Date => {
+            let v = downcast_array::<Date32Array>(values, "date")?;
+            for i in 0..n {
+                if v.is_null(i) {
+                    out.push(None);
+                    continue;
+                }
+                let micros = i64::from(v.value(i)) * 86_400 * 1_000_000;
+                out.push(Some((naive_from_micros(micros)?, None, micros)));
+            }
+        }
+        TemporalKind::Timestamp => {
+            let v = downcast_array::<TimestampMicrosecondArray>(values, "timestamp")?;
+            for i in 0..n {
+                if v.is_null(i) {
+                    out.push(None);
+                    continue;
+                }
+                let micros = v.value(i);
+                out.push(Some((naive_from_micros(micros)?, None, micros)));
+            }
+        }
+        TemporalKind::TimestampTz => {
+            let v =
+                downcast_array::<TimestampMicrosecondArray>(values, "timestamp with time zone")?;
+            let tz = session.time_zone()?;
+            for i in 0..n {
+                if v.is_null(i) {
+                    out.push(None);
+                    continue;
+                }
+                let micros = v.value(i);
+                let utc = naive_from_micros(micros)?;
+                let offset = tz.offset_from_utc_datetime(&utc).fix().local_minus_utc();
+                out.push(Some((
+                    utc + TimeDelta::seconds(i64::from(offset)),
+                    Some(offset),
+                    micros,
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The `numeric` scale `extract` produces for this unit and argument type —
+/// and, in the same pass, the rejection of units this argument type does not
+/// accept.
+///
+/// Arrow's `Decimal128` carries ONE scale for a whole array, while Postgres's
+/// `numeric` carries a per-value `dscale`. That is workable only because the
+/// scale is a function of the unit and the argument type, both fixed for the
+/// whole call — which is why [`eval_extract`] insists on a literal unit. Every
+/// scale below was read off a live PostgreSQL 18.2 with
+/// `scale(pg_catalog.extract(<unit>, <value>))`:
+///
+/// ```text
+/// unit          date   timestamp / timestamptz
+/// epoch            0   6          (1710506096.789123)
+/// second         n/a   6          (56.789123, and 56.000000 on a whole second)
+/// milliseconds   n/a   3          (56789.123)
+/// microseconds   n/a   0          (56789123)
+/// everything     0     0
+/// ```
+///
+/// `julian` is the one unit refused for a reason other than Postgres refusing
+/// it: on a `timestamp` its scale is neither fixed nor small — measured 20 for
+/// `2024-03-15 12:34:56.789123` and 28 for the same date at midnight, because
+/// Postgres computes it as a `numeric` division whose `dscale` floats. No
+/// single Arrow scale reproduces that, so it fails closed instead of answering
+/// to the wrong precision. On a `date` there is no division and the answer is
+/// the integer Julian day, which IS produced.
+fn extract_scale(unit: DateUnit, kind: TemporalKind, raw: &str) -> Result<i8, ExecError> {
+    let ty = kind.type_name();
+    if kind == TemporalKind::Date {
+        // `extract_date` accepts no sub-day unit and no zone field at all,
+        // which is exactly where it parts company with `date_part(text,
+        // date)`. All four messages measured live.
+        return match unit {
+            DateUnit::Hour
+            | DateUnit::Minute
+            | DateUnit::Second
+            | DateUnit::Millisecond
+            | DateUnit::Microsecond
+            | DateUnit::Timezone
+            | DateUnit::TimezoneHour
+            | DateUnit::TimezoneMinute => Err(unit_not_supported(raw, ty)),
+            _ => Ok(0),
+        };
+    }
+    if unit == DateUnit::Julian {
+        return Err(ExecError::Internal(format!(
+            "extract(julian from {ty}) has no fixed numeric scale in Postgres (measured 20 and \
+             28 digits for two values of the same column) and cannot be represented as one \
+             Decimal128 scale"
+        )));
+    }
+    Ok(match unit {
+        DateUnit::Epoch | DateUnit::Second => 6,
+        DateUnit::Millisecond => 3,
+        _ => 0,
+    })
+}
+
+/// The unscaled `Decimal128` value for one row, at the scale
+/// [`extract_scale`] already fixed for the whole array.
+///
+/// The four sub-second-bearing units are computed here in exact integer
+/// microseconds. Every other unit — including the calendar arithmetic for
+/// `decade`/`century`/`millennium`/`julian` and the `timezone*` fields, each
+/// of which has its own already-verified Postgres rule — is delegated to
+/// [`date_part_of`], whose answers are integers for those units and so
+/// survive `f64` exactly. Sharing that function is deliberate: `extract` and
+/// `date_part` must not drift apart on the units where Postgres says they
+/// agree.
+fn extract_value(
+    unit: DateUnit,
+    raw: &str,
+    kind: TemporalKind,
+    local: NaiveDateTime,
+    offset: Option<i32>,
+    epoch_micros: i64,
+) -> Result<i128, ExecError> {
+    // Seconds-and-fraction of the minute, in exact microseconds.
+    let sec_micros = i128::from(local.second()) * 1_000_000
+        + i128::from(local.and_utc().timestamp_subsec_micros());
+    Ok(match unit {
+        // scale 6 on a timestamp (whole microseconds), scale 0 on a date
+        // (where Postgres reports whole seconds — the value is always a whole
+        // number of days from the epoch, so the division is exact).
+        DateUnit::Epoch => match kind {
+            TemporalKind::Date => i128::from(epoch_micros) / 1_000_000,
+            _ => i128::from(epoch_micros),
+        },
+        // All three are the same integer microsecond count read at three
+        // different scales: 56.789123 (scale 6), 56789.123 (scale 3) and
+        // 56789123 (scale 0) are one number, formatted three ways.
+        DateUnit::Second | DateUnit::Millisecond | DateUnit::Microsecond => sec_micros,
+        _ => {
+            let as_f64 = date_part_of(unit, raw, local, offset, epoch_micros, kind.type_name())?;
+            as_f64 as i128
+        }
+    })
+}
+
+/// `extract(FIELD FROM value)` — Postgres oids 6199-6204, one implementation.
+///
+/// The unit must be a literal. Postgres's SQL-standard `EXTRACT(YEAR FROM x)`
+/// syntax can spell it no other way, and `pg_query` lowers that keyword to a
+/// string constant; the function-call spelling `extract(col, x)` with a
+/// *varying* unit is legal Postgres but is refused here, because the result's
+/// `numeric` scale depends on the unit (see [`extract_scale`]) and an Arrow
+/// array has one scale for every row. Refusing falls back, which answers it
+/// correctly by another route; guessing a scale would not.
+fn eval_extract(
+    field: Option<&Expr>,
+    values: &ArrayRef,
+    session: &EvalSession,
+) -> Result<ArrayRef, ExecError> {
+    let raw = match field {
+        Some(Expr::Literal(PlanDatum::Utf8(s), _)) => s.as_str(),
+        _ => {
+            return Err(ExecError::Internal(
+                "extract with a non-literal field is not implemented — the result's numeric \
+                 scale depends on the field, and one Arrow array carries one scale"
+                    .into(),
+            ))
+        }
+    };
+    let kind = temporal_kind(values, "extract")?;
+    let unit = parse_date_unit(raw).ok_or_else(|| unit_not_recognized(raw, kind.type_name()))?;
+    let scale = extract_scale(unit, kind, raw)?;
+
+    let readings = temporal_readings(kind, values, session)?;
+    let mut out: Vec<Option<i128>> = Vec::with_capacity(readings.len());
+    for reading in readings {
+        match reading {
+            None => out.push(None),
+            Some((local, offset, epoch_micros)) => out.push(Some(extract_value(
+                unit,
+                raw,
+                kind,
+                local,
+                offset,
+                epoch_micros,
+            )?)),
+        }
+    }
+    // Precision 38 is the widest `Decimal128` holds and is what
+    // `basin_pgtype::physical` already maps an unconstrained `numeric` to, so
+    // this reports the same width the rest of the engine uses for a `numeric`
+    // with no declared precision.
+    let array = Decimal128Array::from(out)
+        .with_precision_and_scale(38, scale)
+        .map_err(|e| map_arrow(e, "extract"))?;
+    Ok(Arc::new(array))
+}
+
+// ─── to_char (date/time) ────────────────────────────────────────────────────
+
+/// `to_char(timestamp, text)` (2049) and `to_char(timestamptz, text)` (1770).
+///
+/// **A `date` argument is handled here too, and that is not an extra
+/// overload.** PostgreSQL has no `to_char(date, text)` — enumerating
+/// `pg_catalog` on a live server gives exactly eight `to_char` rows, none of
+/// them taking a `date` — so `to_char(day, 'YYYY-MM-DD')` resolves to 2049 by
+/// the implicit `date -> timestamp` cast (`pg_cast.castcontext = 'i'`, read
+/// off the same server). Basin's lowering does not insert that cast, so the
+/// argument arrives as a `Date32` under oid 2049 and the widening happens
+/// here instead: midnight of that day, which is precisely what the cast
+/// Postgres inserts produces — `to_char(DATE '2024-03-05', 'YYYY-MM-DD
+/// HH24:MI:SS')` is `2024-03-05 00:00:00` live.
+///
+/// A `timestamptz` argument renders in the session's `TimeZone`, which is why
+/// both oids are `provolatile = 's'` in `pg_proc`.
+fn eval_to_char_datetime(
+    values: &ArrayRef,
+    formats: &ArrayRef,
+    session: &EvalSession,
+) -> Result<ArrayRef, ExecError> {
+    let kind = temporal_kind(values, "to_char")?;
+    let f = downcast_array::<StringArray>(formats, "text")?;
+    let readings = temporal_readings(kind, values, session)?;
+
+    let mut out: Vec<Option<String>> = Vec::with_capacity(readings.len());
+    for (i, reading) in readings.into_iter().enumerate() {
+        match reading {
+            Some((local, _, _)) if !f.is_null(i) => {
+                out.push(Some(format_datetime(f.value(i), local)?))
+            }
+            _ => out.push(None),
+        }
+    }
+    Ok(Arc::new(StringArray::from(out)))
+}
+
+/// One `to_char` datetime template pattern: the literal Postgres spells it
+/// with, and how to render it — or `None` for a pattern that is **real in
+/// Postgres but not implemented here**.
+///
+/// The `None` entries are not padding. Matching is longest-first, and a
+/// pattern this table did not know about would be silently chewed up by
+/// shorter ones that happen to be prefixes of it: `SSSS` (seconds past
+/// midnight) matched as `SS` twice renders `2024-03-10 06:30:00` as `0000`
+/// instead of `23400` — a wrong answer, produced without any error, and
+/// caught by [`to_char_refuses_an_unimplemented_template_pattern`] only
+/// because that test asserts the refusal rather than the digits. Listing
+/// every pattern Postgres has, implemented or not, is what makes
+/// longest-first matching safe.
+type DatePattern = (&'static str, Option<fn(NaiveDateTime) -> String>);
+
+/// Postgres's month names, in the `C`/English locale `lc_time` defaults to.
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// Postgres's day names, Sunday first — the order `to_char`'s own `D` field
+/// numbers them in.
+const DAY_NAMES: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+/// Postgres's year numbering, which has no year zero: chrono counts
+/// astronomically (its year 0 IS 1 BC), so anything at or below zero is one
+/// further from zero in Postgres's numbering. The same adjustment
+/// [`date_part_of`] makes for the `year` field.
+fn pg_year_of(dt: NaiveDateTime) -> i32 {
+    let y = dt.year();
+    if y <= 0 {
+        y - 1
+    } else {
+        y
+    }
+}
+
+/// The absolute value of the Postgres year: `to_char` prints the digits and
+/// leaves the era to the `BC`/`AD` patterns (which are not implemented).
+/// Confirmed live: `to_char(DATE '0044-03-15 BC', 'YYYY')` is `0044`.
+fn abs_pg_year(dt: NaiveDateTime) -> u32 {
+    pg_year_of(dt).unsigned_abs()
+}
+
+/// Blank-pad to the width Postgres pads its full month and day names to,
+/// measured live: `length(to_char(DATE '2024-03-05', 'MONTH'))` is 9, and so
+/// is `DAY`'s — the width of `September` and `Wednesday`.
+fn pad9(s: &str) -> String {
+    format!("{s:<9}")
+}
+
+/// Every datetime template pattern PostgreSQL 18 has, longest first, with the
+/// subset this evaluator renders. `None` means Postgres has it and this does
+/// not — see [`DatePattern`] for why those entries are load-bearing rather
+/// than documentation.
+///
+/// Each implemented rendering was checked against a live PostgreSQL 18.2 with
+/// `to_char(TIMESTAMP '2024-03-05 14:07:09.123456', <pattern>)`, whose
+/// answers are quoted per group. The `None` list is Postgres's own template
+/// table: the era, Roman-numeral, ISO-year, Julian-day, century,
+/// seconds-past-midnight, fractional-second and time-zone patterns, plus the
+/// `FM`/`FX`/`TM`/`TH`/`th`/`SP` modifiers.
+const DATE_PATTERNS: &[DatePattern] = &[
+    // ── 5 ──
+    ("SSSSS", None), // seconds past midnight
+    ("MONTH", Some(|d| {
+        pad9(MONTH_NAMES[d.month0() as usize]).to_uppercase()
+    })), // "MARCH    "
+    ("Month", Some(|d| pad9(MONTH_NAMES[d.month0() as usize]))), // "March    "
+    ("month", Some(|d| {
+        pad9(MONTH_NAMES[d.month0() as usize]).to_lowercase()
+    })), // "march    "
+    ("Y,YYY", None), // year with a comma
+    // ── 4 ──
+    ("HH24", Some(|d| format!("{:02}", d.hour()))), // "14"
+    ("HH12", Some(|d| format!("{:02}", hour12(d)))), // "02"
+    ("YYYY", Some(|d| format!("{:04}", abs_pg_year(d)))), // "2024"
+    ("IYYY", None), // ISO 8601 week-numbering year
+    ("IDDD", None), // ISO day of the week-numbering year
+    ("SSSS", None), // seconds past midnight
+    ("A.M.", None),
+    ("a.m.", None),
+    ("P.M.", None),
+    ("p.m.", None),
+    ("B.C.", None),
+    ("b.c.", None),
+    ("A.D.", None),
+    ("a.d.", None),
+    // ── 3 ──
+    ("DDD", Some(|d| format!("{:03}", d.ordinal()))), // "065"
+    ("DAY", Some(|d| {
+        pad9(DAY_NAMES[d.weekday().num_days_from_sunday() as usize]).to_uppercase()
+    })), // "TUESDAY  "
+    ("Day", Some(|d| {
+        pad9(DAY_NAMES[d.weekday().num_days_from_sunday() as usize])
+    })), // "Tuesday  "
+    ("day", Some(|d| {
+        pad9(DAY_NAMES[d.weekday().num_days_from_sunday() as usize]).to_lowercase()
+    })), // "tuesday  "
+    ("MON", Some(|d| {
+        MONTH_NAMES[d.month0() as usize][..3].to_uppercase()
+    })), // "MAR"
+    ("Mon", Some(|d| MONTH_NAMES[d.month0() as usize][..3].to_string())), // "Mar"
+    ("mon", Some(|d| {
+        MONTH_NAMES[d.month0() as usize][..3].to_lowercase()
+    })), // "mar"
+    ("YYY", Some(|d| format!("{:03}", abs_pg_year(d) % 1_000))), // "024"
+    ("IYY", None),
+    ("TZH", None),
+    ("TZM", None),
+    ("FF1", None),
+    ("FF2", None),
+    ("FF3", None),
+    ("FF4", None),
+    ("FF5", None),
+    ("FF6", None),
+    // ── 2 ──
+    // `HH` is `HH12`, NOT `HH24` — the trap this group exists to get right:
+    // "02" for 14:07, measured.
+    ("MM", Some(|d| format!("{:02}", d.month()))), // "03"
+    ("DD", Some(|d| format!("{:02}", d.day()))),   // "05"
+    ("HH", Some(|d| format!("{:02}", hour12(d)))), // "02"
+    ("MI", Some(|d| format!("{:02}", d.minute()))), // "07"
+    ("SS", Some(|d| format!("{:02}", d.second()))), // "09"
+    ("MS", Some(|d| {
+        format!("{:03}", d.and_utc().timestamp_subsec_millis())
+    })), // "123"
+    ("US", Some(|d| {
+        format!("{:06}", d.and_utc().timestamp_subsec_micros())
+    })), // "123456"
+    ("YY", Some(|d| format!("{:02}", abs_pg_year(d) % 100))), // "24"
+    ("WW", Some(|d| format!("{:02}", (d.ordinal() - 1) / 7 + 1))), // "10"
+    ("IW", Some(|d| format!("{:02}", d.iso_week().week()))), // "10"
+    ("ID", Some(|d| d.weekday().number_from_monday().to_string())), // "2"
+    ("DY", Some(|d| {
+        DAY_NAMES[d.weekday().num_days_from_sunday() as usize][..3].to_uppercase()
+    })), // "TUE"
+    ("Dy", Some(|d| {
+        DAY_NAMES[d.weekday().num_days_from_sunday() as usize][..3].to_string()
+    })), // "Tue"
+    ("dy", Some(|d| {
+        DAY_NAMES[d.weekday().num_days_from_sunday() as usize][..3].to_lowercase()
+    })), // "tue"
+    ("AM", Some(meridiem_upper)), // "PM" — the pattern's case, the value's meaning
+    ("PM", Some(meridiem_upper)),
+    ("am", Some(meridiem_lower)),
+    ("pm", Some(meridiem_lower)),
+    ("IY", None),
+    ("BC", None),
+    ("bc", None),
+    ("AD", None),
+    ("ad", None),
+    ("CC", None), // century
+    ("RM", None), // Roman-numeral month
+    ("rm", None),
+    ("TZ", None),
+    ("tz", None),
+    ("OF", None),
+    ("FM", None), // fill mode (suppress padding/zeroes)
+    ("FX", None), // fixed format global option
+    ("TM", None), // translation mode (localized names)
+    ("TH", None), // ordinal suffix
+    ("th", None),
+    ("SP", None), // spell mode
+    // ── 1 ──
+    ("Y", Some(|d| (abs_pg_year(d) % 10).to_string())), // "4"
+    ("D", Some(|d| {
+        (d.weekday().num_days_from_sunday() + 1).to_string()
+    })), // "3" — 1 is Sunday
+    ("Q", Some(|d| ((d.month() - 1) / 3 + 1).to_string())), // "1"
+    ("I", None), // last digit of the ISO week-numbering year
+    ("W", None), // week of the month
+    ("J", None), // Julian day
+];
+
+/// 12-hour clock, with midnight and noon both printing `12` — confirmed live:
+/// `to_char(TIMESTAMP '2024-03-05 00:07:09', 'HH12 AM')` is `12 AM` and the
+/// same instant at 12:07 is `12 PM`.
+fn hour12(d: NaiveDateTime) -> u32 {
+    match d.hour() % 12 {
+        0 => 12,
+        h => h,
+    }
+}
+
+/// `AM`/`PM` both print the actual half of the day, in the case of whichever
+/// of the two the format spelled — measured: `to_char(<14:07>, 'AM')` is
+/// `PM`.
+fn meridiem_upper(d: NaiveDateTime) -> String {
+    if d.hour() < 12 { "AM" } else { "PM" }.to_string()
+}
+
+fn meridiem_lower(d: NaiveDateTime) -> String {
+    if d.hour() < 12 { "am" } else { "pm" }.to_string()
+}
+
+/// Render one value with one datetime template.
+///
+/// **An ASCII letter that starts no pattern is an error, not a literal.**
+/// Postgres does copy genuinely unrecognized characters through
+/// (`to_char(<any>, 'ZZZ')` is `ZZZ`), but copying letters through here would
+/// silently corrupt the patterns [`DATE_PATTERNS`] carries as `None`: `RM` is
+/// the Roman-numeral month (`III` for March), `J` the Julian day, `CC` the
+/// century, `SSSS` the seconds past midnight, `TZ` the zone abbreviation.
+/// `to_char(<2024-03-05>, 'XYZ')` is `X4Z` on a live server, not `XYZ` — the
+/// same trap from the other side: `Y` is a pattern even in the middle of
+/// nonsense. So an unimplemented pattern (and any unrecognized letter) fails,
+/// and failing falls back to an engine that has the whole template language.
+///
+/// Non-letters pass through as themselves (`-`, `/`, `:`, spaces), and
+/// double-quoted runs pass through verbatim, which is Postgres's own escape
+/// for text inside a template: `to_char(<2024-03-05>, '"Year:" YYYY')` is
+/// `Year: 2024`.
+fn format_datetime(fmt: &str, dt: NaiveDateTime) -> Result<String, ExecError> {
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let mut rest = fmt;
+    'outer: while !rest.is_empty() {
+        if let Some(after_open) = rest.strip_prefix('"') {
+            let Some(close) = after_open.find('"') else {
+                return Err(ExecError::Internal(format!(
+                    "to_char format `{fmt}` has an unterminated double-quoted section"
+                )));
+            };
+            out.push_str(&after_open[..close]);
+            rest = &after_open[close + 1..];
+            continue;
+        }
+        for (pattern, render) in DATE_PATTERNS {
+            if let Some(tail) = rest.strip_prefix(pattern) {
+                let Some(render) = render else {
+                    return Err(ExecError::Internal(format!(
+                        "to_char datetime template pattern `{pattern}` is not implemented"
+                    )));
+                };
+                out.push_str(&render(dt));
+                rest = tail;
+                continue 'outer;
+            }
+        }
+        let ch = rest.chars().next().expect("rest is non-empty");
+        if ch.is_ascii_alphabetic() {
+            return Err(ExecError::Internal(format!(
+                "to_char datetime template pattern starting at `{rest}` is not implemented"
+            )));
+        }
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    Ok(out)
+}
+
+// ─── `^` (exponentiation) ───────────────────────────────────────────────────
+
+/// `a ^ b`, Postgres oid 965 (`float8 ^ float8`, `dpow`).
+///
+/// Integer operands reach this after [`unify_numeric`] has already made both
+/// sides one integer width; Postgres's own resolution widens them to `float8`
+/// too (there is no `int ^ int` operator, and `pg_typeof(2::int8 ^ 2::int4)`
+/// is `double precision` live), so the cast here is the same one Postgres
+/// performs, not an approximation of it.
+///
+/// A `numeric` operand is REFUSED rather than routed through `f64`. Postgres
+/// resolves that to a different operator with a different result type — oid
+/// 1038, `numeric ^ numeric` returning `numeric` — and answering it in
+/// double precision would be a wrong answer with the right shape.
+/// [`eval_binary`] dispatches on the operator *name*, so this is the only
+/// place the distinction can be made.
+fn eval_exponent(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    for (side, arr) in [("left", lhs), ("right", rhs)] {
+        match arr.data_type() {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64 => {}
+            DataType::Decimal128(..) | DataType::Decimal256(..) => {
+                return Err(ExecError::Internal(format!(
+                    "`^` with a numeric {side} operand is Postgres's numeric_power (oid 1038), \
+                     which returns numeric; this evaluator implements only the float8 operator \
+                     (oid 965)"
+                )))
+            }
+            other => {
+                return Err(ExecError::TypeMismatch(format!(
+                    "operator does not exist: {other:?} ^ ..."
+                )))
+            }
+        }
+    }
+    let l = cast::cast(lhs, &DataType::Float64).map_err(|e| map_arrow(e, "^"))?;
+    let r = cast::cast(rhs, &DataType::Float64).map_err(|e| map_arrow(e, "^"))?;
+    float8_binary_checked(&l, &r, pg_power_f64)
 }
 
 /// Evaluate one argument of a `VARIADIC "any"` function and materialize it
@@ -8334,4 +9048,624 @@ mod tests {
         assert_eq!(ts_micros(&direct), 1_712_408_400_000_000);
     }
 
+    // ── extract / to_char / `^` ────────────────────────────────────────
+    //
+    // Every expectation below was read off a live PostgreSQL 18.2, the
+    // `extract` ones through
+    //
+    // ```sql
+    // SELECT trunc(x * power(10, scale(x))::numeric), scale(x)
+    //   FROM (SELECT pg_catalog.extract(<unit>, <value>) AS x) _;
+    // ```
+    //
+    // which reports the `numeric` as the exact (unscaled integer, scale)
+    // pair a `Decimal128` stores, rather than as text — the point of these
+    // rows is that the scale is data, not formatting.
+
+    fn date_batch(days: i32) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Date32, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Date32Array::from(vec![Some(days)]))]).unwrap()
+    }
+
+    /// The unscaled value and the scale of a one-row `numeric` result — the
+    /// two halves of what Postgres's `numeric` actually carries.
+    fn decimal_at0(v: &ArrayRef) -> (i128, i8) {
+        let a = v
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("extract must produce numeric, not double precision");
+        (a.value(0), a.scale())
+    }
+
+    fn text_at0(v: &ArrayRef) -> String {
+        downcast_array::<StringArray>(v, "text").unwrap().value(0).to_string()
+    }
+
+    /// `extract` on a `timestamp without time zone` (oid 6202), value AND
+    /// scale. The scale is the half a `float8`-returning implementation
+    /// cannot have: `second` is scale 6 even when the seconds are whole
+    /// (`56.000000`), because that is what Postgres's `numeric` carries.
+    #[test]
+    fn extract_on_a_timestamp_matches_postgres_value_and_scale() {
+        const CASES: &[(i64, &str, i128, i8)] = &[
+            (1710052200000000, "epoch", 1710052200000000, 6),
+            (1710052200000000, "year", 2024, 0),
+            (1710052200000000, "isoyear", 2024, 0),
+            (1710052200000000, "quarter", 1, 0),
+            (1710052200000000, "month", 3, 0),
+            (1710052200000000, "week", 10, 0),
+            (1710052200000000, "day", 10, 0),
+            (1710052200000000, "doy", 70, 0),
+            (1710052200000000, "dow", 0, 0),
+            (1710052200000000, "isodow", 7, 0),
+            (1710052200000000, "hour", 6, 0),
+            (1710052200000000, "minute", 30, 0),
+            (1710052200000000, "second", 0, 6),
+            (1710052200000000, "milliseconds", 0, 3),
+            (1710052200000000, "microseconds", 0, 0),
+            (1710052200000000, "decade", 202, 0),
+            (1710052200000000, "century", 21, 0),
+            (1710052200000000, "millennium", 3, 0),
+            // A sub-second instant: 2024-02-28 12:30:56.789123.
+            (1709123456789123, "epoch", 1709123456789123, 6),
+            (1709123456789123, "second", 56789123, 6),
+            (1709123456789123, "milliseconds", 56789123, 3),
+            (1709123456789123, "microseconds", 56789123, 0),
+            (1709123456789123, "minute", 30, 0),
+            (1709123456789123, "doy", 59, 0),
+            (1709123456789123, "week", 9, 0),
+            // One second BEFORE the epoch — the sign case, where a
+            // truncating-toward-zero implementation goes wrong.
+            (-1000000, "epoch", -1000000, 6),
+            (-1000000, "year", 1969, 0),
+            (-1000000, "month", 12, 0),
+            (-1000000, "day", 31, 0),
+            (-1000000, "hour", 23, 0),
+            (-1000000, "minute", 59, 0),
+            (-1000000, "second", 59000000, 6),
+            (-1000000, "milliseconds", 59000000, 3),
+            (-1000000, "microseconds", 59000000, 0),
+            (-1000000, "decade", 196, 0),
+            (-1000000, "century", 20, 0),
+            (-1000000, "millennium", 2, 0),
+        ];
+        for (micros, unit, unscaled, scale) in CASES {
+            let batch = plain_ts_batch(*micros);
+            let expr = sf(OID_EXTRACT_TIMESTAMP, vec![lit_text(unit), col(0, "v")]);
+            let got = eval(&expr, &batch).unwrap();
+            assert_eq!(
+                decimal_at0(&got),
+                (*unscaled, *scale),
+                "extract({unit} from timestamp {micros})"
+            );
+        }
+    }
+
+    /// The headline difference from `date_part`, in one assertion: the same
+    /// field of the same value, exact as `numeric` and rounded as `float8`.
+    /// Live, `extract(second from '2024-02-28 12:30:56.789123')` is
+    /// `56.789123` while `date_part('second', ...)` is `56.789123000000004`
+    /// — the `float8` cannot represent it, and `56789123 / 10^6` can.
+    #[test]
+    fn extract_keeps_the_microseconds_date_part_rounds_away() {
+        let batch = plain_ts_batch(1_709_123_456_789_123);
+        let exact = eval(
+            &sf(OID_EXTRACT_TIMESTAMP, vec![lit_text("second"), col(0, "v")]),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(decimal_at0(&exact), (56_789_123, 6));
+
+        let rounded = eval(
+            &sf(
+                OID_DATE_PART_TIMESTAMP,
+                vec![lit_text("second"), col(0, "v")],
+            ),
+            &batch,
+        )
+        .unwrap();
+        let as_f64 = f64_at0(&rounded);
+        assert_ne!(
+            as_f64, 56.789_123,
+            "date_part's float8 is the imprecise one — if this ever becomes exact, \
+             the premise of extract being a separate implementation is gone"
+        );
+        assert_eq!(as_f64.to_string(), "56.789123000000004");
+    }
+
+    /// `extract` on a `date` (oid 6199) is where it parts company with
+    /// `date_part(text, date)` (1384) on which units are legal at all:
+    /// `date_part` casts to `timestamp` first and answers `0` for `hour`,
+    /// `extract_date` has no such cast and raises "not supported". Both
+    /// behaviours measured; both asserted here so neither drifts onto the
+    /// other.
+    #[test]
+    fn extract_on_a_date_rejects_the_sub_day_units_date_part_accepts() {
+        const CASES: &[(i32, &str, i128)] = &[
+            (19792, "year", 2024),
+            (19792, "month", 3),
+            (19792, "day", 10),
+            (19792, "dow", 0),
+            (19792, "isodow", 7),
+            (19792, "doy", 70),
+            (19792, "week", 10),
+            (19792, "quarter", 1),
+            (19792, "julian", 2460380),
+            (19792, "epoch", 1710028800),
+            (19792, "decade", 202),
+            (19792, "century", 21),
+            (19792, "millennium", 3),
+            (0, "year", 1970),
+            (0, "epoch", 0),
+            (0, "julian", 2440588),
+            (0, "dow", 4),
+            (-1, "year", 1969),
+            (-1, "epoch", -86400),
+            (-1, "julian", 2440587),
+            (-1, "doy", 365),
+            (19158, "isoyear", 2022),
+            (19158, "week", 24),
+            (19158, "epoch", 1655251200),
+        ];
+        for (days, unit, unscaled) in CASES {
+            let batch = date_batch(*days);
+            let expr = sf(OID_EXTRACT_DATE, vec![lit_text(unit), col(0, "v")]);
+            let got = eval(&expr, &batch).unwrap();
+            assert_eq!(
+                decimal_at0(&got),
+                (*unscaled, 0),
+                "extract({unit} from date {days}) — every unit a date accepts is scale 0"
+            );
+        }
+
+        // `epoch` on a date is whole SECONDS (scale 0), not microseconds:
+        // 1710028800, not 1710028800000000. A shared code path with the
+        // timestamp overload would get this wrong by six orders of
+        // magnitude.
+        let epoch = eval(
+            &sf(OID_EXTRACT_DATE, vec![lit_text("epoch"), col(0, "v")]),
+            &date_batch(19792),
+        )
+        .unwrap();
+        assert_eq!(decimal_at0(&epoch), (1_710_028_800, 0));
+
+        for unit in [
+            "hour",
+            "minute",
+            "second",
+            "milliseconds",
+            "microseconds",
+            "timezone",
+            "timezone_hour",
+            "timezone_minute",
+        ] {
+            let batch = date_batch(19792);
+            let err = eval(
+                &sf(OID_EXTRACT_DATE, vec![lit_text(unit), col(0, "v")]),
+                &batch,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                ExecError::TypeMismatch(format!("unit \"{unit}\" not supported for type date")),
+                "extract({unit} from date) must be refused the way a live server refuses it"
+            );
+
+            // The same unit through `date_part`, which DOES accept it —
+            // this is the difference, not a coincidence.
+            let via_part = eval(
+                &sf(OID_DATE_PART_DATE, vec![lit_text(unit), col(0, "v")]),
+                &batch,
+            );
+            if unit.starts_with("timezone") {
+                assert!(via_part.is_err(), "no date has a zone under either function");
+            } else {
+                assert_eq!(
+                    f64_at0(&via_part.unwrap()),
+                    0.0,
+                    "date_part('{unit}', date) is 0 live, because its body casts to timestamp"
+                );
+            }
+        }
+    }
+
+    /// `extract` on a `timestamptz` (oid 6203) reads the SESSION zone for
+    /// every field but `epoch`, exactly as `date_part` does — including on a
+    /// zone whose offset is not a whole number of hours.
+    #[test]
+    fn extract_on_a_timestamptz_reads_the_session_zone() {
+        const CASES: &[(&str, i64, &str, i128, i8)] = &[
+            ("UTC", 1710052200000000, "hour", 6, 0),
+            ("UTC", 1710052200000000, "epoch", 1710052200000000, 6),
+            ("UTC", 1710052200000000, "timezone", 0, 0),
+            ("America/New_York", 1710052200000000, "hour", 1, 0),
+            ("America/New_York", 1710052200000000, "day", 10, 0),
+            ("America/New_York", 1710052200000000, "timezone", -18000, 0),
+            ("America/New_York", 1710052200000000, "timezone_hour", -5, 0),
+            ("America/New_York", 1710052200000000, "timezone_minute", 0, 0),
+            // The epoch is an absolute instant and does NOT move with the
+            // session zone — the same number under all three zones.
+            ("America/New_York", 1710052200000000, "epoch", 1710052200000000, 6),
+            ("Australia/Lord_Howe", 1710052200000000, "epoch", 1710052200000000, 6),
+            // April 6 15:00 UTC, after New York's DST start: -4, not -5.
+            ("America/New_York", 1712415600000000, "timezone_hour", -4, 0),
+            ("America/New_York", 1712415600000000, "hour", 11, 0),
+            // Lord Howe's HALF-hour offset, the case an implementation that
+            // stores offsets in whole hours gets wrong.
+            ("Australia/Lord_Howe", 1709123456789123, "hour", 23, 0),
+            ("Australia/Lord_Howe", 1709123456789123, "second", 56789123, 6),
+            ("Australia/Lord_Howe", 1709123456789123, "milliseconds", 56789123, 3),
+        ];
+        for (zone, micros, unit, unscaled, scale) in CASES {
+            let session = EvalSession::with_time_zone(*zone);
+            let batch = tstz_batch(*micros);
+            let expr = sf(OID_EXTRACT_TIMESTAMPTZ, vec![lit_text(unit), col(0, "v")]);
+            let got = eval_with(&expr, &batch, &session).unwrap();
+            assert_eq!(
+                decimal_at0(&got),
+                (*unscaled, *scale),
+                "extract({unit} from timestamptz {micros}) under TimeZone={zone}"
+            );
+        }
+    }
+
+    /// The six `extract` oids are one function in Postgres, differing only in
+    /// argument type — and lowering cannot yet tell this evaluator which one
+    /// a bare column meant (`best_effort_type` reports `unknown`, so every
+    /// call resolves to the same first-in-table oid). Dispatching on the
+    /// argument's Arrow type is what makes that harmless: the answer must be
+    /// identical no matter which of the six oids carried the call.
+    #[test]
+    fn every_extract_oid_dispatches_on_the_argument_type_it_actually_gets() {
+        let batch = date_batch(19792);
+        for oid_val in [
+            OID_EXTRACT_DATE,
+            OID_EXTRACT_TIME,
+            OID_EXTRACT_TIMETZ,
+            OID_EXTRACT_TIMESTAMP,
+            OID_EXTRACT_TIMESTAMPTZ,
+            OID_EXTRACT_INTERVAL,
+        ] {
+            let got = eval(&sf(oid_val, vec![lit_text("year"), col(0, "v")]), &batch).unwrap();
+            assert_eq!(
+                decimal_at0(&got),
+                (2024, 0),
+                "oid {oid_val} was handed a Date32 and must read it as a date"
+            );
+        }
+    }
+
+    /// `julian` on a `timestamp` is refused rather than answered. Its
+    /// Postgres `dscale` is not fixed — measured 20 digits for
+    /// `2024-03-15 12:34:56.789123` and 28 for the same date at midnight,
+    /// because Postgres computes it as a `numeric` division — so no single
+    /// Arrow scale reproduces it. On a `date` there is no division and it IS
+    /// answered (see the date test above).
+    #[test]
+    fn extract_julian_on_a_timestamp_fails_closed_rather_than_picking_a_scale() {
+        let batch = plain_ts_batch(1_710_052_200_000_000);
+        let err = eval(
+            &sf(OID_EXTRACT_TIMESTAMP, vec![lit_text("julian"), col(0, "v")]),
+            &batch,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ExecError::Internal(ref m) if m.contains("no fixed numeric scale")),
+            "expected a refusal naming the reason, got {err:?}"
+        );
+    }
+
+    /// A NULL value yields NULL, and the array still carries the scale — a
+    /// zero-row or all-NULL batch is exactly what `Project`'s schema probe
+    /// evaluates, so the scale must not depend on there being data.
+    #[test]
+    fn extract_of_null_is_null_and_still_carries_its_scale() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]))],
+        )
+        .unwrap();
+        let got = eval(
+            &sf(OID_EXTRACT_TIMESTAMP, vec![lit_text("epoch"), col(0, "v")]),
+            &batch,
+        )
+        .unwrap();
+        assert!(got.is_null(0));
+        assert_eq!(got.data_type(), &DataType::Decimal128(38, 6));
+
+        let empty = RecordBatch::new_empty(schema);
+        let probe = eval(
+            &sf(OID_EXTRACT_TIMESTAMP, vec![lit_text("epoch"), col(0, "v")]),
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(probe.data_type(), &DataType::Decimal128(38, 6));
+    }
+
+    /// `to_char(timestamp, text)` (oid 2049). Every expectation read off a
+    /// live PostgreSQL 18.2.
+    #[test]
+    fn to_char_of_a_timestamp_matches_postgres() {
+        const CASES: &[(i64, &str, &str)] = &[
+            (1710052200000000, "YYYY-MM-DD", "2024-03-10"),
+            (1710052200000000, "YYYY-MM-DD HH24:MI:SS", "2024-03-10 06:30:00"),
+            (1710052200000000, "DD/MM/YYYY", "10/03/2024"),
+            (1710052200000000, "Mon DD, YYYY", "Mar 10, 2024"),
+            (1710052200000000, "MONTH", "MARCH    "),
+            (1710052200000000, "Month", "March    "),
+            (1710052200000000, "month", "march    "),
+            (1710052200000000, "MON", "MAR"),
+            (1710052200000000, "Mon", "Mar"),
+            (1710052200000000, "mon", "mar"),
+            (1710052200000000, "DAY", "SUNDAY   "),
+            (1710052200000000, "Day", "Sunday   "),
+            (1710052200000000, "day", "sunday   "),
+            (1710052200000000, "DY", "SUN"),
+            (1710052200000000, "Dy", "Sun"),
+            (1710052200000000, "dy", "sun"),
+            (1710052200000000, "HH12:MI AM", "06:30 AM"),
+            (1710052200000000, "HH:MI pm", "06:30 am"),
+            (1710052200000000, "Q", "1"),
+            (1710052200000000, "WW", "10"),
+            (1710052200000000, "IW", "10"),
+            (1710052200000000, "ID", "7"),
+            (1710052200000000, "D", "1"),
+            (1710052200000000, "DDD", "070"),
+            (1710052200000000, "YYY", "024"),
+            (1710052200000000, "YY", "24"),
+            (1710052200000000, "Y", "4"),
+            (1710052200000000, "\"Year:\" YYYY", "Year: 2024"),
+            (1710052200000000, "YYYY\"y\"MM\"m\"DD\"d\"", "2024y03m10d"),
+            (1710052200000000, "YYYY-MM-DD HH24:MI:SS.MS", "2024-03-10 06:30:00.000"),
+            (1710052200000000, "YYYY-MM-DD HH24:MI:SS.US", "2024-03-10 06:30:00.000000"),
+            // 2024-02-28 12:30:56.789123 — noon, where a 12-hour clock that
+            // forgets `12 % 12 == 0` prints `00`.
+            (1709123456789123, "HH12:MI AM", "12:30 PM"),
+            (1709123456789123, "HH:MI pm", "12:30 pm"),
+            (1709123456789123, "YYYY-MM-DD HH24:MI:SS.MS", "2024-02-28 12:30:56.789"),
+            (1709123456789123, "YYYY-MM-DD HH24:MI:SS.US", "2024-02-28 12:30:56.789123"),
+            (1709123456789123, "DAY", "WEDNESDAY"),
+            (1709123456789123, "MONTH", "FEBRUARY "),
+            (1709123456789123, "DDD", "059"),
+            (1709123456789123, "D", "4"),
+            (1709123456789123, "ID", "3"),
+            (1709123456789123, "IW", "09"),
+            (1709123456789123, "WW", "09"),
+            (1712415600000000, "YYYY-MM-DD HH24:MI:SS", "2024-04-06 15:00:00"),
+            (1712415600000000, "HH12:MI AM", "03:00 PM"),
+            (1712415600000000, "Day", "Saturday "),
+            (1712415600000000, "Q", "2"),
+            (1712415600000000, "D", "7"),
+            (1712415600000000, "ID", "6"),
+            (1712415600000000, "Mon DD, YYYY", "Apr 06, 2024"),
+        ];
+        for (micros, fmt, expected) in CASES {
+            let batch = plain_ts_batch(*micros);
+            let expr = sf(OID_TO_CHAR_TIMESTAMP, vec![col(0, "v"), lit_text(fmt)]);
+            let got = eval(&expr, &batch).unwrap();
+            assert_eq!(text_at0(&got), *expected, "to_char({micros}, '{fmt}')");
+        }
+    }
+
+    /// **There is no `to_char(date, text)` in Postgres.** A `date` argument
+    /// reaches oid 2049 by the implicit `date -> timestamp` cast, so this
+    /// evaluator has to accept a `Date32` under that oid and read it as
+    /// midnight — which is what the inserted cast produces. Confirmed live:
+    /// `to_char(DATE '2024-03-05', 'YYYY-MM-DD HH24:MI:SS')` is
+    /// `2024-03-05 00:00:00`.
+    #[test]
+    fn to_char_of_a_date_is_midnight_under_the_timestamp_overload() {
+        const CASES: &[(i32, &str, &str)] = &[
+            (19792, "YYYY-MM-DD", "2024-03-10"),
+            (19792, "YYYY-MM-DD HH24:MI:SS", "2024-03-10 00:00:00"),
+            (19792, "HH12:MI AM", "12:00 AM"),
+            (19792, "Day", "Sunday   "),
+            (0, "YYYY-MM-DD", "1970-01-01"),
+            (-1, "YYYY-MM-DD", "1969-12-31"),
+        ];
+        for (days, fmt, expected) in CASES {
+            let batch = date_batch(*days);
+            let expr = sf(OID_TO_CHAR_TIMESTAMP, vec![col(0, "v"), lit_text(fmt)]);
+            let got = eval(&expr, &batch).unwrap();
+            assert_eq!(text_at0(&got), *expected, "to_char(date {days}, '{fmt}')");
+        }
+    }
+
+    /// `to_char(timestamptz, text)` (1770) renders in the SESSION zone —
+    /// which is why both `to_char` oids are `provolatile = 's'`.
+    #[test]
+    fn to_char_of_a_timestamptz_renders_in_the_session_zone() {
+        let batch = tstz_batch(1_710_052_200_000_000);
+        let expr = sf(
+            OID_TO_CHAR_TIMESTAMPTZ,
+            vec![col(0, "v"), lit_text("YYYY-MM-DD HH24:MI")],
+        );
+        for (zone, expected) in [
+            ("UTC", "2024-03-10 06:30"),
+            ("America/New_York", "2024-03-10 01:30"),
+            ("Australia/Lord_Howe", "2024-03-10 17:30"),
+        ] {
+            let got = eval_with(&expr, &batch, &EvalSession::with_time_zone(zone)).unwrap();
+            assert_eq!(text_at0(&got), expected, "TimeZone={zone}");
+        }
+    }
+
+    /// An unimplemented template pattern FAILS rather than passing its
+    /// letters through, and the reason is that Postgres would not have
+    /// passed them through either: `RM` is the Roman-numeral month (`III`
+    /// for March, live), `J` the Julian day, `CC` the century, `SSSS` the
+    /// seconds past midnight. Emitting `RM` verbatim would be a silently
+    /// wrong answer; failing falls back to an engine that implements them.
+    ///
+    /// The same trap seen from the other side: `to_char(<2024-03-05>,
+    /// 'XYZ')` is `X4Z` on a live server, because `Y` is a pattern even
+    /// inside nonsense. This evaluator refuses that too rather than
+    /// half-matching it.
+    #[test]
+    fn to_char_refuses_an_unimplemented_template_pattern() {
+        let batch = plain_ts_batch(1_710_052_200_000_000);
+        for fmt in ["RM", "J", "CC", "SSSS", "TZ", "yyyy", "FMDay", "IYYY", "XYZ"] {
+            let expr = sf(OID_TO_CHAR_TIMESTAMP, vec![col(0, "v"), lit_text(fmt)]);
+            let err = eval(&expr, &batch).unwrap_err();
+            assert!(
+                matches!(err, ExecError::Internal(ref m) if m.contains("not implemented")),
+                "to_char with '{fmt}' must fail closed, got {err:?}"
+            );
+        }
+        // Non-letters are NOT patterns and pass through, which is what makes
+        // the ordinary separator-laden formats above work.
+        let punct = sf(
+            OID_TO_CHAR_TIMESTAMP,
+            vec![col(0, "v"), lit_text("[YYYY] (MM) {DD} <>#@!")],
+        );
+        assert_eq!(
+            text_at0(&eval(&punct, &batch).unwrap()),
+            "[2024] (03) {10} <>#@!"
+        );
+    }
+
+    /// [`DATE_PATTERNS`] is matched longest-first, and that is the ONLY
+    /// reason `SSSS` is refused instead of being chewed into `SS` twice (the
+    /// bug this test was written after finding: it rendered `0000`). An entry
+    /// added out of order would silently reopen it for whichever pattern the
+    /// shorter one is a prefix of, so the ordering is pinned.
+    #[test]
+    fn date_patterns_are_ordered_longest_first_so_no_pattern_shadows_a_longer_one() {
+        for pair in DATE_PATTERNS.windows(2) {
+            assert!(
+                pair[0].0.len() >= pair[1].0.len(),
+                "`{}` (len {}) precedes `{}` (len {}) — a shorter pattern before a longer \
+                 one can consume the longer one's prefix",
+                pair[0].0,
+                pair[0].0.len(),
+                pair[1].0,
+                pair[1].0.len(),
+            );
+        }
+        // And no two entries claim the same spelling.
+        for (i, (pattern, _)) in DATE_PATTERNS.iter().enumerate() {
+            assert!(
+                !DATE_PATTERNS[i + 1..].iter().any(|(p, _)| p == pattern),
+                "`{pattern}` appears twice; only the first would ever be reached"
+            );
+        }
+    }
+
+    /// `^` is EXPONENTIATION in Postgres, not the bitwise XOR the same
+    /// spelling means in C, Rust, Python and SQLite. `SELECT 2 ^ 10` is
+    /// 1024 live; an XOR would answer 8.
+    #[test]
+    fn caret_is_exponentiation_not_bitwise_xor() {
+        let batch = batch_i32("x", vec![Some(2), Some(3), Some(10)]);
+        let expr = Expr::Binary {
+            op: op(965), // float8 ^ float8 (dpow)
+            lhs: Box::new(col(0, "x")),
+            rhs: Box::new(lit_i32(2)),
+        };
+        let got = eval(&expr, &batch).unwrap();
+        let f = downcast_array::<Float64Array>(&got, "double precision").unwrap();
+        assert_eq!(
+            (f.value(0), f.value(1), f.value(2)),
+            (4.0, 9.0, 100.0),
+            "x ^ 2 is x squared; a bitwise XOR would answer 0, 1 and 8"
+        );
+        assert_eq!(
+            got.data_type(),
+            &DataType::Float64,
+            "integer operands widen to float8, exactly as Postgres's own \
+             resolution does — there is no int ^ int operator"
+        );
+    }
+
+    /// `^` is LEFT-associative in Postgres, unlike the right associativity
+    /// the same spelling has in most languages: `2 ^ 3 ^ 2` is `(2 ^ 3) ^ 2`
+    /// = **64** live, not `2 ^ (3 ^ 2)` = 512.
+    ///
+    /// That association is decided by the grammar, not by this file —
+    /// `basin-plan` parses with `pg_query`, which is Postgres's own grammar,
+    /// so the left operand of the outer `^` arrives already being `2 ^ 3`.
+    /// What is asserted here is that evaluating that shape gives 64, i.e.
+    /// that nothing downstream re-associates it.
+    #[test]
+    fn caret_left_association_evaluates_to_64_not_512() {
+        let batch = batch_i32("x", vec![Some(2)]);
+        let inner = Expr::Binary {
+            op: op(965),
+            lhs: Box::new(col(0, "x")),
+            rhs: Box::new(lit_i32(3)),
+        };
+        let outer = Expr::Binary {
+            op: op(965),
+            lhs: Box::new(inner),
+            rhs: Box::new(lit_i32(2)),
+        };
+        let got = eval(&outer, &batch).unwrap();
+        assert_eq!(
+            downcast_array::<Float64Array>(&got, "double precision")
+                .unwrap()
+                .value(0),
+            64.0
+        );
+    }
+
+    /// A `numeric` operand is refused, not routed through `f64`. Postgres
+    /// resolves that to a DIFFERENT operator with a different result type —
+    /// oid 1038, `numeric ^ numeric` returning `numeric`
+    /// (`pg_typeof(2::numeric ^ 2::int4)` is `numeric` live) — and answering
+    /// it in double precision would be a wrong answer with the right shape.
+    #[test]
+    fn caret_refuses_a_numeric_operand_rather_than_answering_in_float8() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let arr = Decimal128Array::from(vec![Some(200_i128)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let expr = Expr::Binary {
+            op: op(965),
+            lhs: Box::new(col(0, "n")),
+            rhs: Box::new(lit_i32(2)),
+        };
+        let err = eval(&expr, &batch).unwrap_err();
+        assert!(
+            matches!(err, ExecError::Internal(ref m) if m.contains("numeric_power")),
+            "expected a refusal naming the operator it would have to be, got {err:?}"
+        );
+    }
+
+    /// Postgres's `power`/`^` domain errors apply to `^` too, because both
+    /// go through the same `dpow`: `0 ^ -1` is `division_by_zero` and a
+    /// negative base with a fractional exponent is out of range. Sharing
+    /// [`pg_power_f64`] with `power(float8, float8)` is what guarantees the
+    /// operator and the function cannot drift apart.
+    #[test]
+    fn caret_shares_powers_domain_errors_with_the_power_function() {
+        let batch = batch_i32("x", vec![Some(0)]);
+        let expr = Expr::Binary {
+            op: op(965),
+            lhs: Box::new(col(0, "x")),
+            rhs: Box::new(lit_i32(-1)),
+        };
+        let via_operator = eval(&expr, &batch).unwrap_err();
+        let via_function = eval(
+            &sf(
+                OID_POWER_FLOAT8,
+                vec![
+                    Expr::Literal(Datum::Float64(0.0), PgType::FLOAT8),
+                    Expr::Literal(Datum::Float64(-1.0), PgType::FLOAT8),
+                ],
+            ),
+            &batch,
+        )
+        .unwrap_err();
+        assert_eq!(via_operator, via_function);
+    }
 }

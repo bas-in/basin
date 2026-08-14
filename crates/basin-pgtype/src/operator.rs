@@ -464,6 +464,31 @@ pub static OPERATORS: &[OperatorSig] = &[
     OperatorSig::binary(1760, "*", oid::NUMERIC, oid::NUMERIC, oid::NUMERIC),
     OperatorSig::binary(1761, "/", oid::NUMERIC, oid::NUMERIC, oid::NUMERIC),
     OperatorSig::binary(1762, "%", oid::NUMERIC, oid::NUMERIC, oid::NUMERIC),
+    // `^` is **exponentiation** in Postgres, not the bitwise XOR it is in C,
+    // Rust, Python and SQLite — `2 ^ 10` is 1024, confirmed live. Postgres
+    // defines it on exactly two type pairs, both own-type:
+    //
+    // ```text
+    //  965 | ^ | double precision | double precision | double precision | dpow
+    // 1038 | ^ | numeric          | numeric          | numeric          | numeric_power
+    // ```
+    //
+    // There is no `int ^ int` row, so an integer call reaches one of these
+    // two by implicit coercion, and *which* one is a real observable
+    // difference: `pg_typeof(2::int8 ^ 2::int4)` is `double precision` live
+    // (`float8` is the preferred type of the numeric category, so Postgres's
+    // tie-break lands there), while `pg_typeof(2::numeric ^ 2::int4)` is
+    // `numeric`. 965 is listed first so this table's first-match rule agrees
+    // with that preferred-type tie-break for the integer case.
+    //
+    // `^` is also **left**-associative in Postgres, unlike the right
+    // associativity the same spelling has in most languages: `2 ^ 3 ^ 2` is
+    // `(2 ^ 3) ^ 2` = **64** live, not `2 ^ (3 ^ 2)` = 512. That is a
+    // property of the grammar, not of this table — `pg_query` (which parses
+    // for `basin-plan`) is PostgreSQL's own grammar, so the parse arrives
+    // already associated correctly and nothing here has to encode it.
+    OperatorSig::binary(965, "^", oid::FLOAT8, oid::FLOAT8, oid::FLOAT8),
+    OperatorSig::binary(1038, "^", oid::NUMERIC, oid::NUMERIC, oid::NUMERIC),
     // ─── Cross-type arithmetic ──────────────────────────────────────────────
     //
     // Result type follows Postgres's own promotion: the wider of the two
@@ -969,6 +994,50 @@ mod tests {
         assert_eq!(resolve("<=>", Some(oid::INT4), oid::INT4), None);
     }
 
+    /// `^` has exactly two rows and no integer one, so an integer operand
+    /// must arrive at `float8 ^ float8` (965) by implicit coercion — the
+    /// same choice a live server makes (`pg_typeof(2::int8 ^ 2::int4)` is
+    /// `double precision`). `numeric ^ numeric` (1038) stays reachable from
+    /// its own type and must not be shadowed by 965, because it has a
+    /// *different result type*: `pg_typeof(2::numeric ^ 2::int4)` is
+    /// `numeric`, not `double precision`.
+    #[test]
+    fn caret_is_exponentiation_over_float8_and_numeric_only() {
+        let f8 = resolve("^", Some(oid::FLOAT8), oid::FLOAT8).expect("float8 ^ float8");
+        assert_eq!(f8.oid, Oid(965));
+        assert_eq!(f8.result, oid::FLOAT8);
+
+        let num = resolve("^", Some(oid::NUMERIC), oid::NUMERIC).expect("numeric ^ numeric");
+        assert_eq!(num.oid, Oid(1038));
+        assert_eq!(num.result, oid::NUMERIC);
+
+        let ints = resolve("^", Some(oid::INT8), oid::INT4).expect("int8 ^ int4 coerces");
+        assert_eq!(
+            ints.oid,
+            Oid(965),
+            "integers reach the float8 row, not numeric"
+        );
+        assert_eq!(ints.result, oid::FLOAT8);
+
+        assert_eq!(
+            resolve("^", Some(oid::INT4), oid::TEXT),
+            None,
+            "`^` is arithmetic; there is no text row to coerce into"
+        );
+    }
+
+    /// A bare column reaches [`resolve`] typed `unknown` today (see
+    /// `crate::func`'s docs on `basin_plan::lower::expr::best_effort_type`),
+    /// which is exactly the shape `SELECT id ^ 2` produces. Pinned because
+    /// the row *order* is what decides it: with 965 first it lands on
+    /// `float8`, matching the live server's preferred-type tie-break.
+    #[test]
+    fn caret_over_an_unknown_left_operand_lands_on_float8() {
+        let op = resolve("^", Some(oid::UNKNOWN), oid::INT4).expect("unknown ^ int4");
+        assert_eq!(op.oid, Oid(965));
+        assert_eq!(op.result, oid::FLOAT8);
+    }
+
     /// Pins the total row count so an accidental deletion (or an accidental
     /// duplicate) shows up as a failing test rather than silently shrinking
     /// (or bloating) the table. 211 pre-existing rows (see the module docs
@@ -976,14 +1045,15 @@ mod tests {
     /// 6 `bpchar` comparisons, 7 `bytea` (6 comparison + `||`), 18 own-type
     /// comparisons for `time`/`interval`/`timetz`, 36 cross-type
     /// `date`/`timestamp`/`timestamptz` comparisons, and 24 date/time
-    /// arithmetic rows (including unary minus on `interval`) — is 302. If
-    /// this legitimately changes, recount by hand against a live server
+    /// arithmetic rows (including unary minus on `interval`) — is 302, plus
+    /// the two `^` (exponentiation) rows 965/1038 added afterwards, is 304.
+    /// If this legitimately changes, recount by hand against a live server
     /// before updating the number here.
     #[test]
     fn total_operator_row_count_is_pinned() {
         assert_eq!(
             OPERATORS.len(),
-            302,
+            304,
             "row count changed — update this pin only after confirming the new rows against a live server"
         );
     }

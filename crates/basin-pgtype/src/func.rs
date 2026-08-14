@@ -711,6 +711,128 @@ pub static FUNCS: &[FuncSig] = &[
         oid::FLOAT8,
         FuncKind::Scalar,
     ),
+    // `extract` is NOT `date_part` with a cast, and the difference is a
+    // return type, not a rendering: every row below returns **`numeric`**
+    // (2 above the `float8` `date_part` returns). Measured on a live
+    // PostgreSQL 18.2 rather than assumed — the two disagree in the digits:
+    //
+    // ```text
+    // extract  (epoch  from '4024-03-15 12:34:56.654321+02'::timestamptz)
+    //   = 64824402896.654321   -- numeric, every microsecond kept
+    // date_part('epoch',       '4024-03-15 12:34:56.654321+02'::timestamptz)
+    //   = 64824402896.65432    -- float8, the last digit gone
+    //
+    // extract  (second from '2024-03-15 12:34:56.789123'::timestamp)
+    //   = 56.789123
+    // date_part('second',   '2024-03-15 12:34:56.789123'::timestamp)
+    //   = 56.789123000000004   -- float8 cannot represent it exactly
+    // ```
+    //
+    // The pair also disagrees on which units each accepts, because
+    // `date_part(text, date)` (1384) is a SQL wrapper that casts its
+    // argument to `timestamp` first (`prosqlbody` reads `RETURN
+    // date_part($1, ($2)::timestamp without time zone)`, read off the
+    // server) while `extract(text, date)` (6199) is the C function
+    // `extract_date`, which has no such cast. So `date_part('hour', DATE
+    // '2024-03-15')` is `0`, but `extract(hour FROM DATE '2024-03-15')` is
+    // an *error* — "unit \"hour\" not supported for type date". Both
+    // measured; `crates/basin-exec/src/eval.rs` implements both behaviours
+    // separately for that reason.
+    //
+    // Row order mirrors the `date_part` block directly above, deliberately:
+    // an argument that reaches [`resolve`] as `unknown` (which every bare
+    // column does today — see the `unknown_argument_still_lands_on_the_int4_
+    // monomorphization` test for the same effect on `array_agg`) lands on
+    // whichever row comes first, and these two sibling functions landing on
+    // the *same* argument type is less surprising than them disagreeing.
+    FuncSig::new(
+        6203,
+        "extract",
+        &[oid::TEXT, oid::TIMESTAMPTZ],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6202,
+        "extract",
+        &[oid::TEXT, oid::TIMESTAMP],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6199,
+        "extract",
+        &[oid::TEXT, oid::DATE],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6204,
+        "extract",
+        &[oid::TEXT, oid::INTERVAL],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6200,
+        "extract",
+        &[oid::TEXT, oid::TIME],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        6201,
+        "extract",
+        &[oid::TEXT, oid::TIMETZ],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    // `to_char`. **Postgres has no `to_char(date, text)` row** — confirmed by
+    // enumerating every `to_char` in `pg_catalog` on a live PostgreSQL 18.2:
+    //
+    // ```text
+    // 1768 to_char(interval, text)      1773 to_char(int4, text)
+    // 1770 to_char(timestamptz, text)   1774 to_char(int8, text)
+    // 1772 to_char(numeric, text)       1775 to_char(float4, text)
+    // 2049 to_char(timestamp, text)     1776 to_char(float8, text)
+    // ```
+    //
+    // `to_char(day, 'YYYY-MM-DD')` on a `date` column therefore resolves to
+    // **2049**, `to_char(timestamp, text)`, by the implicit `date ->
+    // timestamp` cast (`pg_cast` reports `castcontext = 'i'` for that pair,
+    // also read off the server). Inventing a `(date, text)` row here would
+    // report an oid no PostgreSQL has and make `\df to_char` disagree with
+    // every real server, so there is none — `crates/basin-exec/src/eval.rs`
+    // performs the same widening PostgreSQL's inserted cast would, at
+    // evaluation time.
+    //
+    // Only the two temporal overloads are tabulated. The numeric/integer
+    // `to_char`s (1772-1776) take an entirely different format-pattern
+    // language (`9`, `0`, `D`, `G`, `PR`, `RN`, ...) that shares nothing with
+    // the date/time templates below, and `to_char(interval, text)` (1768) a
+    // third; none is implemented, and a row without an implementation on a
+    // *name that now resolves* turns what is currently a clean "no such
+    // function" into a call that resolves and then fails at execution. Named
+    // here so their absence is a decision rather than an oversight.
+    // 2049 comes first so that the `unknown`-argument call a bare column
+    // produces today lands on the overload PostgreSQL itself picks for the
+    // shape that motivated these rows — `to_char(<date or timestamp column>,
+    // fmt)` — rather than on the `timestamptz` one. Same first-match
+    // ordering dependence as the `extract` block above.
+    FuncSig::new(
+        2049,
+        "to_char",
+        &[oid::TIMESTAMP, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1770,
+        "to_char",
+        &[oid::TIMESTAMPTZ, oid::TEXT],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
     FuncSig::new(
         1217,
         "date_trunc",
@@ -2654,6 +2776,74 @@ mod tests {
         let trunc_ts = resolve("date_trunc", &[oid::TEXT, oid::TIMESTAMP]).unwrap();
         assert_eq!(trunc_tz.ret, oid::TIMESTAMPTZ, "tz in, tz out");
         assert_eq!(trunc_ts.ret, oid::TIMESTAMP, "no tz in, no tz out");
+    }
+
+    /// `extract` is not `date_part` under another name: it has its own six
+    /// oids (6199-6204, one per argument type, exactly like `date_part`) and
+    /// every one of them returns **`numeric`**, where `date_part` returns
+    /// `float8`. Conflating the two loses microseconds — see this module's
+    /// `extract` block for the measured pair of answers that differ.
+    #[test]
+    fn extract_returns_numeric_where_date_part_returns_float8() {
+        let cases = [
+            (oid::TIMESTAMPTZ, 6203u32),
+            (oid::TIMESTAMP, 6202),
+            (oid::DATE, 6199),
+            (oid::INTERVAL, 6204),
+            (oid::TIME, 6200),
+            (oid::TIMETZ, 6201),
+        ];
+        for (arg, want_oid) in cases {
+            let ex = resolve("extract", &[oid::TEXT, arg])
+                .unwrap_or_else(|| panic!("extract(text, {arg}) must resolve"));
+            assert_eq!(ex.oid, Oid(want_oid));
+            assert_eq!(ex.ret, oid::NUMERIC, "extract always returns numeric");
+
+            let part = resolve("date_part", &[oid::TEXT, arg]).unwrap();
+            assert_ne!(ex.oid, part.oid, "different functions, different oids");
+            assert_eq!(part.ret, oid::FLOAT8, "date_part always returns float8");
+        }
+    }
+
+    /// **PostgreSQL has no `to_char(date, text)`.** A `date` argument reaches
+    /// `to_char(timestamp, text)` (2049) through the implicit `date ->
+    /// timestamp` cast, which is what a live server does too — inventing a
+    /// `(date, text)` row would report an oid no server has.
+    #[test]
+    fn to_char_of_a_date_resolves_to_the_timestamp_overload() {
+        let by_cast = resolve("to_char", &[oid::DATE, oid::TEXT]).expect("to_char(date, text)");
+        assert_eq!(by_cast.oid, Oid(2049));
+        assert_eq!(by_cast.args, &[oid::TIMESTAMP, oid::TEXT]);
+        assert_eq!(by_cast.ret, oid::TEXT);
+
+        assert!(
+            !FUNCS
+                .iter()
+                .any(|f| f.name == "to_char" && f.args == [oid::DATE, oid::TEXT]),
+            "no row may claim a (date, text) overload PostgreSQL does not have"
+        );
+
+        let tstz =
+            resolve("to_char", &[oid::TIMESTAMPTZ, oid::TEXT]).expect("to_char(timestamptz, text)");
+        assert_eq!(tstz.oid, Oid(1770));
+    }
+
+    /// The `unknown`-argument call every bare column produces today lands on
+    /// the first matching row, so the row order in the `extract`/`to_char`
+    /// blocks is load-bearing and pinned here. `extract` mirrors
+    /// `date_part`'s own first row deliberately; `to_char` leads with the
+    /// `timestamp` overload, the one a real server picks for the
+    /// date/timestamp column shape these rows were added for.
+    #[test]
+    fn unknown_arguments_land_on_the_documented_first_row() {
+        let ex = resolve("extract", &[oid::UNKNOWN, oid::UNKNOWN]).unwrap();
+        let part = resolve("date_part", &[oid::UNKNOWN, oid::UNKNOWN]).unwrap();
+        assert_eq!(ex.args, part.args, "extract follows date_part's first row");
+        assert_eq!(ex.oid, Oid(6203));
+        assert_eq!(part.oid, Oid(1171));
+
+        let tc = resolve("to_char", &[oid::UNKNOWN, oid::UNKNOWN]).unwrap();
+        assert_eq!(tc.oid, Oid(2049));
     }
 
     /// `age` has both a two-argument and a one-argument (implicitly compared

@@ -37,7 +37,7 @@
 //!   [`crate::PG_CATALOG_NAMESPACE`] (every function here is a builtin,
 //!   confirmed `pronamespace = 11` live for the whole sample below).
 //!
-//! The sample is **all 287 distinct oids `FUNCS` declares**. It was 135 until
+//! The sample is **all 295 distinct oids `FUNCS` declares**. It was 135 until
 //! the DataFusion-orphan rows landed (see `func.rs`'s docs and commit
 //! `c9bd3a68`); the counts below are the current, re-measured ones, and two
 //! columns that were uniform across the smaller sample — `proleakproof` and
@@ -45,18 +45,18 @@
 //! file: "uniform across the rows we happen to have" is not "uniform".
 //!
 //! - `proowner` (4), `oid`, `NOT NULL`: not a `FuncSig` field, but confirmed
-//!   live to be `10` (the bootstrap superuser) for every one of the 287 oids —
-//!   `SELECT DISTINCT proowner FROM pg_proc WHERE oid IN (<all 287 FUNCS
+//!   live to be `10` (the bootstrap superuser) for every one of the 295 oids —
+//!   `SELECT DISTINCT proowner FROM pg_proc WHERE oid IN (<all 295 FUNCS
 //!   oids>)` returns exactly one row, `10`. Added as that literal.
 //! - `prolang` (5), `oid`, `NOT NULL`: not a `FuncSig` field. Live-verified
-//!   `12` (`internal`) for 275 of the 287 oids; the other 12 — `lpad`/`rpad`
+//!   `12` (`internal`) for 283 of the 295 oids; the other 12 — `lpad`/`rpad`
 //!   two-argument (879, 880), `date_part` (1384), `age` (1386, 2059),
 //!   `log10(numeric)` (1481), `round` (1708), `trunc` (1710), `log` (1741),
 //!   `bit_length` (1810, 1811), `substring(text, text, text)` (2074) — are
 //!   real SQL-language wrappers (`prolang = 14`, `prosqlbody` non-`NULL`)
 //!   around another builtin, a distinction `FuncSig` has no field for. Carried
 //!   as an explicit exception set by [`prolang`].
-//! - `procost` (6), `real`, `NOT NULL`: live-verified `1` for all 287 oids.
+//! - `procost` (6), `real`, `NOT NULL`: live-verified `1` for all 295 oids.
 //!   Added as that literal.
 //! - `prorows` (7), `real`, `NOT NULL`: live-verified `0` for every
 //!   non-set-returning row and `1000` for `generate_series`'s eight oids —
@@ -64,7 +64,7 @@
 //!   no `ROWS` clause. `unnest` (2331) is the one exception in the sample
 //!   (`100`, an explicit `ROWS` in its real definition), and [`prorows`]
 //!   carries it as such. None of the orphan rows is set-returning.
-//! - `provariadic` (8), `oid`, `NOT NULL`: live-verified `0` for 285 of 287
+//! - `provariadic` (8), `oid`, `NOT NULL`: live-verified `0` for 293 of 295
 //!   oids; `concat` (3058) and `concat_ws` (3059) are real
 //!   `VARIADIC "any"` functions (`provariadic = 2276`, the `"any"` pseudo-
 //!   type) that `func.rs`'s own docs say are monomorphized to a fixed arity
@@ -79,19 +79,19 @@
 //!   uniform — live-verified non-zero (a real planner support function, e.g.
 //!   `count`'s `int8inc_support`, `row_number`'s
 //!   `window_row_number_support`, `starts_with`'s `text_starts_with_support`)
-//!   for 20 of the 287 oids. `0` ("no support function") is Postgres's own
+//!   for 20 of the 295 oids. `0` ("no support function") is Postgres's own
 //!   default when a `CREATE FUNCTION` omits `SUPPORT`, and is right for the
-//!   other 267 — represented as `oid` per this crate's `regproc`-as-`oid`
+//!   other 275 — represented as `oid` per this crate's `regproc`-as-`oid`
 //!   convention (see [`crate::pg_cast`]'s `castfunc`). The 20 real oids are
 //!   tabulated in [`PROSUPPORT`], which `catalog_fidelity` re-verifies against
 //!   a live server every run.
 //! - `prokind` (10): unchanged logic (see [`prokind`]), moved into its real
 //!   position. 97 aggregates, 13 window functions, the rest `'f'`.
 //! - `prosecdef` (11), `boolean`, `NOT NULL`: live-verified `false` for all
-//!   287 oids (no builtin here runs with definer's rights). Added as that
+//!   295 oids (no builtin here runs with definer's rights). Added as that
 //!   literal.
 //! - `proleakproof` (12), `boolean`, `NOT NULL`: **not** uniform, though it
-//!   was across the original 135. Live-verified `true` for 7 of the 287 —
+//!   was across the original 135. Live-verified `true` for 7 of the 295 —
 //!   `md5` (2311, 2321), `sha224`/`sha256`/`sha384`/`sha512` (3419–3422) and
 //!   `starts_with` (3696), all of which leak nothing about their arguments
 //!   through an error or a timing channel, so the planner may push them below
@@ -100,7 +100,7 @@
 //!   security-barrier view refuse a pushdown real Postgres permits.
 //! - `proisstrict` (13), `boolean`, `NOT NULL`: not a `FuncSig` field, but
 //!   fully determined once the exceptions are enumerated rather than
-//!   guessed. Live-verified across all 287 oids: `false` for every aggregate
+//!   guessed. Live-verified across all 295 oids: `false` for every aggregate
 //!   (97/97), and `true` for every other row except eighteen —
 //!   `concat`/`concat_ws` (which return `''`, not `NULL`, for a `NULL`
 //!   argument), the niladic window functions `row_number`/`rank`/
@@ -116,18 +116,21 @@
 //!   rule, and `catalog_fidelity` checks it every run.
 //! - `proretset` (14), `boolean`, `NOT NULL`: real data, not a placeholder —
 //!   `f.kind == FuncKind::SetReturning`, exactly what that variant's own doc
-//!   comment says it exists to carry (see `func.rs`). 9 of 287.
+//!   comment says it exists to carry (see `func.rs`). 9 of 295.
 //! - `provolatile` (15), `"char"`, `NOT NULL`: not a `FuncSig` field.
-//!   Live-verified `'i'` (immutable) for 273 of 287 oids. Ten are `'s'`
-//!   (stable): `array_to_string` (384, 395 — they call the element type's
-//!   output function, which can depend on session settings),
+//!   Live-verified `'i'` (immutable) for 278 of 295 oids. Thirteen are
+//!   `'s'` (stable): `array_to_string` (384, 395 — they call the element
+//!   type's output function, which can depend on session settings),
 //!   `generate_series` on `timestamptz` (939), `date_part` (1171),
 //!   `date_trunc` (1217), `now` (1299), `age` (1386, 2059),
-//!   `concat`/`concat_ws` (3058, 3059). Four are `'v'` (volatile): every
+//!   `concat`/`concat_ws` (3058, 3059), both `to_char` overloads (1770,
+//!   2049 — `lc_time` and `DateStyle`, not only the zone) and
+//!   `extract(text, timestamptz)` (6203, the only one of the six `extract`
+//!   oids that is not `'i'`). Four are `'v'` (volatile): every
 //!   `random` overload (1598, 6339, 6340, 6341). Carried as two explicit
 //!   exception sets by [`provolatile`].
 //! - `proparallel` (16), `"char"`, `NOT NULL`: also not uniform any more.
-//!   Live-verified `'s'` (parallel-safe) for 283 of 287; the four `random`
+//!   Live-verified `'s'` (parallel-safe) for 291 of 295; the four `random`
 //!   overloads are `'r'` (parallel-*restricted*), because they advance a
 //!   per-backend PRNG state a parallel worker cannot share. Carried by
 //!   [`proparallel`]. `'r'` and `'v'` are different claims about the same
@@ -135,7 +138,7 @@
 //!   `random()` is `'r'`/volatile — so neither may be derived from the other.
 //! - `pronargdefaults` (18), `smallint`, `NOT NULL`: not a `FuncSig` field
 //!   (it has no notion of a default-valued argument), but live-verified `0`
-//!   for all 287 oids — real, not a guess, for every row this crate can
+//!   for all 295 oids — real, not a guess, for every row this crate can
 //!   currently construct. Added as that literal.
 //! - `pronargs` (17), `prorettype` (19), `proargtypes` (20): from
 //!   `FuncSig::args`/`ret`, **except** for the twenty-eight oids whose `FUNCS`
@@ -155,12 +158,12 @@
 //!   `random(min, max)` and `array_sort`'s two- and three-argument forms,
 //!   carried by [`PROARGNAMES`].
 //! - `proargdefaults` (24, `pg_node_tree`), `protrftypes` (25, `oid[]`) —
-//!   both nullable; live-verified `NULL` for **all** 287 oids (no default-
+//!   both nullable; live-verified `NULL` for **all** 295 oids (no default-
 //!   valued argument and no `TRANSFORM` in this sample). Added as
 //!   always-`NULL`, correct for every row.
 //! - `prosrc` (26), `text`, `NOT NULL`: from [`PROSRC`]. `FuncSig::name` is
 //!   the SQL-visible `proname`, not the internal symbol `prosrc` names, and
-//!   the two differ for 259 of the 287 rows — `count`'s is
+//!   the two differ for 267 of the 295 rows — `count`'s is
 //!   `aggregate_dummy`, `row_number`'s is `window_row_number`,
 //!   `generate_series`'s is `generate_series_int4`, `cardinality`'s is
 //!   `array_cardinality`. An earlier version omitted the column on the
@@ -172,7 +175,7 @@
 //!   `prolang` report the **empty string** here, which is the real value
 //!   PostgreSQL 14+ stores for a function whose body lives in `prosqlbody` —
 //!   not a placeholder.
-//! - `probin` (27), `text`, nullable: live-verified `NULL` for all 287 oids
+//! - `probin` (27), `text`, nullable: live-verified `NULL` for all 295 oids
 //!   (every `FUNCS` function is `internal`- or SQL-language, never
 //!   `C`-language). Added as always-`NULL`, correct for every row.
 //! - `prosqlbody` (28), `pg_node_tree`, nullable: **not added.**
@@ -183,10 +186,10 @@
 //!   no reader for, and which changes shape between major Postgres releases.
 //!   Transcribing them would be exactly the fabrication
 //!   [`crate::pg_attrdef`] refuses for `adbin`, and an always-`NULL` column
-//!   is a documented wrong answer for 12 of 287 rows that nothing detected
+//!   is a documented wrong answer for 12 of 295 rows that nothing detected
 //!   until `catalog_fidelity`'s row oracle did. Omitted rather than either.
 //! - `proconfig` (29, `text[]`), `proacl` (30, `aclitem[]`) — both nullable;
-//!   live-verified `NULL` for all 287 oids (no `SET` clause, and default
+//!   live-verified `NULL` for all 295 oids (no `SET` clause, and default
 //!   privileges throughout — nothing in this sample has had `GRANT`/`REVOKE`
 //!   applied). Added as always-`NULL`, correct for every row.
 //!
@@ -203,7 +206,7 @@
 //!
 //! `catalog_fidelity`'s `diff_static_rows` — the row-content oracle this
 //! relation had no equivalent of until it was written — diffs all 28 columns
-//! of all 135 rows against a live server on every run (287 rows today). On
+//! of all 135 rows against a live server on every run (295 rows today). On
 //! its first run it
 //! reported 49 disagreements: the 14 real `prosupport` oids, `unnest`'s
 //! `prorows`, `string_agg`'s `proargnames`, the two variadic rows'
@@ -306,10 +309,22 @@ fn prolang(f: &FuncSig) -> Oid {
     }
 }
 
-/// The 10 real `provolatile = 's'` (stable) oids in `FUNCS`. `array_to_string`
+/// The 13 real `provolatile = 's'` (stable) oids in `FUNCS`. `array_to_string`
 /// (384, 395) joins the original 8 because it calls the element type's output
 /// function, which may depend on session settings. See the module docs.
-const STABLE_VOLATILITY_OIDS: [u32; 10] = [384, 395, 939, 1171, 1217, 1299, 1386, 2059, 3058, 3059];
+///
+/// The last three joined with the `extract`/`to_char` rows, and each was read
+/// off a live PostgreSQL 18.2 rather than inferred from its siblings — which
+/// matters, because the siblings disagree: of the six `extract` oids only
+/// **6203** (`extract(text, timestamptz)`) is `'s'`, the other five
+/// (6199-6202, 6204) are `'i'`, since only the `timestamptz` reading depends
+/// on the session `TimeZone`. Both `to_char` oids — **2049**
+/// (`to_char(timestamp, text)`) and **1770** (`to_char(timestamptz, text)`) —
+/// are `'s'`, the `timestamp` one included: its output depends on `lc_time`
+/// and `DateStyle` even though no time zone is involved.
+const STABLE_VOLATILITY_OIDS: [u32; 13] = [
+    384, 395, 939, 1171, 1217, 1299, 1386, 1770, 2049, 2059, 3058, 3059, 6203,
+];
 
 /// The 4 real `provolatile = 'v'` (volatile) oids in `FUNCS` — every `random`
 /// overload, and nothing else. Confirmed live: `random`'s four oids are the
@@ -415,7 +430,7 @@ fn prosupport(f: &FuncSig) -> Oid {
 
 /// The eighteen oids among `FUNCS`'s non-aggregates that are **not** `STRICT`
 /// — see the module docs on `proisstrict`. Every aggregate is non-strict and
-/// every other row is strict, live-verified across all 287 oids.
+/// every other row is strict, live-verified across all 295 oids.
 const NOT_STRICT_OIDS: [u32; 18] = [
     376,  // string_to_array(text, text, text) — a NULL null-string is meaningful
     378,  // array_append   — appending NULL to an array is not NULL
@@ -690,7 +705,7 @@ fn proargtypes(f: &FuncSig) -> Vec<u32> {
 
 /// `pg_proc.prosrc` for every oid `FUNCS` covers — the internal symbol the
 /// function's implementation is looked up by, which is *not* the same as
-/// `proname` for 259 of the 287 rows.
+/// `proname` for 267 of the 295 rows.
 ///
 /// Real, fixed values assigned by PostgreSQL's catalog bootstrap, the same
 /// class of transcribed data as [`crate::pg_am`]'s `amhandler` and
@@ -702,6 +717,13 @@ fn proargtypes(f: &FuncSig) -> Vec<u32> {
 /// A comment names `proname` where it differs from `prosrc`. The empty
 /// strings are the twelve SQL-language wrappers (see `prolang`), for which
 /// PostgreSQL 14+ genuinely stores an empty `prosrc`.
+///
+/// `extract`'s six oids (6199-6204) are the sharpest example of why this
+/// column is worth carrying: one `proname`, six different C symbols
+/// (`extract_date`, `extract_time`, `extract_timetz`, `extract_timestamp`,
+/// `extract_timestamptz`, `extract_interval`) — Postgres's own statement that
+/// these are six real functions and not one function with a cast in front of
+/// it.
 const PROSRC: &[(u32, &str)] = &[
     (376, "text_to_array_null"), // string_to_array
     (378, "array_append"),
@@ -807,6 +829,7 @@ const PROSRC: &[(u32, &str)] = &[
     (1736, "numeric_log"),         // log
     (1738, "numeric_power"),       // pow
     (1741, ""),                    // log
+    (1770, "timestamptz_to_char"), // to_char
     (1810, ""),                    // bit_length
     (1811, ""),                    // bit_length
     (2012, "bytea_substr"),        // substring
@@ -814,6 +837,7 @@ const PROSRC: &[(u32, &str)] = &[
     (2014, "byteapos"),            // position
     (2020, "timestamp_trunc"),     // date_trunc
     (2021, "timestamp_part"),      // date_part
+    (2049, "timestamp_to_char"),   // to_char
     (2058, "timestamp_age"),       // age
     (2059, ""),                    // age
     (2073, "textregexsubstr"),     // substring
@@ -972,6 +996,12 @@ const PROSRC: &[(u32, &str)] = &[
     (6164, "aggregate_dummy"),       // bit_xor
     (6165, "aggregate_dummy"),       // bit_xor
     (6166, "aggregate_dummy"),       // bit_xor
+    (6199, "extract_date"),          // extract
+    (6200, "extract_time"),          // extract
+    (6201, "extract_timetz"),        // extract
+    (6202, "extract_timestamp"),     // extract
+    (6203, "extract_timestamptz"),   // extract
+    (6204, "extract_interval"),      // extract
     (6254, "regexp_count_no_start"), // regexp_count
     (6255, "regexp_count_no_flags"), // regexp_count
     (6256, "regexp_count"),
@@ -995,7 +1025,7 @@ const PROSRC: &[(u32, &str)] = &[
 /// `pg_proc.prosrc` for this function — see [`PROSRC`]. An oid with no entry
 /// falls back to `proname`, which is right for the 28 rows where the two
 /// coincide and detectably wrong (against the live oracle) otherwise. The
-/// table has an explicit entry for every one of the 287 oids today, so the
+/// table has an explicit entry for every one of the 295 oids today, so the
 /// fallback has no live customers; it is kept because a new `FUNCS` row
 /// landing without one should degrade to a guess the oracle catches, not
 /// panic.
@@ -1011,7 +1041,7 @@ fn prosrc(f: &FuncSig) -> &'static str {
 /// *names* — `string_agg(value, delimiter)`, `make_date(year, month, day)`,
 /// the `regexp_*` family, `random(min, max)` and `array_sort`'s two- and
 /// three-argument forms. Live-verified as the only non-`NULL` `proargnames`
-/// among the 287 oids `FUNCS` covers; `FuncSig` has no field for an argument
+/// among the 295 oids `FUNCS` covers; `FuncSig` has no field for an argument
 /// name.
 ///
 /// Case is load-bearing: `regexp_instr`'s fourth parameter is named `"N"`,
@@ -1070,7 +1100,7 @@ fn proretset(f: &FuncSig) -> bool {
 /// estimate for a set-returning function with no explicit `ROWS` clause
 /// (`1000`), `0` for a row-at-a-time function, and `100` for `unnest`
 /// (oid 2331), whose real definition carries an explicit `ROWS 100`.
-/// Live-verified across all 287 oids: `unnest` is the only exception.
+/// Live-verified across all 295 oids: `unnest` is the only exception.
 fn prorows(f: &FuncSig) -> f32 {
     if f.oid.get() == 2331 {
         100.0
@@ -1248,7 +1278,7 @@ impl crate::SystemView for PgProc {
         // `VARIADIC` function, and `proargnames` only for `string_agg` — see
         // `SignatureOverride` and `PROARGNAMES`. `protrftypes`,
         // `proargdefaults`, `probin`, `proconfig` and `proacl` are `NULL` for
-        // every one of the 287 oids `FUNCS` covers, live-verified.
+        // every one of the 295 oids `FUNCS` covers, live-verified.
         let mut proallargtypes_builder = ListBuilder::new(UInt32Builder::new());
         let mut proargmodes_builder = ListBuilder::new(StringBuilder::new());
         let mut proargnames_builder = ListBuilder::new(StringBuilder::new());
