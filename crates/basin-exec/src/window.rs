@@ -216,7 +216,43 @@ pub struct OrderKey {
     /// 8 records the live-Postgres evidence for that. It must agree with the
     /// `nulls_first` of the `sort::SortKey` the upstream `Sort` ordered this
     /// input by, or the substituted infinity will point the wrong way.
+    ///
+    /// That agreement is **checked against the data**, not merely documented:
+    /// [`WindowAgg::extract_order_f64_signed`] debug-asserts that the NULLs in
+    /// this column really do sit at the end this flag claims. See
+    /// [`OrderKey::pg_default`] for the convention every caller wants.
     pub nulls_first: bool,
+}
+
+impl OrderKey {
+    /// An `ORDER BY` key with **PostgreSQL's default NULL placement**:
+    /// `ASC` puts NULLs last, `DESC` puts them first — i.e. `nulls_first ==
+    /// descending`. Measured against a live PostgreSQL 18.2, and the same
+    /// defaulting `basin_plan::lower::expr` applies to
+    /// `SortByNulls::Default`.
+    ///
+    /// Use this rather than a struct literal whenever the SQL did not spell
+    /// `NULLS FIRST`/`NULLS LAST` explicitly. Writing the literal by hand is
+    /// how this got inverted once already: the test helper in this file read
+    /// `!descending`, which was invisible for exactly as long as nothing
+    /// consulted the field.
+    pub fn pg_default(column: usize, descending: bool) -> Self {
+        Self {
+            column,
+            descending,
+            nulls_first: descending,
+        }
+    }
+
+    /// An `ORDER BY` key with an explicit `NULLS FIRST`/`NULLS LAST`, which
+    /// SQL allows in any combination with `ASC`/`DESC`.
+    pub fn with_nulls(column: usize, descending: bool, nulls_first: bool) -> Self {
+        Self {
+            column,
+            descending,
+            nulls_first,
+        }
+    }
 }
 
 /// Which of the three frame units is in play. Mirrors
@@ -932,6 +968,33 @@ struct Partition {
     end: usize,
 }
 
+/// Do the NULLs in `col` over `part` actually sit at the end
+/// `nulls_first` claims? Backs the debug assertion in
+/// [`WindowAgg::extract_order_f64_signed`].
+///
+/// `WindowAgg` requires its input pre-sorted by `PARTITION BY` then `ORDER
+/// BY` (see the module docs' precondition), so within one partition the NULLs
+/// of the first order key form one contiguous block at one end. Which end is
+/// exactly what [`OrderKey::nulls_first`] asserts, and therefore exactly what
+/// is checkable here.
+///
+/// Answers `true` for the two cases that carry no information — no NULLs at
+/// all, and nothing but NULLs — since neither can distinguish the two
+/// placements and neither can be resolved wrongly either.
+fn nulls_sit_where_declared(col: &ArrayRef, part: &Partition, nulls_first: bool) -> bool {
+    let len = part.end - part.start;
+    let n_null = (part.start..part.end).filter(|&i| col.is_null(i)).count();
+    if n_null == 0 || n_null == len {
+        return true;
+    }
+    let block = if nulls_first {
+        part.start..part.start + n_null
+    } else {
+        part.end - n_null..part.end
+    };
+    block.into_iter().all(|i| col.is_null(i))
+}
+
 /// Peer-group boundaries within one partition. `id[i - start]` is the
 /// 0-based peer group of absolute row `i`; `first[g]`/`last[g]` are the
 /// absolute row indices bounding peer group `g`. With an empty `ORDER BY`
@@ -1097,6 +1160,22 @@ impl WindowAgg {
     ) -> Result<Vec<f64>, ExecError> {
         let key = &self.order_by[0];
         let col = batch.column(key.column);
+        // The invariant `OrderKey::nulls_first` documents, checked rather
+        // than trusted. Every wrong answer this could cause is silent — the
+        // frame simply resolves against an infinity pointing the wrong way —
+        // so the check lives here, at the one place the flag is read, and
+        // catches a mis-wired key from *any* construction site rather than
+        // only from the ones that remembered to use `OrderKey::pg_default`.
+        debug_assert!(
+            nulls_sit_where_declared(col, part, key.nulls_first),
+            "window ORDER BY column {} declares nulls_first={}, but the NULLs in this partition \
+             ({}..{}) do not sit at that end — the upstream Sort and this OrderKey disagree, and \
+             every RANGE bound resolved from it will point the wrong way",
+            key.column,
+            key.nulls_first,
+            part.start,
+            part.end
+        );
         let sign = if key.descending { -1.0 } else { 1.0 };
         let null_sv = if key.nulls_first {
             f64::NEG_INFINITY
@@ -1748,13 +1827,10 @@ mod tests {
     /// `nulls_first` — every fixture here lays its rows out in the window's
     /// physical order by hand, so an inverted flag changed no test's input.
     /// It is load-bearing now: it tells RANGE resolution which way the NULL
-    /// block sorts.
+    /// block sorts, which is why the rule lives in
+    /// [`OrderKey::pg_default`] rather than being spelled out again here.
     fn oc(column: usize, descending: bool) -> OrderKey {
-        OrderKey {
-            column,
-            descending,
-            nulls_first: descending,
-        }
+        OrderKey::pg_default(column, descending)
     }
 
     fn i64_col(name: &str) -> Field {
@@ -2491,11 +2567,76 @@ mod tests {
     // running total.
 
     fn okey(descending: bool, nulls_first: bool) -> OrderKey {
-        OrderKey {
-            column: 0,
-            descending,
-            nulls_first,
+        OrderKey::with_nulls(0, descending, nulls_first)
+    }
+
+    // ── `nulls_first` is enforced, not just documented ──────────────────
+    //
+    // `nulls_first` became load-bearing when RANGE frames started reading it;
+    // before that it was documented as "not read by this file", and the test
+    // helper above had it inverted (`!descending`) with nothing to notice.
+    // These three are what stop that recurring.
+
+    /// PostgreSQL's convention, encoded once in [`OrderKey::pg_default`]
+    /// instead of being restated at every construction site: `ASC` puts NULLs
+    /// last, `DESC` puts them first. Confirmed against a live PostgreSQL
+    /// 18.2, and the same defaulting `basin_plan::lower::expr` applies.
+    #[test]
+    fn pg_default_order_key_puts_nulls_last_for_asc_and_first_for_desc() {
+        let asc = OrderKey::pg_default(3, false);
+        assert_eq!(asc.column, 3);
+        assert!(!asc.descending);
+        assert!(
+            !asc.nulls_first,
+            "ASC defaults to NULLS LAST in PostgreSQL, so nulls_first must be false"
+        );
+
+        let desc = OrderKey::pg_default(3, true);
+        assert!(desc.descending);
+        assert!(
+            desc.nulls_first,
+            "DESC defaults to NULLS FIRST in PostgreSQL, so nulls_first must be true — the \
+             inversion this constructor exists to prevent"
+        );
+    }
+
+    /// An explicit `NULLS FIRST`/`NULLS LAST` is independent of direction —
+    /// SQL allows all four combinations, so the constructor must not
+    /// "helpfully" derive one from the other.
+    #[test]
+    fn with_nulls_order_key_keeps_direction_and_placement_independent() {
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let k = OrderKey::with_nulls(1, descending, nulls_first);
+                assert_eq!(k.descending, descending);
+                assert_eq!(k.nulls_first, nulls_first);
+            }
         }
+    }
+
+    /// The backstop that catches a wrong key from *any* construction site,
+    /// including ones that never call the constructors above: the data itself
+    /// contradicts the flag. Here the NULLs physically lead the partition
+    /// while the key claims `NULLS LAST`, which is precisely the inversion
+    /// the old `oc` helper encoded — RANGE resolution would substitute
+    /// `+INFINITY` for rows sitting at the `-INFINITY` end and silently
+    /// resolve every bound against the wrong side of the NULL block.
+    ///
+    /// `debug_assert!` compiles out under `--release`, so this test only
+    /// exists where the assertion does.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "do not sit at that end")]
+    fn a_nulls_first_flag_contradicted_by_the_data_is_caught() {
+        // NULLs lead, so this partition is NULLS FIRST; the key says
+        // otherwise.
+        frame_sum_and_count(
+            vec![None, None, Some(10), Some(20)],
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
     }
 
     /// Feed one partition in its window-physical order and read back both

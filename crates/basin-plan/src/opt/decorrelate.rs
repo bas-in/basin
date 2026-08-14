@@ -219,19 +219,70 @@ use crate::{ColumnRef, Expr, JoinKind, LogicalPlan, OpId, SubqueryKind, Subscrip
 
 use super::OptimizerRule;
 
+// ── The reserved sentinel block ──────────────────────────────────────────
+//
+// The top of the `Oid` space is carved up between several files that each
+// need an `OpId` for something `pg_operator` has no row for. They are *not*
+// independent choices: a plan built by one file is read by another, so the
+// same value must mean the same thing everywhere. The whole block, and who
+// owns each slot:
+//
+// | Value          | Meaning | Defined in |
+// |---|---|---|
+// | `u32::MAX`     | `AND`   | `opt/pushdown.rs`, `opt/simplify.rs`, this file, `basin-exec`'s `eval.rs` + `build.rs`, `basin-engine`'s `owned_engine.rs` |
+// | `u32::MAX - 1` | `OR`    | `opt/simplify.rs`, `basin-exec`'s `eval.rs` + `build.rs`, `basin-engine`'s `owned_engine.rs` |
+// | `u32::MAX - 2` | `NOT`   | `opt/simplify.rs`, `basin-exec`'s `eval.rs`, `basin-engine`'s `owned_engine.rs` |
+// | `u32::MAX - 3` | the equality `IN` implies | this file ([`IN_EQ_OP`]) |
+//
+// `IN_EQ_OP` was `u32::MAX - 1` until it was found to be bit-identical to
+// `OR`. It was unreachable in that state — [`is_equality`] folds every such
+// conjunct into `Join::on`, where the `OpId` is discarded — but had one ever
+// reached `Join::filter` with boolean operands, `eval.rs` would have computed
+// `lhs OR rhs` where the plan meant `lhs = rhs`: a silent wrong answer, not
+// an error. The const assertions below are what makes the next such clash a
+// compile error instead.
+
 /// See "A convention this file invents" in the module docs. Bit-for-bit the
 /// same sentinel `super::pushdown::FilterPushdown` uses privately, and for the
 /// same reason (`Expr` has no dedicated `AND` variant yet) — redefined here
 /// rather than imported because it is that file's own private convention.
 const AND_OP: OpId = OpId(Oid(u32::MAX));
 
+/// The `OR` slot of the reserved block. Not used by this file; declared so
+/// the assertions below can prove [`IN_EQ_OP`] does not land on it, which is
+/// exactly the collision that existed here before.
+const RESERVED_OR_OP: OpId = OpId(Oid(u32::MAX - 1));
+/// The `NOT` slot of the reserved block. Declared for the same reason as
+/// [`RESERVED_OR_OP`].
+const RESERVED_NOT_OP: OpId = OpId(Oid(u32::MAX - 2));
+
 /// Placeholder for "the equality Postgres's `IN` implies" — see "A convention
 /// this file invents" in the module docs for why a real, type-resolved
-/// `pg_operator` `OpId` is not available here. Chosen one below `AND_OP`'s
-/// `u32::MAX` sentinel so the two can never collide with each other or with
-/// any real `pg_operator` oid (the largest of which is in the low thousands,
-/// per `basin_pgtype::operator::OPERATORS`).
-const IN_EQ_OP: OpId = OpId(Oid(u32::MAX - 1));
+/// `pg_operator` `OpId` is not available here.
+///
+/// The first free slot below the boolean connectives. See the reserved-block
+/// table above for why it is not `u32::MAX - 1`, and
+/// [`the_reserved_sentinel_block_has_no_duplicates`] /
+/// [`no_real_operator_oid_comes_near_the_sentinel_block`] for what now keeps
+/// it that way.
+const IN_EQ_OP: OpId = OpId(Oid(u32::MAX - 3));
+
+// Distinctness is a compile error, not a test failure: reusing a taken slot
+// is the exact defect this block exists to prevent, and it must not be
+// possible to introduce it and still build.
+const _: () = assert!(
+    IN_EQ_OP.0 .0 != AND_OP.0 .0,
+    "IN_EQ_OP collides with the AND sentinel"
+);
+const _: () = assert!(
+    IN_EQ_OP.0 .0 != RESERVED_OR_OP.0 .0,
+    "IN_EQ_OP collides with the OR sentinel — eval.rs would compute `lhs OR rhs` for a \
+     conjunct this file meant as `lhs = rhs`"
+);
+const _: () = assert!(
+    IN_EQ_OP.0 .0 != RESERVED_NOT_OP.0 .0,
+    "IN_EQ_OP collides with the NOT sentinel"
+);
 
 /// Within a subquery's own `subplan`, the [`ColumnRef::relation`] value that
 /// marks a reference reaching into the enclosing query's current row. See "A
@@ -1310,6 +1361,65 @@ mod tests {
     use super::*;
     use crate::{ColId, Datum, SnapshotId, TableId};
     use basin_pgtype::PgType;
+
+    // ── The reserved sentinel block ─────────────────────────────────────
+    //
+    // See the block's own comment above `AND_OP`. The const assertions there
+    // already make a duplicate a compile error; these two pin the *other* two
+    // assumptions the block rests on, neither of which the compiler can see.
+
+    /// Every slot in the reserved block is a distinct value, and each is the
+    /// documented one. The const assertions cover `IN_EQ_OP` against the
+    /// three connectives; this covers the connectives against each other and
+    /// pins the actual numbers, so renumbering any slot is a deliberate edit
+    /// to this list rather than a silent change other files do not learn
+    /// about.
+    #[test]
+    fn the_reserved_sentinel_block_has_no_duplicates() {
+        let block = [
+            ("AND", AND_OP, u32::MAX),
+            ("OR", RESERVED_OR_OP, u32::MAX - 1),
+            ("NOT", RESERVED_NOT_OP, u32::MAX - 2),
+            ("IN_EQ", IN_EQ_OP, u32::MAX - 3),
+        ];
+        for (name, op, expected) in block {
+            assert_eq!(
+                op.0 .0, expected,
+                "the {name} sentinel moved; every file listed in the reserved-block table must \
+                 move with it, or a plan one builds will be misread by another"
+            );
+        }
+        for (i, (na, a, _)) in block.iter().enumerate() {
+            for (nb, b, _) in &block[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "sentinels {na} and {nb} are bit-identical — whichever file reads the OpId \
+                     back will silently apply the wrong operator"
+                );
+            }
+        }
+    }
+
+    /// The block's other unstated premise: that no *real* `pg_operator` oid
+    /// can ever reach it. The module docs assert this ("the largest of which
+    /// is in the low thousands") — this measures it against the table instead
+    /// of trusting the sentence, since [`is_equality`] compares a sentinel
+    /// against real oids directly.
+    #[test]
+    fn no_real_operator_oid_comes_near_the_sentinel_block() {
+        let highest = basin_pgtype::operator::OPERATORS
+            .iter()
+            .map(|sig| sig.oid.0)
+            .max()
+            .expect("the operator table is not empty");
+        // The four reserved slots, plus generous headroom for future ones.
+        const RESERVED_FLOOR: u32 = u32::MAX - 255;
+        assert!(
+            highest < RESERVED_FLOOR,
+            "a real pg_operator oid ({highest}) has reached the reserved sentinel block \
+             (floor {RESERVED_FLOOR}) — the sentinels are no longer safely out of band"
+        );
+    }
 
     fn scan(table: u32, projection: Vec<ColId>) -> LogicalPlan {
         LogicalPlan::Scan {
