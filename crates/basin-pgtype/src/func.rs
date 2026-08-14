@@ -3379,6 +3379,120 @@ mod tests {
         assert_eq!(positions.ret, oid::INT4_ARRAY, "positions, not elements");
     }
 
+    /// What the hyperbolics, `log10` and `pow` resolve to for a **bare
+    /// column**, now that `crates/basin-exec/src/eval.rs` implements all eight
+    /// of the `float8` overloads.
+    ///
+    /// The rows themselves are older than the implementations (the block
+    /// above), so this is not a test of the table's contents but of
+    /// [`resolve`]'s *choice*: `log10` and `pow` each carry a `float8` row and
+    /// a `numeric` row, and `798b5e9c` gave lowering real column types while
+    /// only stage 1 of PostgreSQL's `func_select_candidate` is implemented
+    /// (`c8061346`). A bare `integer` column matches neither exactly, so the
+    /// two overloads are precisely the shape that can tie — and PostgreSQL
+    /// answers this unambiguously: `pg_typeof(pow(2, 3))` is `double
+    /// precision`, not `numeric`, confirmed live. Landing on the `numeric`
+    /// overload instead would route the call to an implementation
+    /// `basin-exec` deliberately does not have, turning a working call into
+    /// an error.
+    #[test]
+    fn hyperbolics_log10_and_pow_resolve_and_stay_float8() {
+        for (name, oid_want) in [
+            ("sinh", 2462u32),
+            ("cosh", 2463),
+            ("tanh", 2464),
+            ("asinh", 2465),
+            ("acosh", 2466),
+            ("atanh", 2467),
+            ("log10", 1194),
+        ] {
+            let f = resolve(name, &[oid::FLOAT8]).unwrap_or_else(|| panic!("{name} must resolve"));
+            assert_eq!(f.oid, Oid(oid_want), "{name}");
+            assert_eq!(f.ret, oid::FLOAT8, "{name}");
+            assert_eq!(f.kind, FuncKind::Scalar, "{name}");
+
+            // A bare `integer` column, the shape lowering now produces.
+            let from_int = resolve(name, &[oid::INT4])
+                .unwrap_or_else(|| panic!("{name}(int4) must resolve by coercion"));
+            assert_eq!(from_int.oid, Oid(oid_want), "{name}(int4)");
+        }
+
+        let pow = resolve("pow", &[oid::FLOAT8, oid::FLOAT8]).expect("pow must resolve");
+        assert_eq!(pow.oid, Oid(1346));
+        assert_eq!(pow.ret, oid::FLOAT8);
+        // `pow` is a separate oid from `power` (1368), not an alias folded
+        // into it — the same relationship `ceiling` has to `ceil`.
+        assert_ne!(
+            pow.oid,
+            resolve("power", &[oid::FLOAT8, oid::FLOAT8]).unwrap().oid,
+            "pow and power are two real pg_proc rows"
+        );
+        assert_eq!(
+            resolve("pow", &[oid::INT4, oid::INT4]).unwrap().oid,
+            Oid(1346),
+            "pow(int4, int4) coerces to the float8 overload, as PostgreSQL does"
+        );
+    }
+
+    /// What the array family resolves to for **bare columns**, not literals.
+    ///
+    /// `798b5e9c` gave lowering real column types and `c8061346` implemented
+    /// stage 1 of PostgreSQL's `func_select_candidate` (most exact matches);
+    /// stages 2-4 are not implemented, so a name whose overloads tie after
+    /// stage 1 can land anywhere. This family is monomorphized at two element
+    /// types, which is exactly the shape that could tie — so every arity is
+    /// pinned here against the oid a live PostgreSQL 18.2 resolves the same
+    /// call to.
+    #[test]
+    fn array_family_resolves_the_same_for_a_bare_column_as_for_a_literal() {
+        let cases: &[(&str, &[Oid], u32)] = &[
+            ("array_append", &[oid::INT4_ARRAY, oid::INT4], 378),
+            ("array_append", &[oid::TEXT_ARRAY, oid::TEXT], 378),
+            ("array_prepend", &[oid::INT4, oid::INT4_ARRAY], 379),
+            ("array_cat", &[oid::INT4_ARRAY, oid::INT4_ARRAY], 383),
+            ("array_remove", &[oid::INT4_ARRAY, oid::INT4], 3167),
+            ("array_replace", &[oid::INT4_ARRAY, oid::INT4, oid::INT4], 3168),
+            ("array_position", &[oid::INT4_ARRAY, oid::INT4], 3277),
+            (
+                "array_position",
+                &[oid::INT4_ARRAY, oid::INT4, oid::INT4],
+                3278,
+            ),
+            ("array_positions", &[oid::INT4_ARRAY, oid::INT4], 3279),
+            ("array_ndims", &[oid::INT4_ARRAY], 748),
+            ("cardinality", &[oid::INT4_ARRAY], 3179),
+            ("array_reverse", &[oid::INT4_ARRAY], 6381),
+            ("array_sort", &[oid::INT4_ARRAY], 6388),
+            ("array_sort", &[oid::INT4_ARRAY, oid::BOOL], 6389),
+            ("array_sort", &[oid::INT4_ARRAY, oid::BOOL, oid::BOOL], 6390),
+            ("array_to_string", &[oid::INT4_ARRAY, oid::TEXT], 395),
+            (
+                "array_to_string",
+                &[oid::INT4_ARRAY, oid::TEXT, oid::TEXT],
+                384,
+            ),
+            ("string_to_array", &[oid::TEXT, oid::TEXT], 394),
+            ("string_to_array", &[oid::TEXT, oid::TEXT, oid::TEXT], 376),
+        ];
+        for (name, args, want) in cases {
+            let f = resolve(name, args)
+                .unwrap_or_else(|| panic!("{name}{args:?} must resolve for a bare column"));
+            assert_eq!(f.oid, Oid(*want), "{name}{args:?}");
+        }
+
+        // The two arities of `array_sort` differ only by a trailing boolean,
+        // and the two of `array_position`/`array_to_string` only by a trailing
+        // argument. An arity confusion would silently drop or invent an
+        // argument, so the counts are asserted rather than assumed.
+        for (name, args, nargs) in [
+            ("array_sort", vec![oid::INT4_ARRAY], 1usize),
+            ("array_sort", vec![oid::INT4_ARRAY, oid::BOOL], 2),
+            ("array_sort", vec![oid::INT4_ARRAY, oid::BOOL, oid::BOOL], 3),
+        ] {
+            assert_eq!(resolve(name, &args).unwrap().args.len(), nargs);
+        }
+    }
+
     /// The statistical aggregates are `Aggregate`, not `Scalar`, and their
     /// return types are the surprising part: `stddev(int4)` widens to
     /// `numeric` while `stddev(float8)` stays `float8`, and `regr_count`

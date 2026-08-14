@@ -217,10 +217,10 @@
 use std::sync::Arc;
 
 use arrow::compute::kernels::{
-    arity, boolean, cast, cmp, comparison, concat_elements, numeric, zip,
+    arity, boolean, cast, cmp, comparison, concat_elements, numeric, sort::sort_to_indices, zip,
 };
 use arrow_array::{
-    new_null_array,
+    new_empty_array, new_null_array,
     timezone::Tz,
     types::{
         Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
@@ -232,8 +232,8 @@ use arrow_array::{
     StringArray,
     TimestampMicrosecondArray, UInt32Array,
 };
-use arrow::buffer::OffsetBuffer;
-use arrow_schema::{ArrowError, DataType, Field};
+use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow_schema::{ArrowError, DataType, Field, SortOptions};
 use arrow_select::{interleave, take};
 use chrono::{
     offset::MappedLocalTime, DateTime, Datelike, NaiveDate, NaiveDateTime, Offset, TimeDelta,
@@ -475,6 +475,130 @@ const OID_ATAN2_FLOAT8: u32 = 1603; // atan2(double precision, double precision)
 const OID_COS_FLOAT8: u32 = 1605; // cos(double precision)
 const OID_SIN_FLOAT8: u32 = 1604; // sin(double precision)
 const OID_TAN_FLOAT8: u32 = 1606; // tan(double precision)
+
+// ─── The DataFusion orphans ─────────────────────────────────────────────────
+//
+// `docs/migration/df-removal/17-udf-rehosting.md` §3 and
+// `22-removal-surface-measured.md` §8 name the `pg_catalog` functions Basin
+// answers today ONLY because `datafusion-functions` answers them: no Basin
+// code registers them and none implements them, so they vanish silently the
+// day `datafusion = "53"` leaves the workspace. Commit `c9bd3a68` landed
+// their `pg_proc` rows in `basin_pgtype::func::FUNCS` — which made them
+// *resolvable* but still unimplemented, so every call reached the `other =>`
+// arm below. These are the arms that make them answerable.
+//
+// Every OID here was read from the live PostgreSQL 18.2 `pg_proc` this
+// session, with `pg_get_function_identity_arguments` printed alongside so an
+// overload could not be confused with its sibling — never recalled. Every
+// edge case each implementation is written around was likewise *asked of the
+// server*, not reasoned about; the surprising ones are recorded on the
+// individual functions.
+//
+// The array family. `basin_pgtype::func` monomorphizes these on
+// `anycompatiblearray`/`anycompatible` at `int4[]` and `text[]`; the
+// implementations below are element-type agnostic (they move elements with
+// `take`/`interleave` and compare them with the `not_distinct` kernel), so a
+// wider monomorphization in that table needs no change here.
+const OID_ARRAY_APPEND: u32 = 378; // array_append(anycompatiblearray, anycompatible)
+const OID_ARRAY_PREPEND: u32 = 379; // array_prepend(anycompatible, anycompatiblearray)
+const OID_ARRAY_CAT: u32 = 383; // array_cat(anycompatiblearray, anycompatiblearray)
+const OID_ARRAY_REMOVE: u32 = 3167; // array_remove(anycompatiblearray, anycompatible)
+const OID_ARRAY_REPLACE: u32 = 3168; // array_replace(anycompatiblearray, anycompatible, anycompatible)
+const OID_ARRAY_POSITION: u32 = 3277; // array_position(anycompatiblearray, anycompatible)
+const OID_ARRAY_POSITION_START: u32 = 3278; // array_position(anycompatiblearray, anycompatible, integer)
+const OID_ARRAY_POSITIONS: u32 = 3279; // array_positions(anycompatiblearray, anycompatible)
+const OID_ARRAY_NDIMS: u32 = 748; // array_ndims(anyarray)
+const OID_CARDINALITY: u32 = 3179; // cardinality(anyarray)
+const OID_ARRAY_REVERSE: u32 = 6381; // array_reverse(anyarray)
+const OID_ARRAY_SORT_1: u32 = 6388; // array_sort(anyarray)
+const OID_ARRAY_SORT_2: u32 = 6389; // array_sort(anyarray, descending boolean)
+const OID_ARRAY_SORT_3: u32 = 6390; // array_sort(anyarray, descending boolean, nulls_first boolean)
+const OID_ARRAY_TO_STRING_2: u32 = 395; // array_to_string(anyarray, text)
+const OID_ARRAY_TO_STRING_3: u32 = 384; // array_to_string(anyarray, text, text)
+const OID_STRING_TO_ARRAY_2: u32 = 394; // string_to_array(text, text)
+const OID_STRING_TO_ARRAY_3: u32 = 376; // string_to_array(text, text, text)
+
+// String/binary measurement and construction.
+const OID_BIT_LENGTH_TEXT: u32 = 1811; // bit_length(text)
+const OID_BIT_LENGTH_BYTEA: u32 = 1810; // bit_length(bytea)
+const OID_OCTET_LENGTH_TEXT: u32 = 1374; // octet_length(text)
+const OID_OCTET_LENGTH_BYTEA: u32 = 720; // octet_length(bytea)
+const OID_STARTS_WITH: u32 = 3696; // starts_with(text, text)
+const OID_OVERLAY_TEXT_3: u32 = 1405; // overlay(text, text, integer)
+const OID_OVERLAY_TEXT_4: u32 = 1404; // overlay(text, text, integer, integer)
+const OID_OVERLAY_BYTEA_3: u32 = 752; // overlay(bytea, bytea, integer)
+const OID_OVERLAY_BYTEA_4: u32 = 749; // overlay(bytea, bytea, integer, integer)
+const OID_TO_HEX_INT4: u32 = 2089; // to_hex(integer)
+const OID_TO_HEX_INT8: u32 = 2090; // to_hex(bigint)
+
+// Integer math.
+const OID_FACTORIAL: u32 = 1376; // factorial(bigint) -> numeric
+const OID_GCD_INT4: u32 = 5044; // gcd(integer, integer)
+const OID_GCD_INT8: u32 = 5045; // gcd(bigint, bigint)
+const OID_LCM_INT4: u32 = 5046; // lcm(integer, integer)
+const OID_LCM_INT8: u32 = 5047; // lcm(bigint, bigint)
+const OID_COT_FLOAT8: u32 = 1607; // cot(double precision)
+
+// Float math whose `pg_proc` rows this session added to
+// `basin_pgtype::func::FUNCS` — see that table's "the hyperbolics, log10 and
+// pow" block. The differential harness reported all eight as UNRESOLVABLE
+// (no catalog row) rather than merely unimplemented, so both halves land
+// together.
+const OID_SINH_FLOAT8: u32 = 2462; // sinh(double precision)
+const OID_COSH_FLOAT8: u32 = 2463; // cosh(double precision)
+const OID_TANH_FLOAT8: u32 = 2464; // tanh(double precision)
+const OID_ASINH_FLOAT8: u32 = 2465; // asinh(double precision)
+const OID_ACOSH_FLOAT8: u32 = 2466; // acosh(double precision)
+const OID_ATANH_FLOAT8: u32 = 2467; // atanh(double precision)
+const OID_LOG10_FLOAT8: u32 = 1194; // log10(double precision) — a separate oid from log(float8) 1340
+const OID_POW_FLOAT8: u32 = 1346; // pow(double precision, double precision) — separate from power 1368
+
+// Date construction.
+const OID_MAKE_DATE: u32 = 3846; // make_date(year int, month int, day int) -> date
+
+// ─── Orphans deliberately still unimplemented ───────────────────────────────
+//
+// Named here so their absence is a decision with a measured reason rather
+// than an oversight. Each one falls through to the `other =>` arm and errors,
+// which is the honest outcome for all of them:
+//
+//   * `octet_length(character)` (1375). PostgreSQL blank-pads `character(n)`
+//     and counts the padding: `octet_length('abc'::char(10))` is **10**,
+//     measured live, while `length('abc'::char(10))` is 3. `basin_pgtype`
+//     maps `bpchar` to Arrow `Utf8` with no padding at all
+//     (`basin_pgtype::physical`, `oid::BPCHAR => DataType::Utf8`), so this
+//     function would report 3 where PostgreSQL reports 10 for every value
+//     narrower than its declared width. That is a wrong answer, not a missing
+//     one. (`bit_length('abc'::char(10))` is 24, not 80 — that call resolves
+//     through the *text* overload after an implicit `bpchar -> text` cast,
+//     which strips the padding, so 1811 below is unaffected.)
+//   * `regexp_count` (6254-6256), `regexp_instr` (6257-6262) and
+//     `regexp_like` (6263-6264). Same refusal commit `b9f07643` recorded for
+//     the rest of the regex family: PostgreSQL's pattern language is POSIX
+//     ARE, which has backreferences and lookaround; Rust's `regex` crate
+//     cannot compile either, by design. Basin would therefore *error* on
+//     patterns PostgreSQL answers, and — worse — the subset that does compile
+//     differs in longest-vs-leftmost alternation semantics. A clean refusal
+//     beats a subtly different regex engine.
+//   * `md5` (2311, 2321) and `random` (1598, 6339-6341). Both need a
+//     dependency `basin-exec`'s manifest does not carry (an MD5
+//     implementation; an RNG), and this session does not own that manifest.
+//     `md5` is otherwise a pure, exactly-specifiable function and is the
+//     cheapest remaining orphan once the dependency question is settled.
+//   * `now` (1299). Implementable — [`EvalSession::transaction_timestamp`] is
+//     exactly its value — but only against a session that HAS a clock, and
+//     `eval()`'s public entry point supplies [`EvalSession::DEFAULT`], which
+//     deliberately has none (see that constant's docs). Adding the arm
+//     without a way to reach it from `eval()` would be unreachable code.
+//   * `percentile_cont`. An *ordered-set* aggregate
+//     (`pg_aggregate.aggkind = 'o'`), spelled
+//     `percentile_cont(f) WITHIN GROUP (ORDER BY x)`. It is not a scalar
+//     function and has no `pg_proc` row in `basin_pgtype::func::FUNCS` for
+//     the reason that table's own module docs give: `FuncKind` has no variant
+//     for an ordered-set aggregate, and tabulating it as a plain aggregate
+//     would assert it is callable as an ordinary two-argument one — which is
+//     precisely the "same name, different function" trap DataFusion falls
+//     into for this name.
 
 // ─── Session context ────────────────────────────────────────────────────────
 
@@ -1504,6 +1628,708 @@ fn eval_array_length(arr: &ArrayRef, dim: &ArrayRef) -> Result<ArrayRef, ExecErr
     Ok(Arc::new(out))
 }
 
+// ─── The array family ───────────────────────────────────────────────────────
+//
+// Twelve `pg_catalog` functions that Basin answered today only through
+// DataFusion's `datafusion-functions-nested` (see the `OID_ARRAY_*` block).
+// They share three properties that shape everything below:
+//
+//  1. **They are polymorphic, and the implementation must be too.** Postgres
+//     declares them on `anycompatiblearray`/`anyarray`, with one physical oid
+//     for every element type. So none of these functions may match on the
+//     element type: elements are *moved* with `take`/`interleave` and
+//     *compared* with the `not_distinct` kernel, both of which are generic
+//     over Arrow's type system. Adding `int8[]`/`numeric[]` rows to
+//     `basin_pgtype::func::FUNCS` therefore needs no change here.
+//
+//  2. **NULL has three distinct meanings and they are not interchangeable.**
+//     A NULL *array*, a NULL *element inside* an array, and an *empty* array
+//     are three different things, and Postgres answers differently for each.
+//     Every one of the rules below was measured on the live PostgreSQL 18.2,
+//     and several are the opposite of the natural guess:
+//
+//     | call | result | the wrong guess |
+//     |---|---|---|
+//     | `array_append(NULL::int[], 1)` | `{1}` | NULL — the function is NOT strict |
+//     | `array_append(NULL::int[], NULL)` | `{NULL}` | NULL — a one-element array *containing* NULL |
+//     | `array_cat(NULL::int[], ARRAY[1])` | `{1}` | NULL |
+//     | `array_cat(NULL::int[], NULL::int[])` | NULL | `{}` |
+//     | `array_position(ARRAY[1,NULL,3], NULL)` | `2` | NULL — a NULL element IS found |
+//     | `array_positions(ARRAY[1,2], 9)` | `{}` | NULL — empty array, not NULL |
+//     | `array_position(ARRAY[1,2], 9)` | NULL | `{}`/0 — the singular form DOES answer NULL |
+//     | `array_remove(ARRAY[1,NULL,3], NULL)` | `{1,3}` | `{1,NULL,3}` — NULLs ARE removed |
+//     | `array_ndims(ARRAY[]::int[])` | NULL | 1 — an empty array has ZERO dimensions |
+//     | `cardinality(ARRAY[]::int[])` | `0` | NULL — and it disagrees with `array_length`, which IS NULL |
+//     | `array_to_string(ARRAY['a',NULL,'c'], ',')` | `a,c` | `a,,c` — NULLs are DROPPED |
+//     | `array_sort(ARRAY[3,1,NULL,2], true)` | `{NULL,3,2,1}` | `{3,2,1,NULL}` — NULLS FIRST is the DESC default |
+//
+//     The `array_position`/`array_positions` row and the
+//     `array_length`/`cardinality` row are the two that a shared helper gets
+//     wrong, which is why neither pair shares one here.
+//
+//  3. **Element equality is `IS NOT DISTINCT FROM`, not `=`.** That is what
+//     makes `array_position(…, NULL)` find a NULL and `array_remove(…, NULL)`
+//     remove one. Arrow's `cmp::not_distinct` kernel is exactly this
+//     predicate and returns a null-free `BooleanArray`, so none of the
+//     search/replace functions below has a three-valued branch to get wrong.
+//
+// Postgres arrays are also multi-dimensional and Arrow's `ListArray` is not:
+// `basin_pgtype::physical` maps `int4[]` to a one-dimensional `List`, so no
+// multi-dimensional value can reach any of these. That is a real gap
+// (`array_ndims` can only ever answer 1 or NULL here), and it is the reason
+// the differential harness passes multi-dimensional literals as
+// "unrepresentable" rather than as a case Basin could fail.
+
+/// Gather a list column's elements into one compact child array in row order,
+/// plus each row's `(start, len)` window inside it.
+///
+/// Exists because `ListArray::values()` is the *whole* child buffer, which for
+/// a sliced or out-of-order list is neither compact nor in row order — every
+/// function below wants "row `i`'s elements" as a contiguous run, and building
+/// that once is both simpler and cheaper than re-deriving it from
+/// `value_offsets()` in each.
+///
+/// A NULL row contributes no elements and gets a zero-length window, so the
+/// caller decides what a NULL array means for its own function (they differ —
+/// see the table above) rather than inheriting a decision made here.
+fn flatten_list(
+    list: &ListArray,
+    what: &'static str,
+) -> Result<(ArrayRef, Vec<(usize, usize)>), ExecError> {
+    let offsets = list.value_offsets();
+    let mut picks: Vec<u32> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(list.len());
+    for i in 0..list.len() {
+        let start = picks.len();
+        if !list.is_null(i) {
+            for k in offsets[i]..offsets[i + 1] {
+                picks.push(u32::try_from(k).expect("list offset fits u32"));
+            }
+        }
+        spans.push((start, picks.len() - start));
+    }
+    let values = take::take(list.values().as_ref(), &UInt32Array::from(picks), None)
+        .map_err(|e| map_arrow(e, what))?;
+    Ok((values, spans))
+}
+
+/// Repeat a one-value-per-row array so it lines up element-for-element with a
+/// [`flatten_list`] child array — the shape `cmp::not_distinct` needs to
+/// compare every element of row `i` against row `i`'s search value.
+fn expand_per_row(
+    per_row: &ArrayRef,
+    spans: &[(usize, usize)],
+    what: &'static str,
+) -> Result<ArrayRef, ExecError> {
+    let mut idx: Vec<u32> = Vec::new();
+    for (row, (_, len)) in spans.iter().enumerate() {
+        let row = u32::try_from(row).expect("row index fits u32");
+        idx.extend(std::iter::repeat_n(row, *len));
+    }
+    take::take(per_row.as_ref(), &UInt32Array::from(idx), None).map_err(|e| map_arrow(e, what))
+}
+
+/// `IS NOT DISTINCT FROM`, element by element, between a flattened child array
+/// and the per-row search value expanded to match it. Never NULL — that is the
+/// whole point of `not_distinct` over `eq`, and it is why
+/// `array_position(ARRAY[1,NULL,3], NULL)` is `2` rather than NULL.
+fn elements_not_distinct(
+    flat: &ArrayRef,
+    needle: &ArrayRef,
+    spans: &[(usize, usize)],
+    what: &'static str,
+) -> Result<BooleanArray, ExecError> {
+    let expanded = expand_per_row(needle, spans, what)?;
+    cmp::not_distinct(flat, &expanded).map_err(|e| map_arrow(e, what))
+}
+
+/// Build a `ListArray` from element sources picked by `indices`, cut into rows
+/// by `lengths`, with `validity[i] == false` making row `i` a NULL array.
+///
+/// The output field is `("item", nullable)` because that is what
+/// `basin_pgtype::physical` produces for a Postgres array type — a different
+/// name or nullability would be a different Arrow type from the one the plan
+/// declared, and the batch would be rejected downstream. Same reason
+/// [`eval_array_lit`] spells it that way.
+fn assemble_list(
+    elem_type: &DataType,
+    sources: &[&dyn Array],
+    indices: &[(usize, usize)],
+    lengths: &[usize],
+    validity: &[bool],
+    what: &'static str,
+) -> Result<ArrayRef, ExecError> {
+    let values: ArrayRef = if indices.is_empty() {
+        new_empty_array(elem_type)
+    } else {
+        interleave::interleave(sources, indices).map_err(|e| map_arrow(e, what))?
+    };
+    let offsets = OffsetBuffer::from_lengths(lengths.iter().copied());
+    let field = Arc::new(Field::new("item", elem_type.clone(), true));
+    let nulls = if validity.iter().all(|v| *v) {
+        None
+    } else {
+        Some(NullBuffer::from(validity.to_vec()))
+    };
+    Ok(Arc::new(
+        ListArray::try_new(field, offsets, values, nulls).map_err(|e| map_arrow(e, what))?,
+    ))
+}
+
+/// `array_append(a, e)` and `array_prepend(e, a)` — the same function with the
+/// element on the other end.
+///
+/// Neither is strict, and that is the whole subtlety. Measured live:
+/// `array_append(NULL::int[], 1)` is `{1}`, not NULL — a NULL array behaves as
+/// an empty one — and `array_append(NULL::int[], NULL)` is `{NULL}`, a
+/// one-element array whose single element is NULL. So the result is **never**
+/// a NULL array, which is why `validity` below is unconditionally true.
+fn eval_array_add_element(
+    arr: &ArrayRef,
+    elem: &ArrayRef,
+    at_front: bool,
+    what: &'static str,
+) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, what)?;
+    let (flat, spans) = flatten_list(list, what)?;
+    if flat.data_type() != elem.data_type() {
+        return Err(ExecError::TypeMismatch(format!(
+            "{what} expects the element type {:?} of its array, found {:?}",
+            flat.data_type(),
+            elem.data_type()
+        )));
+    }
+    let mut indices = Vec::with_capacity(flat.len() + spans.len());
+    let mut lengths = Vec::with_capacity(spans.len());
+    for (row, (start, len)) in spans.iter().enumerate() {
+        if at_front {
+            indices.push((1usize, row));
+        }
+        indices.extend((*start..start + len).map(|k| (0usize, k)));
+        if !at_front {
+            indices.push((1usize, row));
+        }
+        lengths.push(len + 1);
+    }
+    let validity = vec![true; spans.len()];
+    assemble_list(
+        &flat.data_type().clone(),
+        &[flat.as_ref(), elem.as_ref()],
+        &indices,
+        &lengths,
+        &validity,
+        what,
+    )
+}
+
+/// `array_cat(l, r)` — concatenation.
+///
+/// NULL is absorbed on either side but not on both: `array_cat(NULL, {1})` is
+/// `{1}` and `array_cat({1}, NULL)` is `{1}`, while
+/// `array_cat(NULL::int[], NULL::int[])` is NULL, not `{}`. All three measured
+/// live. The result is a NULL array exactly when *both* inputs are.
+fn eval_array_cat(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let ll = require_list(l, "array_cat")?;
+    let rl = require_list(r, "array_cat")?;
+    let (lflat, lspans) = flatten_list(ll, "array_cat")?;
+    let (rflat, rspans) = flatten_list(rl, "array_cat")?;
+    if lflat.data_type() != rflat.data_type() {
+        return Err(ExecError::TypeMismatch(format!(
+            "array_cat expects two arrays of the same element type, found {:?} and {:?}",
+            lflat.data_type(),
+            rflat.data_type()
+        )));
+    }
+    let mut indices = Vec::with_capacity(lflat.len() + rflat.len());
+    let mut lengths = Vec::with_capacity(lspans.len());
+    let mut validity = Vec::with_capacity(lspans.len());
+    for row in 0..ll.len() {
+        let (ls, ln) = lspans[row];
+        let (rs, rn) = rspans[row];
+        indices.extend((ls..ls + ln).map(|k| (0usize, k)));
+        indices.extend((rs..rs + rn).map(|k| (1usize, k)));
+        lengths.push(ln + rn);
+        validity.push(!(ll.is_null(row) && rl.is_null(row)));
+    }
+    assemble_list(
+        &lflat.data_type().clone(),
+        &[lflat.as_ref(), rflat.as_ref()],
+        &indices,
+        &lengths,
+        &validity,
+        "array_cat",
+    )
+}
+
+/// `array_remove(a, e)` — every element not distinct from `e`, dropped.
+///
+/// `array_remove(ARRAY[1,NULL,3], NULL)` is `{1,3}`, measured live: a NULL
+/// search value removes the NULL elements rather than matching nothing. A NULL
+/// *array* still answers NULL.
+fn eval_array_remove(arr: &ArrayRef, elem: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_remove")?;
+    let (flat, spans) = flatten_list(list, "array_remove")?;
+    let matches = elements_not_distinct(&flat, elem, &spans, "array_remove")?;
+    let mut indices = Vec::new();
+    let mut lengths = Vec::with_capacity(spans.len());
+    let mut validity = Vec::with_capacity(spans.len());
+    for (row, (start, len)) in spans.iter().enumerate() {
+        let before = indices.len();
+        indices.extend((*start..start + len).filter(|k| !matches.value(*k)).map(|k| (0usize, k)));
+        lengths.push(indices.len() - before);
+        validity.push(!list.is_null(row));
+    }
+    assemble_list(
+        &flat.data_type().clone(),
+        &[flat.as_ref()],
+        &indices,
+        &lengths,
+        &validity,
+        "array_remove",
+    )
+}
+
+/// `array_replace(a, from, to)` — every element not distinct from `from`,
+/// replaced by `to`.
+///
+/// Both `from` and `to` may be NULL and both are meaningful:
+/// `array_replace(ARRAY[1,NULL,3], NULL, 9)` is `{1,9,3}` and
+/// `array_replace(ARRAY[1,2,3], 2, NULL)` is `{1,NULL,3}`, measured live.
+fn eval_array_replace(
+    arr: &ArrayRef,
+    from: &ArrayRef,
+    to: &ArrayRef,
+) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_replace")?;
+    let (flat, spans) = flatten_list(list, "array_replace")?;
+    if flat.data_type() != to.data_type() {
+        return Err(ExecError::TypeMismatch(format!(
+            "array_replace expects the element type {:?} of its array, found {:?}",
+            flat.data_type(),
+            to.data_type()
+        )));
+    }
+    let matches = elements_not_distinct(&flat, from, &spans, "array_replace")?;
+    let mut indices = Vec::with_capacity(flat.len());
+    let mut lengths = Vec::with_capacity(spans.len());
+    let mut validity = Vec::with_capacity(spans.len());
+    for (row, (start, len)) in spans.iter().enumerate() {
+        for k in *start..start + len {
+            if matches.value(k) {
+                indices.push((1usize, row));
+            } else {
+                indices.push((0usize, k));
+            }
+        }
+        lengths.push(*len);
+        validity.push(!list.is_null(row));
+    }
+    assemble_list(
+        &flat.data_type().clone(),
+        &[flat.as_ref(), to.as_ref()],
+        &indices,
+        &lengths,
+        &validity,
+        "array_replace",
+    )
+}
+
+/// `array_position(a, e)` and `array_position(a, e, start)` — the 1-based
+/// index of the first element not distinct from `e`, or NULL if there is none.
+///
+/// Measured live, and each row is a case a plausible implementation gets
+/// wrong:
+///
+/// | call | result |
+/// |---|---|
+/// | `array_position(ARRAY[1,NULL,3], NULL)` | 2 — a NULL element IS matched |
+/// | `array_position(ARRAY[1,2], 9)` | NULL — absent is NULL, not 0 |
+/// | `array_position(NULL::int[], 1)` | NULL |
+/// | `array_position(ARRAY[]::int[], 1)` | NULL |
+/// | `array_position(ARRAY[1,2,1], 1, 0)` | 1 — a start below 1 clamps |
+/// | `array_position(ARRAY[1,2,1], 1, -5)` | 1 — so does a negative one |
+/// | `array_position(ARRAY[1,2,1], 1, 9)` | NULL — past the end finds nothing |
+/// | `array_position(ARRAY[1,2,1], 1, NULL)` | **ERROR**: `initial position must not be null` |
+///
+/// The last one is the only input any of these functions *rejects*, and it
+/// rejects it rather than returning NULL even though the function is not
+/// strict.
+fn eval_array_position(
+    arr: &ArrayRef,
+    elem: &ArrayRef,
+    start: Option<&ArrayRef>,
+) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_position")?;
+    let (flat, spans) = flatten_list(list, "array_position")?;
+    let matches = elements_not_distinct(&flat, elem, &spans, "array_position")?;
+    let from = match start {
+        None => None,
+        Some(s) => {
+            let s = cast::cast(s, &DataType::Int64).map_err(|e| map_arrow(e, "array_position"))?;
+            let s = s
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("just cast to Int64")
+                .clone();
+            if s.null_count() > 0 {
+                return Err(ExecError::TypeMismatch(
+                    "initial position must not be null".to_string(),
+                ));
+            }
+            Some(s)
+        }
+    };
+    let out: Int32Array = spans
+        .iter()
+        .enumerate()
+        .map(|(row, (start_off, len))| {
+            if list.is_null(row) {
+                return None;
+            }
+            // 1-based, clamped: a start below 1 means "from the beginning",
+            // not an error and not an empty search.
+            let skip = from
+                .as_ref()
+                .map(|s| (s.value(row) - 1).max(0))
+                .unwrap_or(0);
+            let skip = usize::try_from(skip).unwrap_or(usize::MAX);
+            if skip >= *len {
+                return None;
+            }
+            (start_off + skip..start_off + len)
+                .find(|k| matches.value(*k))
+                .map(|k| i32::try_from(k - start_off + 1).expect("array position fits i32"))
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `array_positions(a, e)` — *all* the 1-based indices, as an `int4[]`.
+///
+/// It does not share [`eval_array_position`]'s "absent is NULL" rule:
+/// `array_positions(ARRAY[1,2], 9)` is `{}`, an empty array, while the
+/// singular form is NULL. A NULL array is still NULL. Both measured live, and
+/// this disagreement is why the two are separate functions here.
+fn eval_array_positions(arr: &ArrayRef, elem: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_positions")?;
+    let (flat, spans) = flatten_list(list, "array_positions")?;
+    let matches = elements_not_distinct(&flat, elem, &spans, "array_positions")?;
+    let mut values: Vec<i32> = Vec::new();
+    let mut lengths = Vec::with_capacity(spans.len());
+    let mut validity = Vec::with_capacity(spans.len());
+    for (row, (start, len)) in spans.iter().enumerate() {
+        let before = values.len();
+        for k in *start..start + len {
+            if matches.value(k) {
+                values.push(i32::try_from(k - start + 1).expect("array position fits i32"));
+            }
+        }
+        lengths.push(values.len() - before);
+        validity.push(!list.is_null(row));
+    }
+    let child = Int32Array::from(values);
+    let offsets = OffsetBuffer::from_lengths(lengths);
+    let field = Arc::new(Field::new("item", DataType::Int32, true));
+    let nulls = if validity.iter().all(|v| *v) {
+        None
+    } else {
+        Some(NullBuffer::from(validity))
+    };
+    Ok(Arc::new(
+        ListArray::try_new(field, offsets, Arc::new(child), nulls)
+            .map_err(|e| map_arrow(e, "array_positions"))?,
+    ))
+}
+
+/// `cardinality(a)` — the total number of elements.
+///
+/// Deliberately NOT sharing [`eval_array_length`]: `cardinality(ARRAY[]::int[])`
+/// is **0** while `array_length(ARRAY[]::int[], 1)` is **NULL**, both measured
+/// live. The two functions disagree on exactly the input a shared helper would
+/// unify. NULL in, NULL out.
+///
+/// Postgres's `cardinality` counts elements across *all* dimensions; Arrow's
+/// `ListArray` is one-dimensional, so here it is the row's length.
+fn eval_cardinality(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "cardinality")?;
+    let offsets = list.value_offsets();
+    let out: Int32Array = (0..list.len())
+        .map(|i| (!list.is_null(i)).then(|| offsets[i + 1] - offsets[i]))
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `array_ndims(a)` — the number of dimensions.
+///
+/// `array_ndims(ARRAY[]::int[])` is **NULL**, not 1 and not 0: an empty array
+/// has no dimensions at all, the same rule that makes `array_length` NULL for
+/// it (measured live). A NULL array is NULL.
+///
+/// Only ever 1 or NULL here, because `basin_pgtype::physical` has no
+/// multi-dimensional array type — see this family's header comment.
+fn eval_array_ndims(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_ndims")?;
+    let offsets = list.value_offsets();
+    let out: Int32Array = (0..list.len())
+        .map(|i| {
+            if list.is_null(i) || offsets[i + 1] == offsets[i] {
+                None
+            } else {
+                Some(1)
+            }
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `array_reverse(a)`.
+fn eval_array_reverse(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_reverse")?;
+    let (flat, spans) = flatten_list(list, "array_reverse")?;
+    let mut indices = Vec::with_capacity(flat.len());
+    let mut lengths = Vec::with_capacity(spans.len());
+    let mut validity = Vec::with_capacity(spans.len());
+    for (row, (start, len)) in spans.iter().enumerate() {
+        indices.extend((*start..start + len).rev().map(|k| (0usize, k)));
+        lengths.push(*len);
+        validity.push(!list.is_null(row));
+    }
+    assemble_list(
+        &flat.data_type().clone(),
+        &[flat.as_ref()],
+        &indices,
+        &lengths,
+        &validity,
+        "array_reverse",
+    )
+}
+
+/// `array_sort(a)`, `array_sort(a, descending)` and
+/// `array_sort(a, descending, nulls_first)`.
+///
+/// The default for `nulls_first` is **`descending` itself**, not `false`:
+/// measured live, `array_sort(ARRAY[3,1,NULL,2])` is `{1,2,3,NULL}` but
+/// `array_sort(ARRAY[3,1,NULL,2], true)` is `{NULL,3,2,1}`. That is Postgres's
+/// ordinary `ORDER BY` rule (NULLS LAST for ASC, NULLS FIRST for DESC) applied
+/// to an array, and getting it wrong puts the NULL at the wrong end of every
+/// descending sort. The three-argument form overrides it and was checked in
+/// all four combinations.
+///
+/// All three overloads are strict, so a NULL `descending` or `nulls_first`
+/// makes the whole call NULL rather than falling back to a default —
+/// `array_sort(ARRAY[3,1,NULL,2], NULL::bool)` is NULL, measured live.
+///
+/// > **Collation.** Postgres orders text by the database collation
+/// > (`en_US.UTF-8` on the server this was measured against, which sorts
+/// > `{1,a,A,ä,b,B}`), while Arrow's sort kernel orders by Unicode code point
+/// > (`{1,A,B,a,b,ä}`). So `array_sort` on a text array diverges from
+/// > PostgreSQL under any collation but `C`. This is not a new divergence
+/// > introduced here: `basin-exec` has no collation support anywhere, so
+/// > `ORDER BY textcol` already answers in code-point order. It is recorded
+/// > here rather than fixed here, because fixing it is a crate-wide collation
+/// > facility, not an argument to this function.
+fn eval_array_sort(
+    arr: &ArrayRef,
+    descending: Option<&ArrayRef>,
+    nulls_first: Option<&ArrayRef>,
+) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_sort")?;
+    let (flat, spans) = flatten_list(list, "array_sort")?;
+    let desc = match descending {
+        None => None,
+        Some(d) => Some(downcast_array::<BooleanArray>(d, "boolean")?.clone()),
+    };
+    let nf = match nulls_first {
+        None => None,
+        Some(n) => Some(downcast_array::<BooleanArray>(n, "boolean")?.clone()),
+    };
+
+    let mut indices = Vec::with_capacity(flat.len());
+    let mut lengths = Vec::with_capacity(spans.len());
+    let mut validity = Vec::with_capacity(spans.len());
+    for (row, (start, len)) in spans.iter().enumerate() {
+        // Strict in every argument: a NULL flag makes the row NULL, it does
+        // not fall back to the default.
+        let flags_null = desc.as_ref().is_some_and(|d| d.is_null(row))
+            || nf.as_ref().is_some_and(|n| n.is_null(row));
+        if list.is_null(row) || flags_null {
+            lengths.push(0);
+            validity.push(false);
+            continue;
+        }
+        let descending = desc.as_ref().is_some_and(|d| d.value(row));
+        let nulls_first = nf
+            .as_ref()
+            .map(|n| n.value(row))
+            // The default that is easy to get wrong — see the doc comment.
+            .unwrap_or(descending);
+        let options = SortOptions {
+            descending,
+            nulls_first,
+        };
+        let slice = flat.slice(*start, *len);
+        let order = sort_to_indices(slice.as_ref(), Some(options), None)
+            .map_err(|e| map_arrow(e, "array_sort"))?;
+        indices.extend((0..order.len()).map(|k| (0usize, start + order.value(k) as usize)));
+        lengths.push(*len);
+        validity.push(true);
+    }
+    assemble_list(
+        &flat.data_type().clone(),
+        &[flat.as_ref()],
+        &indices,
+        &lengths,
+        &validity,
+        "array_sort",
+    )
+}
+
+/// `array_to_string(a, delim)` and `array_to_string(a, delim, null_string)`.
+///
+/// Measured live, and the NULL rules differ between the two overloads in a way
+/// the shared body below has to keep straight:
+///
+/// | call | result |
+/// |---|---|
+/// | `array_to_string(ARRAY['a',NULL,'c'], ',')` | `a,c` — NULLs are DROPPED, not rendered as empty |
+/// | `array_to_string(ARRAY['a',NULL,'c'], ',', 'X')` | `a,X,c` |
+/// | `array_to_string(ARRAY['a',NULL,'c'], ',', NULL)` | `a,c` — a NULL `null_string` drops them again |
+/// | `array_to_string(ARRAY[]::text[], ',')` | `` — the empty string, not NULL |
+/// | `array_to_string(NULL::text[], ',')` | NULL |
+/// | `array_to_string(ARRAY[1,2], NULL)` | NULL — a NULL delimiter is NULL even for the non-strict 3-argument form |
+///
+/// Elements are rendered by casting the child array to `Utf8`, so the same
+/// code serves `int4[]` and `text[]` (the two element types
+/// `basin_pgtype::func::FUNCS` monomorphizes this family at) without a
+/// per-type match.
+fn eval_array_to_string(
+    arr: &ArrayRef,
+    delim: &ArrayRef,
+    null_string: Option<&ArrayRef>,
+) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_to_string")?;
+    let (flat, spans) = flatten_list(list, "array_to_string")?;
+    let rendered =
+        cast::cast(&flat, &DataType::Utf8).map_err(|e| map_arrow(e, "array_to_string"))?;
+    let rendered = downcast_array::<StringArray>(&rendered, "text")?;
+    let delim = downcast_array::<StringArray>(delim, "text")?;
+    let null_string = match null_string {
+        None => None,
+        Some(n) => Some(downcast_array::<StringArray>(n, "text")?.clone()),
+    };
+
+    let out: StringArray = spans
+        .iter()
+        .enumerate()
+        .map(|(row, (start, len))| {
+            if list.is_null(row) || delim.is_null(row) {
+                return None;
+            }
+            let sep = delim.value(row);
+            let replacement = null_string
+                .as_ref()
+                .and_then(|n| n.is_valid(row).then(|| n.value(row)));
+            let mut buf = String::new();
+            let mut first = true;
+            for k in *start..start + len {
+                let piece = if rendered.is_null(k) {
+                    match replacement {
+                        // A NULL element with no replacement is dropped
+                        // entirely — separator and all.
+                        None => continue,
+                        Some(r) => r,
+                    }
+                } else {
+                    rendered.value(k)
+                };
+                if !first {
+                    buf.push_str(sep);
+                }
+                buf.push_str(piece);
+                first = false;
+            }
+            Some(buf)
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `string_to_array(s, delim)` and `string_to_array(s, delim, null_string)`.
+///
+/// The complement of [`eval_array_to_string`], and its NULL rules are stranger
+/// still. All measured live:
+///
+/// | call | result |
+/// |---|---|
+/// | `string_to_array('a,b,c', NULL)` | `{a,",",b,",",c}` — a NULL delimiter splits into single CHARACTERS |
+/// | `string_to_array('a,b,c', '')` | `{"a,b,c"}` — an empty delimiter does not split at all |
+/// | `string_to_array('', ',')` | `{}` — an empty array, NOT `{""}` |
+/// | `string_to_array('', '')` | `{}` |
+/// | `string_to_array(NULL, ',')` | NULL |
+/// | `string_to_array(',a,', ',')` | `{"",a,""}` — leading/trailing empties ARE kept |
+/// | `string_to_array('a,,c', ',', '')` | `{a,NULL,c}` — `null_string` turns matching pieces into NULL |
+///
+/// The NULL-delimiter rule is the one worth stating twice: it is not "return
+/// NULL" and it is not "do not split", it is "split into characters", and
+/// characters means `char`s, not bytes — `string_to_array('héllo', NULL)` is
+/// five elements, not six.
+fn eval_string_to_array(
+    s: &ArrayRef,
+    delim: &ArrayRef,
+    null_string: Option<&ArrayRef>,
+) -> Result<ArrayRef, ExecError> {
+    let s = downcast_array::<StringArray>(s, "text")?;
+    let delim = downcast_array::<StringArray>(delim, "text")?;
+    let null_string = match null_string {
+        None => None,
+        Some(n) => Some(downcast_array::<StringArray>(n, "text")?.clone()),
+    };
+
+    let mut pieces: Vec<Option<String>> = Vec::new();
+    let mut lengths = Vec::with_capacity(s.len());
+    let mut validity = Vec::with_capacity(s.len());
+    for row in 0..s.len() {
+        if s.is_null(row) {
+            lengths.push(0);
+            validity.push(false);
+            continue;
+        }
+        let text = s.value(row);
+        let replacement = null_string
+            .as_ref()
+            .and_then(|n| n.is_valid(row).then(|| n.value(row)));
+        let split: Vec<String> = if text.is_empty() {
+            // The empty input is an empty ARRAY, not a one-element array
+            // holding the empty string — for every delimiter.
+            Vec::new()
+        } else if delim.is_null(row) {
+            text.chars().map(|c| c.to_string()).collect()
+        } else if delim.value(row).is_empty() {
+            vec![text.to_string()]
+        } else {
+            text.split(delim.value(row)).map(str::to_string).collect()
+        };
+        lengths.push(split.len());
+        validity.push(true);
+        pieces.extend(split.into_iter().map(|p| match replacement {
+            Some(r) if p == r => None,
+            _ => Some(p),
+        }));
+    }
+    let child = StringArray::from(pieces);
+    let offsets = OffsetBuffer::from_lengths(lengths);
+    let field = Arc::new(Field::new("item", DataType::Utf8, true));
+    let nulls = if validity.iter().all(|v| *v) {
+        None
+    } else {
+        Some(NullBuffer::from(validity))
+    };
+    Ok(Arc::new(
+        ListArray::try_new(field, offsets, Arc::new(child), nulls)
+            .map_err(|e| map_arrow(e, "string_to_array"))?,
+    ))
+}
+
 /// `a[i]` — a single array subscript.
 ///
 /// Postgres subscripts are 1-based and, unlike almost everything else in the
@@ -2132,6 +2958,127 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         OID_COS_FLOAT8 => float8_unary_checked(&a(0)?, |x| pg_trig_of_radians(x, f64::cos)),
         OID_SIN_FLOAT8 => float8_unary_checked(&a(0)?, |x| pg_trig_of_radians(x, f64::sin)),
         OID_TAN_FLOAT8 => float8_unary_checked(&a(0)?, |x| pg_trig_of_radians(x, f64::tan)),
+
+        // ─── The DataFusion orphans ─────────────────────────────────────────
+        //
+        // The array family. See its header comment for the three NULLs these
+        // functions distinguish and the measured table of every rule.
+        OID_ARRAY_APPEND => {
+            eval_array_add_element(&a(0)?, &a(1)?, false, "array_append")
+        }
+        OID_ARRAY_PREPEND => {
+            // Note the argument order: `array_prepend(element, array)`, the
+            // reverse of `array_append`. `basin_pgtype::func::FUNCS` has a
+            // test asserting `array_prepend(array, element)` does NOT resolve,
+            // for exactly this reason.
+            eval_array_add_element(&a(1)?, &a(0)?, true, "array_prepend")
+        }
+        OID_ARRAY_CAT => eval_array_cat(&a(0)?, &a(1)?),
+        OID_ARRAY_REMOVE => eval_array_remove(&a(0)?, &a(1)?),
+        OID_ARRAY_REPLACE => eval_array_replace(&a(0)?, &a(1)?, &a(2)?),
+        OID_ARRAY_POSITION => eval_array_position(&a(0)?, &a(1)?, None),
+        OID_ARRAY_POSITION_START => {
+            let start = a(2)?;
+            eval_array_position(&a(0)?, &a(1)?, Some(&start))
+        }
+        OID_ARRAY_POSITIONS => eval_array_positions(&a(0)?, &a(1)?),
+        OID_ARRAY_NDIMS => eval_array_ndims(&a(0)?),
+        OID_CARDINALITY => eval_cardinality(&a(0)?),
+        OID_ARRAY_REVERSE => eval_array_reverse(&a(0)?),
+        OID_ARRAY_SORT_1 => eval_array_sort(&a(0)?, None, None),
+        OID_ARRAY_SORT_2 => {
+            let desc = a(1)?;
+            eval_array_sort(&a(0)?, Some(&desc), None)
+        }
+        OID_ARRAY_SORT_3 => {
+            let desc = a(1)?;
+            let nulls_first = a(2)?;
+            eval_array_sort(&a(0)?, Some(&desc), Some(&nulls_first))
+        }
+        OID_ARRAY_TO_STRING_2 => eval_array_to_string(&a(0)?, &a(1)?, None),
+        OID_ARRAY_TO_STRING_3 => {
+            let null_string = a(2)?;
+            eval_array_to_string(&a(0)?, &a(1)?, Some(&null_string))
+        }
+        OID_STRING_TO_ARRAY_2 => eval_string_to_array(&a(0)?, &a(1)?, None),
+        OID_STRING_TO_ARRAY_3 => {
+            let null_string = a(2)?;
+            eval_string_to_array(&a(0)?, &a(1)?, Some(&null_string))
+        }
+
+        // String and binary measurement. `bit_length` is `octet_length` times
+        // eight and neither is `length` — see [`text_byte_length`].
+        OID_OCTET_LENGTH_TEXT => text_byte_length(&a(0)?, false),
+        OID_BIT_LENGTH_TEXT => text_byte_length(&a(0)?, true),
+        OID_OCTET_LENGTH_BYTEA => bytea_byte_length(&a(0)?, false),
+        OID_BIT_LENGTH_BYTEA => bytea_byte_length(&a(0)?, true),
+        OID_STARTS_WITH => eval_starts_with(&a(0)?, &a(1)?),
+        OID_TO_HEX_INT4 => eval_to_hex_i32(&a(0)?),
+        OID_TO_HEX_INT8 => eval_to_hex_i64(&a(0)?),
+        OID_OVERLAY_TEXT_3 => eval_overlay_text(&a(0)?, &a(1)?, &a(2)?, None),
+        OID_OVERLAY_TEXT_4 => {
+            let len = a(3)?;
+            eval_overlay_text(&a(0)?, &a(1)?, &a(2)?, Some(&len))
+        }
+        OID_OVERLAY_BYTEA_3 => eval_overlay_bytea(&a(0)?, &a(1)?, &a(2)?, None),
+        OID_OVERLAY_BYTEA_4 => {
+            let len = a(3)?;
+            eval_overlay_bytea(&a(0)?, &a(1)?, &a(2)?, Some(&len))
+        }
+
+        // Integer math. The overflow boundaries are the whole difficulty —
+        // see [`pg_gcd_i64`]'s measured truth table.
+        OID_FACTORIAL => eval_factorial(&a(0)?),
+        OID_GCD_INT4 => eval_gcd_lcm_i32(&a(0)?, &a(1)?, true),
+        OID_LCM_INT4 => eval_gcd_lcm_i32(&a(0)?, &a(1)?, false),
+        OID_GCD_INT8 => eval_gcd_lcm_i64(&a(0)?, &a(1)?, true),
+        OID_LCM_INT8 => eval_gcd_lcm_i64(&a(0)?, &a(1)?, false),
+
+        // `cot` shares `sin`/`cos`/`tan`'s shape exactly, including the part
+        // that is easy to miss: `cot('NaN')` is `NaN` and `cot('Infinity')` is
+        // an ERROR, while `cot(0)` is `Infinity` — not an error, not NULL.
+        // All three measured live.
+        OID_COT_FLOAT8 => {
+            float8_unary_checked(&a(0)?, |x| pg_trig_of_radians(x, |v| 1.0 / f64::tan(v)))
+        }
+        // The six hyperbolics. `f64`'s implementations are the same libm
+        // routines Postgres calls, so these are exact rather than approximate.
+        // `sinh`/`cosh`/`tanh`/`asinh` have no domain to leave — measured
+        // live, `sinh(1e308)` is `Infinity` (not an error), `tanh('Infinity')`
+        // is `1`, and a `NaN` passes straight through — so they need no
+        // checked path at all.
+        OID_SINH_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::sinh,
+        ))),
+        OID_COSH_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::cosh,
+        ))),
+        OID_TANH_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::tanh,
+        ))),
+        OID_ASINH_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
+            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
+            f64::asinh,
+        ))),
+        OID_ACOSH_FLOAT8 => float8_unary_checked(&a(0)?, pg_acosh_f64),
+        OID_ATANH_FLOAT8 => float8_unary_checked(&a(0)?, pg_atanh_f64),
+        // `log10(float8)` and `pow(float8, float8)` are separate `pg_proc`
+        // rows from `log(float8)` (1340) and `power(float8, float8)` (1368),
+        // with identical semantics — Postgres's `log` on `double precision` is
+        // already base 10. Sharing the implementation is therefore exact, not
+        // an approximation.
+        OID_LOG10_FLOAT8 => float8_unary_checked(&a(0)?, pg_log10_f64),
+        OID_POW_FLOAT8 => {
+            let base = a(0)?;
+            let exp = a(1)?;
+            float8_binary_checked(&base, &exp, pg_power_f64)
+        }
+
+        // `make_date`. Year zero is rejected; a negative year is BC.
+        OID_MAKE_DATE => eval_make_date(&a(0)?, &a(1)?, &a(2)?),
 
         other => Err(ExecError::Internal(format!(
             "scalar function oid {other} is not implemented in eval yet — the bridge should \
@@ -4829,6 +5776,38 @@ fn pg_acos_f64(x: f64) -> Result<f64, ExecError> {
     Ok(x.acos())
 }
 
+/// `acosh(double precision)`. Domain is `[1, ∞)`, and leaving it is an ERROR,
+/// not a `NaN`: `acosh(0.5)` raises `input is out of range` on the live server
+/// while `f64::acosh(0.5)` silently returns `NaN`. `acosh(1)` is `0` and
+/// `acosh('Infinity')` is `Infinity`, both measured — so the guard is `x < 1`,
+/// not a two-sided range. `NaN` passes through ahead of the guard, the same
+/// phase-1/phase-2 ordering [`pg_acos_f64`] uses and for the same reason
+/// (`NaN < 1.0` is false, so Postgres needs no explicit branch and neither
+/// would this — the branch is here so the ordering is legible).
+fn pg_acosh_f64(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x < 1.0 {
+        return Err(ExecError::TypeMismatch("input is out of range".to_string()));
+    }
+    Ok(x.acosh())
+}
+
+/// `atanh(double precision)`. Domain is `[-1, 1]`, and the *endpoints are in
+/// it*: `atanh(1)` is `Infinity` and `atanh(-1)` is `-Infinity` (measured
+/// live), while `atanh(2)` raises `input is out of range`. An implementation
+/// that rejects the endpoints alongside the outside is wrong for exactly two
+/// inputs, which is why this reuses [`reject_out_of_trig_domain`]'s inclusive
+/// range rather than an exclusive one.
+fn pg_atanh_f64(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    reject_out_of_trig_domain(x)?;
+    Ok(x.atanh())
+}
+
 /// Shared `[-1, 1]` domain guard for `asin`/`acos`. Callers must have handled
 /// `NaN` before calling: `(-1.0..=1.0).contains(&NaN)` is false, so this
 /// would report a `NaN` as out of range where Postgres returns it unchanged.
@@ -4977,6 +5956,434 @@ fn catalog_op_name(op: OpId) -> Option<&'static str> {
         .iter()
         .find(|sig| sig.oid == op.0)
         .map(|sig| sig.name)
+}
+
+// ─── The string / integer-math orphans ──────────────────────────────────────
+//
+// The non-array half of the DataFusion orphan list (see the `OID_*` block near
+// the top). Same discipline as the array family: every rule below was asked of
+// the live PostgreSQL 18.2, and the ones that surprised are stated.
+
+/// `octet_length(text)` and `bit_length(text)` — byte length, and eight times
+/// it.
+///
+/// Deliberately not [`text_char_length`]: `length('héllo')` is 5 (characters)
+/// while `octet_length('héllo')` is 6 and `bit_length('héllo')` is 48 (bytes,
+/// and bytes×8), all measured live. The two are one function apart and answer
+/// differently for every non-ASCII string, which is why this does not reuse
+/// the character-counting one.
+///
+/// `octet_length(character)` (oid 1375) is NOT implemented — see the "Orphans
+/// deliberately still unimplemented" block for the measured reason.
+fn text_byte_length(arr: &ArrayRef, times_eight: bool) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<StringArray>(arr, "text")?;
+    let out: Int32Array = a
+        .iter()
+        .map(|v| {
+            v.map(|s| {
+                let bytes = i32::try_from(s.len()).expect("string length fits i32");
+                if times_eight {
+                    bytes.saturating_mul(8)
+                } else {
+                    bytes
+                }
+            })
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `octet_length(bytea)` and `bit_length(bytea)`.
+fn bytea_byte_length(arr: &ArrayRef, times_eight: bool) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<BinaryArray>(arr, "bytea")?;
+    let out: Int32Array = a
+        .iter()
+        .map(|v| {
+            v.map(|b| {
+                let bytes = i32::try_from(b.len()).expect("bytea length fits i32");
+                if times_eight {
+                    bytes.saturating_mul(8)
+                } else {
+                    bytes
+                }
+            })
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `starts_with(a, b)`.
+///
+/// `starts_with('abc', '')` and `starts_with('', '')` are both **true**,
+/// measured live — the empty prefix is a prefix of everything, including of
+/// the empty string. Rust's `str::starts_with` agrees, which is why this is a
+/// one-liner and not a hand-rolled loop.
+fn eval_starts_with(a: &ArrayRef, b: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<StringArray>(a, "text")?;
+    let b = downcast_array::<StringArray>(b, "text")?;
+    let out: BooleanArray = a
+        .iter()
+        .zip(b.iter())
+        .map(|(s, p)| match (s, p) {
+            (Some(s), Some(p)) => Some(s.starts_with(p)),
+            _ => None,
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `to_hex(integer)` / `to_hex(bigint)` — hexadecimal in the argument's own
+/// **two's complement**, not a signed rendering.
+///
+/// `to_hex(-1)` is `ffffffff` for `int4` and `ffffffffffffffff` for `int8`,
+/// `to_hex(-2147483648)` is `80000000`, and `to_hex(0)` is `0` — all measured
+/// live. A `format!("{:x}", n)` on the signed value would print `-1`, so the
+/// cast to the unsigned type of the same width is the whole implementation.
+fn eval_to_hex_i32(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Int32Array>(arr, "integer")?;
+    let out: StringArray = a
+        .iter()
+        .map(|v| v.map(|n| format!("{:x}", n as u32)))
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `to_hex(bigint)`. See [`eval_to_hex_i32`].
+fn eval_to_hex_i64(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Int64Array>(arr, "bigint")?;
+    let out: StringArray = a
+        .iter()
+        .map(|v| v.map(|n| format!("{:x}", n as u64)))
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `factorial(bigint) -> numeric`.
+///
+/// `factorial(0)` is 1 and `factorial(-1)` **errors** with "factorial of a
+/// negative number is undefined" (measured live) — it does not return NULL and
+/// it does not return 1.
+///
+/// Postgres's result is an arbitrary-precision `numeric`; Basin's is a
+/// `Decimal128`, whose 38 digits run out at **33!**
+/// (`8683317618811886495518194401280000000`, 37 digits — 34! is 39 digits).
+/// So `factorial(34)` and above error here where PostgreSQL answers. That is
+/// the crate-wide `Decimal128` ceiling `basin_pgtype`'s own docs record
+/// (`DECIMAL128_MAX_PRECISION`), surfaced rather than wrapped: a silently
+/// truncated factorial would be far worse than a refusal. PostgreSQL itself
+/// stops at `factorial(9223372036854775807)` with "value overflows numeric
+/// format", so the *shape* of the two answers agrees, only the threshold
+/// differs.
+fn eval_factorial(arr: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Int64Array>(arr, "bigint")?;
+    let mut out: Vec<Option<i128>> = Vec::with_capacity(a.len());
+    for v in a.iter() {
+        match v {
+            None => out.push(None),
+            Some(n) if n < 0 => {
+                return Err(ExecError::TypeMismatch(
+                    "factorial of a negative number is undefined".to_string(),
+                ))
+            }
+            Some(n) => {
+                let mut acc: i128 = 1;
+                for k in 2..=n {
+                    let k = i128::from(k);
+                    acc = acc
+                        .checked_mul(k)
+                        .filter(|p| p.abs() < DECIMAL128_LIMIT)
+                        .ok_or(ExecError::Overflow("factorial"))?;
+                }
+                out.push(Some(acc));
+            }
+        }
+    }
+    let arr = Decimal128Array::from(out)
+        .with_precision_and_scale(38, 0)
+        .map_err(|e| map_arrow(e, "factorial"))?;
+    Ok(Arc::new(arr))
+}
+
+/// One more than the largest 38-digit value, the ceiling
+/// `DataType::Decimal128(38, 0)` can hold. `i128` itself goes three digits
+/// further (`1.7e38`), so an `i128` overflow check alone would admit values
+/// Arrow then rejects.
+const DECIMAL128_LIMIT: i128 = 100_000_000_000_000_000_000_000_000_000_000_000_000;
+
+/// `gcd(a, b)` for `int4`/`int8`, and `lcm(a, b)` on top of it.
+///
+/// Both follow PostgreSQL's own algorithm, because the *overflow* cases are
+/// where a reimplementation goes wrong and they are not where they look. The
+/// full `int4` truth table over `{0, ±1, 3, INT_MIN, INT_MAX}` was measured
+/// live; the entries that matter:
+///
+/// | call | result |
+/// |---|---|
+/// | `gcd(0, 0)` | 0 |
+/// | `gcd(-12, 18)` | 6 — the result is always non-negative |
+/// | `gcd(INT_MIN, 0)` | **ERROR** integer out of range — the result would be `|INT_MIN|` |
+/// | `gcd(INT_MIN, INT_MIN)` | **ERROR** — same reason |
+/// | `gcd(INT_MIN, 1)` | 1 — no error: the *result* fits |
+/// | `lcm(0, 5)` | 0 |
+/// | `lcm(INT_MIN, 0)` | **0**, NOT an error — the zero test comes FIRST |
+/// | `lcm(INT_MIN, 1)` | **ERROR** — `|INT_MIN|` again |
+/// | `lcm(-4, 6)` | 12 — non-negative |
+///
+/// `lcm(INT_MIN, 0)` is the trap: an implementation that computes the gcd
+/// before checking for zero raises where PostgreSQL answers 0.
+fn pg_gcd_i64(mut a: i64, mut b: i64, width_min: i64) -> Result<i64, ExecError> {
+    while b != 0 {
+        let t = b;
+        // `wrapping_rem`, not `%`: `i64::MIN % -1` *panics* in a debug build
+        // (the quotient overflows even though the remainder does not), and
+        // `gcd(-9223372036854775808, -1)` is a perfectly good `1` on the live
+        // server. The wrapping form yields the mathematically correct 0 here.
+        b = a.wrapping_rem(b);
+        a = t;
+    }
+    if a < 0 {
+        if a == width_min {
+            return Err(ExecError::Overflow("integer"));
+        }
+        a = -a;
+    }
+    Ok(a)
+}
+
+/// See [`pg_gcd_i64`] for the measured truth table, including why the zero
+/// test must precede the gcd.
+fn pg_lcm_i64(a: i64, b: i64, width_min: i64, width_max: i64) -> Result<i64, ExecError> {
+    if a == 0 || b == 0 {
+        return Ok(0);
+    }
+    let g = pg_gcd_i64(a, b, width_min)?;
+    let mut r = (a / g)
+        .checked_mul(b)
+        .ok_or(ExecError::Overflow("integer"))?;
+    if r < 0 {
+        if r == width_min {
+            return Err(ExecError::Overflow("integer"));
+        }
+        r = -r;
+    }
+    if r > width_max {
+        return Err(ExecError::Overflow("integer"));
+    }
+    Ok(r)
+}
+
+/// `gcd`/`lcm` over an `int4` column, computed in `i64` and range-checked back
+/// to `i32` — the `int4` overflow boundary is `i32::MIN`, not `i64::MIN`, so
+/// the width has to be passed in rather than inferred from the accumulator.
+fn eval_gcd_lcm_i32(a: &ArrayRef, b: &ArrayRef, is_gcd: bool) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Int32Array>(a, "integer")?;
+    let b = downcast_array::<Int32Array>(b, "integer")?;
+    let mut out: Vec<Option<i32>> = Vec::with_capacity(a.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        match (x, y) {
+            (Some(x), Some(y)) => {
+                let min = i64::from(i32::MIN);
+                let r = if is_gcd {
+                    pg_gcd_i64(i64::from(x), i64::from(y), min)?
+                } else {
+                    pg_lcm_i64(i64::from(x), i64::from(y), min, i64::from(i32::MAX))?
+                };
+                out.push(Some(
+                    i32::try_from(r).map_err(|_| ExecError::Overflow("integer"))?,
+                ));
+            }
+            _ => out.push(None),
+        }
+    }
+    Ok(Arc::new(Int32Array::from(out)))
+}
+
+/// `gcd`/`lcm` over an `int8` column. See [`pg_gcd_i64`].
+fn eval_gcd_lcm_i64(a: &ArrayRef, b: &ArrayRef, is_gcd: bool) -> Result<ArrayRef, ExecError> {
+    let a = downcast_array::<Int64Array>(a, "bigint")?;
+    let b = downcast_array::<Int64Array>(b, "bigint")?;
+    let mut out: Vec<Option<i64>> = Vec::with_capacity(a.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        match (x, y) {
+            (Some(x), Some(y)) => out.push(Some(if is_gcd {
+                pg_gcd_i64(x, y, i64::MIN)?
+            } else {
+                pg_lcm_i64(x, y, i64::MIN, i64::MAX)?
+            })),
+            _ => out.push(None),
+        }
+    }
+    Ok(Arc::new(Int64Array::from(out)))
+}
+
+/// `overlay(s placing r from start [for len])` — replace a stretch of `s`.
+///
+/// PostgreSQL defines it as, exactly:
+///
+/// ```text
+/// substring(s from 1 for start - 1) || r || substring(s from start + len)
+/// ```
+///
+/// with `len` defaulting to the length of `r`. Implementing it as that
+/// composition rather than as an index-juggling rewrite is what makes the odd
+/// cases fall out for free; all measured live:
+///
+/// | call | result |
+/// |---|---|
+/// | `overlay('abcdef' placing 'XY' from 3)` | `abXYef` |
+/// | `overlay('abcdef' placing 'XY' from 3 for 1)` | `abXYdef` |
+/// | `overlay('abcdef' placing 'XY' from 99)` | `abcdefXY` — past the end APPENDS |
+/// | `overlay('abcdef' placing 'XY' from 3 for -1)` | `abXYbcdef` — a negative `for` does NOT error and DUPLICATES text |
+/// | `overlay('abcdef' placing 'XY' from 0)` | **ERROR** negative substring length not allowed |
+/// | `overlay('abcdef' placing 'XY' from -2)` | **ERROR** — same message, not "negative start" |
+/// | `overlay('abcdef' placing 'XY' from 2147483647)` | **ERROR** integer out of range — `start + len` overflows |
+///
+/// The `for -1` row is the one worth stating: `start + len` moves the tail
+/// *backwards*, so characters appear twice, and Postgres allows it. Only
+/// `start <= 0` and an overflowing `start + len` are rejected.
+fn pg_overlay_bounds(start: i32, len: i32) -> Result<(i64, i64), ExecError> {
+    if start <= 0 {
+        return Err(ExecError::TypeMismatch(
+            "negative substring length not allowed".to_string(),
+        ));
+    }
+    let tail = start
+        .checked_add(len)
+        .ok_or(ExecError::Overflow("integer"))?;
+    Ok((i64::from(start), i64::from(tail)))
+}
+
+/// `overlay(text, text, integer [, integer])`. See [`pg_overlay_bounds`].
+fn eval_overlay_text(
+    s: &ArrayRef,
+    r: &ArrayRef,
+    start: &ArrayRef,
+    len: Option<&ArrayRef>,
+) -> Result<ArrayRef, ExecError> {
+    let s = downcast_array::<StringArray>(s, "text")?;
+    let r = downcast_array::<StringArray>(r, "text")?;
+    let start = downcast_array::<Int32Array>(start, "integer")?;
+    let len = match len {
+        None => None,
+        Some(l) => Some(downcast_array::<Int32Array>(l, "integer")?.clone()),
+    };
+    let mut out: Vec<Option<String>> = Vec::with_capacity(s.len());
+    for i in 0..s.len() {
+        let explicit_len_null = len.as_ref().is_some_and(|l| l.is_null(i));
+        if s.is_null(i) || r.is_null(i) || start.is_null(i) || explicit_len_null {
+            out.push(None);
+            continue;
+        }
+        let replacement = r.value(i);
+        let sl = match len.as_ref() {
+            Some(l) => l.value(i),
+            None => i32::try_from(replacement.chars().count())
+                .map_err(|_| ExecError::Overflow("integer"))?,
+        };
+        let (sp, tail) = pg_overlay_bounds(start.value(i), sl)?;
+        let head = pg_substr(s.value(i), 1, Some(sp - 1));
+        let rest = pg_substr(s.value(i), tail, None);
+        out.push(Some(format!("{head}{replacement}{rest}")));
+    }
+    Ok(Arc::new(StringArray::from(out)))
+}
+
+/// `overlay(bytea, bytea, integer [, integer])` — the same definition over
+/// bytes rather than characters.
+fn eval_overlay_bytea(
+    s: &ArrayRef,
+    r: &ArrayRef,
+    start: &ArrayRef,
+    len: Option<&ArrayRef>,
+) -> Result<ArrayRef, ExecError> {
+    let s = downcast_array::<BinaryArray>(s, "bytea")?;
+    let r = downcast_array::<BinaryArray>(r, "bytea")?;
+    let start = downcast_array::<Int32Array>(start, "integer")?;
+    let len = match len {
+        None => None,
+        Some(l) => Some(downcast_array::<Int32Array>(l, "integer")?.clone()),
+    };
+    let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(s.len());
+    for i in 0..s.len() {
+        let explicit_len_null = len.as_ref().is_some_and(|l| l.is_null(i));
+        if s.is_null(i) || r.is_null(i) || start.is_null(i) || explicit_len_null {
+            out.push(None);
+            continue;
+        }
+        let replacement = r.value(i);
+        let sl = match len.as_ref() {
+            Some(l) => l.value(i),
+            None => i32::try_from(replacement.len()).map_err(|_| ExecError::Overflow("integer"))?,
+        };
+        let (sp, tail) = pg_overlay_bounds(start.value(i), sl)?;
+        let bytes = s.value(i);
+        let n = bytes.len() as i64;
+        let head_end = (sp - 1).clamp(0, n) as usize;
+        let tail_start = (tail - 1).clamp(0, n) as usize;
+        let mut buf = Vec::with_capacity(head_end + replacement.len() + (n as usize - tail_start));
+        buf.extend_from_slice(&bytes[..head_end]);
+        buf.extend_from_slice(replacement);
+        buf.extend_from_slice(&bytes[tail_start..]);
+        out.push(Some(buf));
+    }
+    Ok(Arc::new(BinaryArray::from_iter(out.iter().map(
+        |v| v.as_deref(),
+    ))))
+}
+
+/// `make_date(year, month, day) -> date`.
+///
+/// Rejects what Postgres rejects, with Postgres's own message: a day the month
+/// does not have (`make_date(2024, 2, 30)` → `date field value out of range:
+/// 2024-02-30`, measured live) and **year zero** (`make_date(0, 1, 1)` →
+/// the same message), which has no proleptic-Gregorian meaning in Postgres.
+/// A negative year is BC and is accepted: `make_date(-1, 1, 1)` is
+/// `0001-01-01 BC`.
+///
+/// The BC handling is the reason this converts through `chrono`'s
+/// astronomical year numbering rather than treating the year as-is: Postgres's
+/// year `-1` is chrono's year `0` (there is no year 0 in Postgres, so every BC
+/// year shifts by one), and getting that wrong is a one-year error nothing
+/// downstream would catch.
+fn eval_make_date(
+    year: &ArrayRef,
+    month: &ArrayRef,
+    day: &ArrayRef,
+) -> Result<ArrayRef, ExecError> {
+    let y = downcast_array::<Int32Array>(year, "integer")?;
+    let m = downcast_array::<Int32Array>(month, "integer")?;
+    let d = downcast_array::<Int32Array>(day, "integer")?;
+    let mut out: Vec<Option<i32>> = Vec::with_capacity(y.len());
+    for i in 0..y.len() {
+        if y.is_null(i) || m.is_null(i) || d.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let (year, month, day) = (y.value(i), m.value(i), d.value(i));
+        let bad = || {
+            ExecError::TypeMismatch(format!(
+                "date field value out of range: {year}-{month:02}-{day:02}"
+            ))
+        };
+        if year == 0 {
+            return Err(bad());
+        }
+        // Postgres has no year 0: its -1 is chrono's 0, -2 is chrono's -1, …
+        let astronomical = if year < 0 { year + 1 } else { year };
+        let date = NaiveDate::from_ymd_opt(
+            astronomical,
+            u32::try_from(month).map_err(|_| bad())?,
+            u32::try_from(day).map_err(|_| bad())?,
+        )
+        .ok_or_else(bad)?;
+        let days = date
+            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is a date"))
+            .num_days();
+        out.push(Some(
+            i32::try_from(days).map_err(|_| ExecError::Overflow("date"))?,
+        ));
+    }
+    Ok(Arc::new(Date32Array::from(out)))
 }
 
 fn require_bool(array: &ArrayRef) -> Result<&BooleanArray, ExecError> {
