@@ -21,26 +21,34 @@
 //! for this file is **79**. §"Census method" below states how that was
 //! obtained and where it is still a floor.
 //!
-//! # THESE TESTS ARE EXPECTED TO FAIL TODAY
+//! # THIS TEST IS EXPECTED TO FAIL UNTIL THE RE-HOSTING TRANCHE LANDS
 //!
-//! Every function here is unimplemented in `basin-exec`. A red run is the
-//! correct state, not a broken harness. The output is written to be read as a
-//! **work queue** for the re-hosting tranche: for each function it prints the
-//! resolution status, the input, what PostgreSQL 18.2 returned, and what Basin
-//! did — and it distinguishes three different kinds of "does not work":
+//! A red run is the correct state, not a broken harness — but it is no longer
+//! true that *every* function here is unimplemented, and this heading used to
+//! say so. The output is written to be read as a **work queue**: for each
+//! function it prints the resolution status, the input, what PostgreSQL 18.2
+//! returned, and what Basin did — and it distinguishes four states:
 //!
 //!   * `UNRESOLVABLE` — `basin_pgtype::func::resolve()` does not know the
 //!     name/signature at all, so the owned planner cannot even *build* the
-//!     call. 73 of the 79 are in this state: the gap is a missing `pg_proc`
-//!     row *plus* a missing implementation, and the row has to come first.
+//!     call. The gap is a missing `pg_proc` row *plus* a missing
+//!     implementation, and the row has to come first.
 //!   * `UNIMPLEMENTED` — the name resolves to a real OID, but
-//!     `eval_scalar_fn`'s `match` has no arm, so every call errors. 6 are
-//!     here (`concat_ws`, `date_part`, `date_trunc`, `now`, `position`,
-//!     `substring` — `basin-pgtype`'s `FUNCS` already carries their rows).
+//!     `eval_scalar_fn`'s `match` has no arm, so every call errors.
 //!   * `DIVERGENT` — implemented, executes, returns a different answer from
-//!     PostgreSQL. Nothing is in this state yet. Entries will move here as the
-//!     tranche lands, and moving from DIVERGENT to matching is the real
-//!     finish line, not moving out of UNRESOLVABLE.
+//!     PostgreSQL. Moving from DIVERGENT to matching is the real finish line,
+//!     not moving out of UNRESOLVABLE.
+//!   * `MATCHES` — done.
+//!
+//! **How many are in each state is deliberately not written here.** It was
+//! once — "73 of the 79 are in this state", "6 are here", "nothing is
+//! DIVERGENT yet" — and all three went stale the moment a tranche landed,
+//! while still reading as fact. The run prints the current split in its
+//! banner every time, measured from the tables below; a number in a doc
+//! comment can only ever be a claim about a day that has passed. The same
+//! mistake in this file's aggregate section (a hardcoded "cannot be
+//! constructed") hid 25 working functions from the acceptance criterion for
+//! months — see §"What is executed here".
 //!
 //! # Census method, and exactly where it is a floor
 //!
@@ -136,14 +144,26 @@
 //!
 //! # What is executed here, and what is only probed
 //!
-//! `eval()` evaluates **scalar** expressions. Aggregates and window functions
-//! live in `aggregate.rs`'s `AggFunc` and `window.rs`'s `WindowFunc`, which
-//! are closed enums with no variant for any of the 29 aggregate/window
-//! orphans — they cannot be *constructed*, so there is nothing to call. Those
-//! are therefore probed at the resolution layer only, and their PostgreSQL
-//! answer over a fixed dataset is captured so the work queue carries the value
-//! the implementation has to produce. That asymmetry is deliberate and is
-//! reported, not hidden: see `AGG_ORPHANS`.
+//! `eval()` evaluates **scalar** expressions, so the scalar orphans are
+//! called through it directly. Aggregates and window functions cannot be:
+//! they live in `aggregate.rs`'s `AggFunc` and `window.rs`'s `WindowFunc`,
+//! reachable only through `build.rs`'s private `agg_func_of`/`window_func_of`
+//! OID tables. Those 26 are therefore probed by **building and executing a
+//! real `LogicalPlan`** carrying the `pg_proc` OID — the same path the engine
+//! takes — over a fixed dataset, and comparing the result with the live
+//! server. See `AGG_ORPHANS` and the probe section beneath it.
+//!
+//! Until 2026-08-14 this file did something else: it printed the fixed
+//! sentence *"aggregate.rs's AggFunc enum has no variant — cannot be
+//! constructed"* for all 26. That was a hardcoded claim, not a measurement,
+//! and it had been false since commit `f42fc38f` for **25 of the 26** —
+//! `bool_and`/`bool_or`, the `stddev`/`var` families, `corr`,
+//! `covar_pop`/`covar_samp`, all nine `regr_*`, `bit_and`/`bit_or`/`bit_xor`,
+//! `cume_dist`, `percent_rank` and `ntile` all map to real variants today and
+//! all reproduce PostgreSQL. Twenty-five functions the acceptance criterion
+//! for DataFusion's removal could not see. Only `percentile_cont` (3974) is
+//! genuinely unbuildable, and now says so in `build.rs`'s own words rather
+//! than in this file's.
 //!
 //! # The batteries
 //!
@@ -208,12 +228,14 @@
 //! Value, NULL-ness and error-vs-success, as in `function_equivalence.rs`,
 //! with one deliberate difference. `function_equivalence.rs` treats
 //! ERROR-on-both-sides as a match; this file does not, when Basin's error is
-//! *absence* rather than input rejection. Every function here errors for every
-//! input today, so counting those pairs as matches would credit Basin with
-//! agreeing that `overlay('abcdef' PLACING 'XY' FROM 0)` is invalid when it
-//! has no `overlay` at all. The result is that the failing count equals the
-//! total call-site count until real implementations land — which is the honest
-//! reading of "nothing here is verified".
+//! *absence* rather than input rejection. For a function Basin does not have,
+//! counting those pairs as matches would credit it with agreeing that
+//! `overlay('abcdef' PLACING 'XY' FROM 0)` is invalid when it has no
+//! `overlay` at all — so an absent function's failing count equals its
+//! call-site count, which is the honest reading of "nothing here is
+//! verified". Once a function lands, its ERROR/ERROR pairs become real
+//! agreement and stop counting. `is_absence` is the predicate that decides
+//! which of the two a given error is.
 //! Floats compare with a `1e-9` relative epsilon; `numeric` compares by value
 //! after stripping trailing fractional zeros; arrays compare element-wise as
 //! text (never as PostgreSQL's `{…}` literal, whose quoting rules are their
@@ -221,14 +243,27 @@
 //!
 //! # Rendering self-check
 //!
-//! Basin returns an error for every function here today, so the Basin-side
-//! renderers (Date32, Timestamp, Interval, List, Binary) would otherwise be
-//! dead code that nobody has ever seen produce a right answer — and would
-//! start producing *false* divergences the day the first function lands.
-//! `render_self_check()` therefore builds each of those arrow types by hand
-//! from the battery's own constants and diffs the rendering against the live
-//! server's text for the same literal, before any function is tested. It
-//! fails the run loudly if the harness itself is wrong.
+//! The Basin-side renderers would otherwise be code that nobody has ever seen
+//! produce a right answer — and would start producing *false* divergences the
+//! day a function lands. `render_self_check()` therefore builds each arrow
+//! type by hand and diffs the rendering against the live server's text for
+//! the same literal, before any function is tested. It fails the run loudly
+//! if the harness itself is wrong.
+//!
+//! It did not always cover enough, and both gaps produced exactly the
+//! manufactured divergences it exists to prevent. It covered `Date32` but not
+//! the **BC era branch** (`date_battery` stops at `0001-01-01`, while
+//! `make_date(-1, 3, 10)` reaches astronomical year 0), and it did not cover
+//! **booleans at all** until `starts_with` became the first
+//! boolean-returning function to reach the battery — 27 cases where Basin's
+//! value was right and this file's renderer was wrong. The check now walks
+//! *every* arm of `render_cell`, not only the arms some battery value
+//! happens to reach, and asks the server through the same `(…)::text`
+//! wrapper the comparison itself uses, so the renderer and the query cannot
+//! drift apart. The arrow types that still have no arm are enumerated in the
+//! check rather than left implicit; none of them is reachable from
+//! `basin_pgtype::physical` today, and `render_cell`'s final arm turns a
+//! surprise into a loud error rather than a wrong answer.
 //!
 //! # Skip behavior
 //!
@@ -249,9 +284,17 @@ use arrow_array::{
     StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+// `build` is how an aggregate/window OID becomes an `AggFunc`/`WindowFunc`:
+// `agg_func_of` and `window_func_of` are private to that module, so the only
+// way to ask "can Basin construct this call" is to hand the real production
+// path a real plan. See the AGG_ORPHANS probe section.
+use basin_exec::build::{build, MemTableResolver};
 use basin_exec::eval::eval;
-use basin_pgtype::Oid;
-use basin_plan::{ColumnRef, Expr, FuncId};
+use basin_pgtype::{Oid, PgType};
+use basin_plan::{
+    ColId, ColumnRef, Datum, Expr, FrameBound, FrameUnits, FuncId, LogicalPlan, SnapshotId,
+    SortKey, TableId, WindowFrame,
+};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::Client;
 
@@ -944,9 +987,26 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Postgres prints dates at or before astronomical year 0 with a `BC` era
+/// suffix and a *proleptic* year number, not a negative one: astronomical
+/// year 0 **is** 1 BC, astronomical -1 is 2 BC, and the minimum date
+/// `4713-01-01 BC` is astronomical -4712. Verified live:
+/// `SELECT ('0001-03-10 BC'::date)::text` is `0001-03-10 BC`.
+///
+/// This branch is not decoration. `make_date(-1, 3, 10)` is legal input —
+/// a negative year argument means BC — and the server answers
+/// `0001-03-10 BC`, day -719459, astronomical year 0. Basin stored exactly
+/// that `Date32`; without the suffix this function rendered it
+/// `0000-03-10`, disagreed with the server, and reported a divergence that
+/// existed only in this file. [`render_self_check`] now covers the branch —
+/// `date_battery` contains no BC date, which is exactly how it got through.
 fn fmt_date(days: i32) -> String {
     let (y, m, d) = civil_from_days(days as i64);
-    format!("{y:04}-{m:02}-{d:02}")
+    if y <= 0 {
+        format!("{:04}-{m:02}-{d:02} BC", 1 - y)
+    } else {
+        format!("{y:04}-{m:02}-{d:02}")
+    }
 }
 
 /// Micros since epoch → Postgres's `timestamp` text form, including its
@@ -964,6 +1024,12 @@ fn fmt_timestamp(micros: i64) -> String {
     let secs = rem / 1_000_000;
     let frac = rem % 1_000_000;
     let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    // Same era rule as `fmt_date`, applied here too. No value in `ts_battery`
+    // reaches it today, so unlike the date branch this one is a guard rather
+    // than a fix for an observed divergence — but `date_trunc('millennium',
+    // …)` is in this file's work queue and the day it lands the input space
+    // is one subtraction away from year 0. Covered by `render_self_check`.
+    let (y, era) = if y <= 0 { (1 - y, " BC") } else { (y, "") };
     let mut out = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
     if frac != 0 {
         let mut f = format!("{frac:06}");
@@ -973,6 +1039,9 @@ fn fmt_timestamp(micros: i64) -> String {
         out.push('.');
         out.push_str(&f);
     }
+    // After the fraction, not before it: Postgres prints
+    // `0001-01-01 00:00:00.5 BC`.
+    out.push_str(era);
     out
 }
 
@@ -1031,8 +1100,22 @@ fn render_cell(arr: &dyn Array, i: usize) -> Result<Option<String>, String> {
         return Ok(None);
     }
     let any = arr.as_any();
+    // `true`/`false`, NOT `t`/`f`. Postgres has two different text forms for
+    // a boolean and this harness compares against exactly one of them: the
+    // wire/psql form produced by `boolout` is `t`/`f` (verified live:
+    // `SELECT starts_with('abc','a')` prints `t`), but every boolean case
+    // here reaches the server through `pg_sql`'s `SELECT (…)::text` wrapper,
+    // and the `bool → text` *cast* spells it `true`/`false` (verified live:
+    // `SELECT (starts_with('abc','a'))::text` is `true`). Rendering `f`
+    // against a Postgres side that says `false` is a divergence manufactured
+    // by this file; `starts_with` was the first boolean-returning function to
+    // reach the battery and 27 of its cases failed for exactly that reason
+    // while Basin's computed values were right. If `pg_sql`'s `RetKind::Bool`
+    // arm ever stops casting to text, this arm has to change with it —
+    // `render_self_check` asks the server for both booleans through the same
+    // wrapper, so the two cannot drift apart silently.
     if let Some(a) = any.downcast_ref::<BooleanArray>() {
-        return Ok(Some(if a.value(i) { "t" } else { "f" }.to_string()));
+        return Ok(Some(if a.value(i) { "true" } else { "false" }.to_string()));
     }
     if let Some(a) = any.downcast_ref::<StringArray>() {
         return Ok(Some(a.value(i).to_string()));
@@ -1046,8 +1129,27 @@ fn render_cell(arr: &dyn Array, i: usize) -> Result<Option<String>, String> {
     if let Some(a) = any.downcast_ref::<Int64Array>() {
         return Ok(Some(a.value(i).to_string()));
     }
+    // Rust's `f64` Display spells the infinities `inf`/`-inf`; Postgres
+    // spells them `Infinity`/`-Infinity` (verified live, both as `::text` and
+    // as an element of a `float8[]`). `NaN` happens to agree. Scalar float8
+    // results dodge this arm entirely — `extract_basin`'s `RetKind::Float`
+    // compares `f64` to `f64` — but an *element* of a `float8[]` does not,
+    // and neither does the aggregate probe, which renders before it parses.
+    // Found by audit rather than by a failing case: nothing in the battery
+    // returns an infinite float today. It is here because "the renderer is
+    // right only for the inputs someone happened to try" is the exact defect
+    // this file just spent a commit removing.
     if let Some(a) = any.downcast_ref::<Float64Array>() {
-        return Ok(Some(format!("{}", a.value(i))));
+        let v = a.value(i);
+        return Ok(Some(if v.is_infinite() {
+            if v.is_sign_negative() {
+                "-Infinity".to_string()
+            } else {
+                "Infinity".to_string()
+            }
+        } else {
+            format!("{v}")
+        }));
     }
     if let Some(a) = any.downcast_ref::<Decimal128Array>() {
         return Ok(Some(normalize_numeric(&fmt_decimal(
@@ -2287,76 +2389,411 @@ struct AggSpec {
     oid: u32,
     arg_types: Option<&'static [u32]>,
     kind: &'static str,
-    /// A complete statement returning one text column.
+    /// A complete statement returning one text column. For a window function
+    /// that is one `string_agg` of the per-row results in `ORDER BY` order;
+    /// [`split_agg_text`] takes both sides apart the same way.
     pg_sql: &'static str,
+    /// The dataset [`pg_sql`](AggSpec::pg_sql)'s `VALUES` list spells, in the
+    /// form the Basin side is fed.
+    data: AggData,
+    /// The call shape to build for Basin.
+    probe: AggProbe,
+    /// How the probe's cells compare — [`RetKind::Float`] uses the same
+    /// `1e-9` relative epsilon as the scalar float path, everything else is
+    /// exact text.
+    ret: RetKind,
 }
+
+/// The dataset an aggregate or window orphan is probed over.
+///
+/// Written out twice on purpose — as this enum for Basin and as the `VALUES`
+/// list inside [`AggSpec::pg_sql`] for the server — because there is no way
+/// to derive one from the other that does not amount to this harness
+/// deciding what PostgreSQL was asked. The seam is safe in the direction
+/// that matters: two different datasets produce two different answers, and
+/// the probe prints both, so a transcription slip surfaces as a loud
+/// mismatch rather than a silent pass. It cannot tell you *which* side is
+/// wrong, which is why a run in which all of these MATCH is the evidence
+/// that they agree.
+#[derive(Clone, Copy)]
+enum AggData {
+    /// One nullable `boolean` column, `t(b)`.
+    Bool(&'static [Option<bool>]),
+    /// One nullable `float8` column, `t(x)`.
+    F8(&'static [Option<f64>]),
+    /// Two nullable `float8` columns, `t(x, y)` — `x` first, matching the
+    /// `t(x,y)` alias list in the SQL.
+    F8Pair(&'static [Option<f64>], &'static [Option<f64>]),
+    /// One nullable `int4` column, `t(x)`.
+    I4(&'static [Option<i32>]),
+}
+
+/// The call shape to build for the Basin side of an aggregate/window probe.
+#[derive(Clone, Copy)]
+enum AggProbe {
+    /// `f(x)` over the single data column.
+    One,
+    /// `f(y, x)` — the `regr_*`/`corr`/`covar_*` family, whose FIRST SQL
+    /// argument is the dependent variable Y (data column 1) and whose second
+    /// is X (data column 0). Passing them the other way round is not a
+    /// fallback but a different, plausible-looking number, so the order here
+    /// mirrors the SQL exactly.
+    Pair,
+    /// `f() OVER (ORDER BY x)` — a niladic ranking window function.
+    Window,
+    /// `ntile(n) OVER (ORDER BY x)`.
+    Ntile(i32),
+    /// `f(fraction) WITHIN GROUP (ORDER BY x)` — the ordered-set shape.
+    WithinGroup(f64),
+}
+
+const BOOL_ROWS: &[Option<bool>] = &[Some(true), Some(false), None];
+const F8_ROWS: &[Option<f64>] = &[Some(1.0), Some(2.0), Some(4.0), None];
+const F8_X: &[Option<f64>] = &[Some(1.0), Some(2.0), Some(4.0), None];
+const F8_Y: &[Option<f64>] = &[Some(10.0), Some(20.0), Some(25.0), None];
+const I4_ROWS: &[Option<i32>] = &[Some(12), Some(10), None];
+const WIN_ROWS: &[Option<i32>] = &[Some(1), Some(2), Some(2), Some(4)];
+const NTILE_ROWS: &[Option<i32>] = &[Some(1), Some(2), Some(3), Some(4), Some(5)];
 
 const AGG_ORPHANS: &[AggSpec] = &[
     AggSpec { name: "bool_and", oid: 2517, arg_types: Some(&[16]), kind: "aggregate",
-        pg_sql: "SELECT bool_and(b)::text FROM (VALUES (true),(false),(NULL)) t(b)" },
+        pg_sql: "SELECT bool_and(b)::text FROM (VALUES (true),(false),(NULL)) t(b)",
+        data: AggData::Bool(BOOL_ROWS), probe: AggProbe::One, ret: RetKind::Bool },
     AggSpec { name: "bool_or", oid: 2518, arg_types: Some(&[16]), kind: "aggregate",
-        pg_sql: "SELECT bool_or(b)::text FROM (VALUES (true),(false),(NULL)) t(b)" },
+        pg_sql: "SELECT bool_or(b)::text FROM (VALUES (true),(false),(NULL)) t(b)",
+        data: AggData::Bool(BOOL_ROWS), probe: AggProbe::One, ret: RetKind::Bool },
     AggSpec { name: "stddev", oid: 2158, arg_types: Some(&[F8]), kind: "aggregate",
-        pg_sql: "SELECT stddev(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)" },
+        pg_sql: "SELECT stddev(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)",
+        data: AggData::F8(F8_ROWS), probe: AggProbe::One, ret: RetKind::Float },
     AggSpec { name: "stddev_pop", oid: 2728, arg_types: Some(&[F8]), kind: "aggregate",
-        pg_sql: "SELECT stddev_pop(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)" },
+        pg_sql: "SELECT stddev_pop(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)",
+        data: AggData::F8(F8_ROWS), probe: AggProbe::One, ret: RetKind::Float },
     AggSpec { name: "stddev_samp", oid: 2716, arg_types: Some(&[F8]), kind: "aggregate",
-        pg_sql: "SELECT stddev_samp(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)" },
+        pg_sql: "SELECT stddev_samp(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)",
+        data: AggData::F8(F8_ROWS), probe: AggProbe::One, ret: RetKind::Float },
     AggSpec { name: "var_pop", oid: 2722, arg_types: Some(&[F8]), kind: "aggregate",
-        pg_sql: "SELECT var_pop(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)" },
+        pg_sql: "SELECT var_pop(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)",
+        data: AggData::F8(F8_ROWS), probe: AggProbe::One, ret: RetKind::Float },
     AggSpec { name: "var_samp", oid: 2645, arg_types: Some(&[F8]), kind: "aggregate",
-        pg_sql: "SELECT var_samp(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)" },
+        pg_sql: "SELECT var_samp(x)::text FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)",
+        data: AggData::F8(F8_ROWS), probe: AggProbe::One, ret: RetKind::Float },
     AggSpec { name: "corr", oid: 2829, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT corr(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT corr(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "covar_pop", oid: 2827, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT covar_pop(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT covar_pop(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "covar_samp", oid: 2828, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT covar_samp(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT covar_samp(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "regr_slope", oid: 2825, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_slope(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_slope(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "regr_intercept", oid: 2826, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_intercept(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_intercept(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "regr_count", oid: 2818, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_count(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_count(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Int },
     AggSpec { name: "regr_r2", oid: 2824, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_r2(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_r2(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "regr_avgx", oid: 2822, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_avgx(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_avgx(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "regr_avgy", oid: 2823, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_avgy(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_avgy(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "regr_sxx", oid: 2819, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_sxx(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_sxx(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "regr_syy", oid: 2820, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_syy(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_syy(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "regr_sxy", oid: 2821, arg_types: Some(&[F8, F8]), kind: "aggregate",
-        pg_sql: "SELECT regr_sxy(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)" },
+        pg_sql: "SELECT regr_sxy(y, x)::text FROM (VALUES (1::float8,10::float8),(2,20),(4,25),(NULL,NULL)) t(x,y)",
+        data: AggData::F8Pair(F8_X, F8_Y), probe: AggProbe::Pair, ret: RetKind::Float },
     AggSpec { name: "bit_and", oid: 2238, arg_types: Some(&[I4]), kind: "aggregate",
-        pg_sql: "SELECT bit_and(x)::text FROM (VALUES (12),(10),(NULL)) t(x)" },
+        pg_sql: "SELECT bit_and(x)::text FROM (VALUES (12),(10),(NULL)) t(x)",
+        data: AggData::I4(I4_ROWS), probe: AggProbe::One, ret: RetKind::Int },
     AggSpec { name: "bit_or", oid: 2239, arg_types: Some(&[I4]), kind: "aggregate",
-        pg_sql: "SELECT bit_or(x)::text FROM (VALUES (12),(10),(NULL)) t(x)" },
+        pg_sql: "SELECT bit_or(x)::text FROM (VALUES (12),(10),(NULL)) t(x)",
+        data: AggData::I4(I4_ROWS), probe: AggProbe::One, ret: RetKind::Int },
     AggSpec { name: "bit_xor", oid: 6165, arg_types: Some(&[I4]), kind: "aggregate",
-        pg_sql: "SELECT bit_xor(x)::text FROM (VALUES (12),(10),(NULL)) t(x)" },
+        pg_sql: "SELECT bit_xor(x)::text FROM (VALUES (12),(10),(NULL)) t(x)",
+        data: AggData::I4(I4_ROWS), probe: AggProbe::One, ret: RetKind::Int },
     // The shape trap: PostgreSQL's percentile_cont is an ORDERED-SET
     // aggregate — `percentile_cont(f) WITHIN GROUP (ORDER BY x)` — while
     // DataFusion's is a plain two-argument aggregate. Re-hosting it as
     // `percentile_cont(f, x)` would be a different function with the same
-    // name. The SQL below is the Postgres spelling, deliberately.
+    // name. The SQL below is the Postgres spelling, deliberately, and so is
+    // the plan the probe builds: `order_by` non-empty on the aggregate
+    // expression. What comes back from `build.rs` for that plan is the
+    // measured answer to "can Basin construct this", printed verbatim.
     AggSpec { name: "percentile_cont", oid: 3974, arg_types: None, kind: "ordered-set aggregate",
         pg_sql: "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x)::text \
-                 FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)" },
+                 FROM (VALUES (1::float8),(2),(4),(NULL)) t(x)",
+        data: AggData::F8(F8_ROWS), probe: AggProbe::WithinGroup(0.5), ret: RetKind::Float },
     AggSpec { name: "cume_dist", oid: 3104, arg_types: Some(&[]), kind: "window",
         pg_sql: "SELECT string_agg(cd::text, ',' ORDER BY x) FROM \
                  (SELECT x, cume_dist() OVER (ORDER BY x) cd \
-                  FROM (VALUES (1),(2),(2),(4)) t(x)) s" },
+                  FROM (VALUES (1),(2),(2),(4)) t(x)) s",
+        data: AggData::I4(WIN_ROWS), probe: AggProbe::Window, ret: RetKind::Float },
     AggSpec { name: "percent_rank", oid: 3103, arg_types: Some(&[]), kind: "window",
         pg_sql: "SELECT string_agg(pr::text, ',' ORDER BY x) FROM \
                  (SELECT x, percent_rank() OVER (ORDER BY x) pr \
-                  FROM (VALUES (1),(2),(2),(4)) t(x)) s" },
+                  FROM (VALUES (1),(2),(2),(4)) t(x)) s",
+        data: AggData::I4(WIN_ROWS), probe: AggProbe::Window, ret: RetKind::Float },
     AggSpec { name: "ntile", oid: 3105, arg_types: Some(&[I4]), kind: "window",
         pg_sql: "SELECT string_agg(n::text, ',' ORDER BY x) FROM \
                  (SELECT x, ntile(3) OVER (ORDER BY x) n \
-                  FROM (VALUES (1),(2),(3),(4),(5)) t(x)) s" },
+                  FROM (VALUES (1),(2),(3),(4),(5)) t(x)) s",
+        data: AggData::I4(NTILE_ROWS), probe: AggProbe::Ntile(3), ret: RetKind::Int },
 ];
+
+// ─────────────────────────────────────────────────────────────────────────
+// Probing an aggregate / window orphan
+//
+// This file used to print, for all 26 names above, the fixed sentence
+// "basin: aggregate.rs's AggFunc enum has no variant — cannot be
+// constructed". That sentence was a hardcoded string, not a measurement, and
+// it went stale at commit f42fc38f: `build.rs`'s `agg_func_of` and
+// `window_func_of` now map 25 of the 26 oids onto real variants, and
+// `crates/basin-exec/tests/statistical_aggregates.rs` already diffs those
+// implementations against a live server. So the acceptance criterion for
+// DataFusion's removal was asserting that 25 functions could not be built
+// while they were, in fact, both built and correct — 25 functions invisible
+// to the measurement that decides whether removal is safe.
+//
+// What replaces it goes through the real production path rather than around
+// it: a `LogicalPlan` carrying the `pg_proc` OID, handed to
+// `basin_exec::build::build`, which is the only code that turns an OID into
+// an `AggFunc`/`WindowFunc`. `agg_func_of` and `window_func_of` are private,
+// so this is not merely the honest route, it is the only one — and it is the
+// better one anyway, because it measures the whole chain the engine uses
+// (OID → variant → operator → arrow output) instead of one table lookup.
+// "Cannot be constructed" is now whatever `BuildError` that path returns,
+// quoted verbatim, or it is not said at all.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The probe's input batch, with column names matching the `t(…)` alias list
+/// in [`AggSpec::pg_sql`].
+fn agg_batch(data: AggData) -> Result<(Arc<Schema>, RecordBatch), String> {
+    let (fields, cols): (Vec<Field>, Vec<ArrayRef>) = match data {
+        AggData::Bool(v) => (
+            vec![Field::new("b", DataType::Boolean, true)],
+            vec![Arc::new(BooleanArray::from(v.to_vec())) as ArrayRef],
+        ),
+        AggData::F8(v) => (
+            vec![Field::new("x", DataType::Float64, true)],
+            vec![Arc::new(Float64Array::from(v.to_vec())) as ArrayRef],
+        ),
+        AggData::F8Pair(x, y) => (
+            vec![
+                Field::new("x", DataType::Float64, true),
+                Field::new("y", DataType::Float64, true),
+            ],
+            vec![
+                Arc::new(Float64Array::from(x.to_vec())) as ArrayRef,
+                Arc::new(Float64Array::from(y.to_vec())) as ArrayRef,
+            ],
+        ),
+        AggData::I4(v) => (
+            vec![Field::new("x", DataType::Int32, true)],
+            vec![Arc::new(Int32Array::from(v.to_vec())) as ArrayRef],
+        ),
+    };
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), cols)
+        .map_err(|e| format!("harness could not build the probe's input batch: {e}"))?;
+    Ok((schema, batch))
+}
+
+fn probe_col(index: u16, name: &str) -> Expr {
+    Expr::Column(ColumnRef {
+        relation: 0,
+        index,
+        name: name.to_string(),
+    })
+}
+
+/// The `t(…)` alias list of [`AggSpec::pg_sql`], in column order. Carried so
+/// the plan's `ColumnRef::name`s read the same as the SQL's do; only the
+/// index is load-bearing.
+fn data_col_names(d: AggData) -> &'static [&'static str] {
+    match d {
+        AggData::Bool(_) => &["b"],
+        AggData::F8(_) | AggData::I4(_) => &["x"],
+        AggData::F8Pair(_, _) => &["x", "y"],
+    }
+}
+
+/// The plan whose build is the measurement. Ranking window functions ignore
+/// the frame, but a `WindowFrame` is not optional in the IR, so this uses
+/// PostgreSQL's own default — `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+/// ROW`.
+fn agg_plan(spec: &AggSpec, ncols: usize) -> LogicalPlan {
+    let names = data_col_names(spec.data);
+    let scan = LogicalPlan::Scan {
+        table: TableId(1),
+        projection: (0..ncols as u16).map(ColId).collect(),
+        filters: vec![],
+        snapshot: SnapshotId(0),
+    };
+    let order_by = vec![SortKey {
+        expr: probe_col(0, names[0]),
+        descending: false,
+        nulls_first: false,
+    }];
+    let func = FuncId(Oid(spec.oid));
+    let agg = |args, order_by| LogicalPlan::Aggregate {
+        input: Box::new(scan.clone()),
+        group: vec![],
+        aggs: vec![Expr::Aggregate {
+            func,
+            args,
+            distinct: false,
+            filter: None,
+            order_by,
+        }],
+        grouping_sets: None,
+    };
+    let win = |args| LogicalPlan::Window {
+        input: Box::new(scan.clone()),
+        windows: vec![Expr::Window {
+            func,
+            args,
+            partition_by: vec![],
+            order_by: order_by.clone(),
+            frame: WindowFrame {
+                units: FrameUnits::Range,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
+            },
+        }],
+    };
+    match spec.probe {
+        AggProbe::One => agg(vec![probe_col(0, names[0])], vec![]),
+        // Y first, X second — see `AggProbe::Pair`.
+        AggProbe::Pair => agg(vec![probe_col(1, names[1]), probe_col(0, names[0])], vec![]),
+        AggProbe::WithinGroup(f) => agg(
+            vec![Expr::Literal(Datum::Float64(f), PgType::FLOAT8)],
+            order_by.clone(),
+        ),
+        AggProbe::Window => win(vec![]),
+        AggProbe::Ntile(n) => win(vec![Expr::Literal(Datum::Int32(n), PgType::INT4)]),
+    }
+}
+
+/// Build and run the probe, rendering every output row's LAST column — which
+/// is the aggregate for an `Aggregate` node (whose output is `group ++ aggs`,
+/// and `group` is empty here) and the window column for a `Window` node
+/// (whose output is the input's columns plus one per window function).
+fn basin_agg_call(spec: &AggSpec) -> Result<Vec<Option<String>>, String> {
+    let (schema, batch) = agg_batch(spec.data)?;
+    let ncols = schema.fields().len();
+    let mut resolver = MemTableResolver::new();
+    resolver.insert(TableId(1), Arc::clone(&schema), vec![batch]);
+    let plan = agg_plan(spec, ncols);
+    // The measurement. `is_absence` recognises this prefix, so a name that
+    // genuinely cannot be built is classified as absence rather than as
+    // Basin rejecting the input — the same distinction the scalar side draws.
+    let mut op = build(&plan, &resolver).map_err(|e| {
+        format!(
+            "basin has no owned implementation reachable from oid {}: basin_exec::build::build \
+             refused the plan — {e}",
+            spec.oid
+        )
+    })?;
+    let mut out = Vec::new();
+    while let Some(b) = op
+        .next_batch()
+        .map_err(|e| format!("basin errored while executing the plan: {e}"))?
+    {
+        let col = b.column(b.num_columns() - 1);
+        for i in 0..b.num_rows() {
+            out.push(render_cell(col.as_ref(), i)?);
+        }
+    }
+    Ok(out)
+}
+
+/// [`basin_agg_call`] as an [`Outcome`], with a panic recorded rather than
+/// allowed to abort the run — same rationale as [`safe_basin_call`].
+///
+/// A single-cell NULL result collapses to `Outcome::Value(None)` so it lines
+/// up with the Postgres side, where a NULL aggregate arrives as a NULL text
+/// column rather than as a one-element list.
+fn safe_basin_agg(spec: &AggSpec) -> Outcome {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| basin_agg_call(spec)));
+    std::panic::set_hook(previous);
+    match r {
+        Err(payload) => Outcome::Error(format!("PANIC: {}", panic_message(&payload))),
+        Ok(Err(e)) => Outcome::Error(e),
+        Ok(Ok(cells)) => {
+            if cells.len() == 1 && cells[0].is_none() {
+                Outcome::Value(None)
+            } else {
+                Outcome::Value(Some(Val::A(cells)))
+            }
+        }
+    }
+}
+
+/// Postgres's answer, taken apart the same way Basin's is: one text column,
+/// which for a window function is a comma-joined `string_agg` of the per-row
+/// values in `ORDER BY` order. No value in any of these datasets contains a
+/// comma.
+fn split_agg_text(s: &str) -> Vec<Option<String>> {
+    s.split(',').map(|p| Some(p.to_string())).collect()
+}
+
+async fn pg_agg_outcome(client: &Client, spec: &AggSpec) -> Outcome {
+    match client.query_one(spec.pg_sql, &[]).await {
+        Err(e) => Outcome::Error(pg_err(&e)),
+        Ok(row) => match row.try_get::<_, Option<String>>(0) {
+            Ok(None) => Outcome::Value(None),
+            Ok(Some(s)) => Outcome::Value(Some(Val::A(split_agg_text(&s)))),
+            Err(e) => Outcome::Undecodable(e.to_string()),
+        },
+    }
+}
+
+/// [`compare`], plus the float epsilon the scalar side already applies via
+/// [`RetKind::Float`]. Both sides arrive here as *text* (Postgres's
+/// `::text`, Basin's [`render_cell`]), so an exact string comparison would be
+/// diffing two float formatters rather than two variance algorithms — and
+/// this file's whole complaint is about divergences manufactured by
+/// rendering. `statistical_aggregates.rs` is where these are compared bit for
+/// bit, which is the right place for that question.
+fn agg_compare(
+    basin: &Outcome,
+    pg: &Outcome,
+    ret: RetKind,
+) -> Option<(&'static str, String, String)> {
+    if ret != RetKind::Float {
+        return compare(basin, pg);
+    }
+    if let (Outcome::Value(Some(Val::A(a))), Outcome::Value(Some(Val::A(b)))) = (basin, pg) {
+        let same = a.len() == b.len()
+            && a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
+                (None, None) => true,
+                (Some(x), Some(y)) => match (x.parse::<f64>(), y.parse::<f64>()) {
+                    (Ok(x), Ok(y)) => floats_equivalent(x, y),
+                    _ => x == y,
+                },
+                _ => false,
+            });
+        return if same {
+            None
+        } else {
+            Some(("value mismatch", fmt_outcome(basin), fmt_outcome(pg)))
+        };
+    }
+    compare(basin, pg)
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Harness self-check
@@ -2369,6 +2806,219 @@ const AGG_ORPHANS: &[AggSpec] = &[
 async fn render_self_check(client: &Client) -> Result<usize, String> {
     let mut checked = 0usize;
     let fail = |what: String| -> Result<(), String> { Err(what) };
+
+    // ── Booleans, through render_cell and through pg_sql's own wrapper ──
+    //
+    // This is the branch that was missing. `render_cell` rendered `t`/`f`
+    // while `pg_sql`'s `RetKind::Bool` arm asks the server for `(…)::text`,
+    // which is `true`/`false` — 27 divergences that were entirely this
+    // file's doing, and invisible until `starts_with` became the first
+    // boolean-returning function to reach the battery. Asking the server
+    // through the SAME `(…)::text` wrapper the comparison uses is what makes
+    // this a check rather than a second opinion: if that wrapper changes,
+    // this fails.
+    for v in [true, false] {
+        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![v]));
+        let got = render_cell(arr.as_ref(), 0)?;
+        let want: Option<String> = client
+            .query_one("SELECT ($1::text::boolean)::text", &[&v.to_string()])
+            .await
+            .map_err(|e| format!("self-check boolean {v}: {e}"))?
+            .get(0);
+        if got != want {
+            fail(format!(
+                "SELF-CHECK FAILED: boolean {v} renders as {got:?}, postgres's (…)::text — the \
+                 form pg_sql asks for — says {want:?}"
+            ))?;
+        }
+        checked += 1;
+    }
+    // NULL, which must render as SQL NULL rather than as the text "NULL".
+    {
+        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![None::<bool>]));
+        if render_cell(arr.as_ref(), 0)?.is_some() {
+            fail("SELF-CHECK FAILED: a NULL boolean does not render as SQL NULL".to_string())?;
+        }
+        checked += 1;
+    }
+
+    // ── The BC era branch, which `date_battery` cannot reach ──────────────
+    //
+    // The other defect this check did not cover. `date_battery` stops at
+    // `0001-01-01`; `make_date(-1, 3, 10)` is legal input and lands in
+    // astronomical year 0, where Postgres prints `0001-03-10 BC` and this
+    // file printed `0000-03-10`. Every value below is a `(days, literal)`
+    // pair read back from the live server, and the literal is round-tripped
+    // through the server rather than trusted — the two ends of the branch
+    // (day number and era text) are exactly what a naive implementation gets
+    // wrong together.
+    for (days, lit) in [
+        (-719_162i32, "0001-01-01"),   // AD year 1, the day before the branch
+        (-719_163, "0001-12-31 BC"),   // one day earlier: astronomical year 0
+        (-719_459, "0001-03-10 BC"),   // make_date(-1, 3, 10)
+        (-719_825, "0002-03-10 BC"),   // make_date(-2, 3, 10)
+        (-2_440_550, "4713-01-01 BC"), // Postgres's minimum date
+    ] {
+        let want: String = client
+            .query_one("SELECT ($1::text::date)::text", &[&lit])
+            .await
+            .map_err(|e| format!("self-check BC date {lit}: {e}"))?
+            .get(0);
+        let day_check: i32 = client
+            .query_one(
+                "SELECT ($1::text::date - '1970-01-01'::date)::int4",
+                &[&lit],
+            )
+            .await
+            .map_err(|e| format!("self-check BC date days {lit}: {e}"))?
+            .get(0);
+        if day_check != days {
+            fail(format!(
+                "SELF-CHECK FAILED: this file says {lit} is day {days}, the server says \
+                 {day_check} — the fixture, not the renderer, is wrong"
+            ))?;
+        }
+        let arr: ArrayRef = Arc::new(Date32Array::from(vec![days]));
+        let got = render_cell(arr.as_ref(), 0)?;
+        if got.as_deref() != Some(want.as_str()) {
+            fail(format!(
+                "SELF-CHECK FAILED: date day {days} renders as {got:?}, postgres says {want:?}"
+            ))?;
+        }
+        checked += 1;
+    }
+    // The same branch in `fmt_timestamp`, which shares the era rule and has
+    // no battery value that reaches it either.
+    for (micros, lit) in [
+        (-62_135_596_800_000_000i64, "0001-01-01 00:00:00"),
+        (-62_135_596_800_500_000, "0001-12-31 23:59:59.5 BC"),
+        (-62_167_219_200_000_000, "0001-01-01 00:00:00 BC"),
+    ] {
+        let want: String = client
+            .query_one("SELECT ($1::text::timestamp)::text", &[&lit])
+            .await
+            .map_err(|e| format!("self-check BC timestamp {lit}: {e}"))?
+            .get(0);
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![micros]));
+        let got = render_cell(arr.as_ref(), 0)?;
+        if got.as_deref() != Some(want.as_str()) {
+            fail(format!(
+                "SELF-CHECK FAILED: timestamp micros {micros} renders as {got:?}, postgres says \
+                 {want:?}"
+            ))?;
+        }
+        checked += 1;
+    }
+
+    // ── Every remaining arrow type render_cell claims to handle ───────────
+    //
+    // Not just the ones a battery value happens to reach. `render_cell`'s
+    // final arm is an error — "harness cannot render arrow type X" — which
+    // is honest but only fires at comparison time, i.e. after a function
+    // lands and produces the type. Walking the arms here means an arm that
+    // is wrong, or an arrow type the battery can produce that has no arm at
+    // all, is a self-check failure before any function is tested.
+    for (label, arr, sql) in [
+        (
+            "int2",
+            Arc::new(Int16Array::from(vec![-32768i16])) as ArrayRef,
+            "SELECT ((-32768)::int2)::text",
+        ),
+        (
+            "int4",
+            Arc::new(Int32Array::from(vec![i32::MIN])) as ArrayRef,
+            "SELECT ((-2147483648)::int4)::text",
+        ),
+        (
+            "int8",
+            Arc::new(Int64Array::from(vec![i64::MIN])) as ArrayRef,
+            "SELECT ((-9223372036854775808)::int8)::text",
+        ),
+        (
+            "float8",
+            Arc::new(Float64Array::from(vec![0.1f64 + 0.2])) as ArrayRef,
+            "SELECT (0.1::float8 + 0.2::float8)::text",
+        ),
+        (
+            "float8_infinity",
+            Arc::new(Float64Array::from(vec![f64::INFINITY])) as ArrayRef,
+            "SELECT ('Infinity'::float8)::text",
+        ),
+        (
+            "float8_neg_infinity",
+            Arc::new(Float64Array::from(vec![f64::NEG_INFINITY])) as ArrayRef,
+            "SELECT ('-Infinity'::float8)::text",
+        ),
+        (
+            "float8_nan",
+            Arc::new(Float64Array::from(vec![f64::NAN])) as ArrayRef,
+            "SELECT ('NaN'::float8)::text",
+        ),
+        (
+            "text_with_nul_and_multibyte",
+            Arc::new(StringArray::from(vec!["héllo 世界"])) as ArrayRef,
+            "SELECT ('héllo 世界'::text)::text",
+        ),
+        (
+            "bytea",
+            Arc::new(BinaryArray::from(vec![&[0x00u8, 0xff, 0x41][..]])) as ArrayRef,
+            "SELECT encode('\\x00ff41'::bytea, 'hex')",
+        ),
+        (
+            "numeric",
+            Arc::new(
+                Decimal128Array::from(vec![-1_234_500_000_000i128])
+                    .with_precision_and_scale(NUM_PRECISION, NUM_SCALE)
+                    .map_err(|e| format!("self-check numeric fixture: {e}"))?,
+            ) as ArrayRef,
+            // Rendered through `normalize_numeric` on both sides, which is
+            // what the comparison does for `RetKind::Numeric`.
+            "SELECT (-123.45)::text",
+        ),
+    ] {
+        let mut got = render_cell(arr.as_ref(), 0)?;
+        let mut want: Option<String> = client
+            .query_one(sql, &[])
+            .await
+            .map_err(|e| format!("self-check {label}: {e}"))?
+            .get(0);
+        if label == "numeric" {
+            got = got.map(|s| normalize_numeric(&s));
+            want = want.map(|s| normalize_numeric(&s));
+        }
+        if got != want {
+            fail(format!(
+                "SELF-CHECK FAILED: {label} renders as {got:?}, postgres says {want:?}"
+            ))?;
+        }
+        checked += 1;
+    }
+    // Interval, through the same `(months, days, micros)` triple the
+    // comparison uses, is covered by the `iv_battery` loop below; List is
+    // covered by the `text_array_cases` loop, including a NULL *element
+    // inside* the list (`with_null_elem`) and an element whose text contains
+    // the array separator (`embedded_separator`).
+    //
+    // What has NO arm in `render_cell`, audited against
+    // `basin_pgtype::physical` rather than guessed — these are every arrow
+    // type Basin can produce for some pg type, minus the ones handled above:
+    //
+    //   Float32          float4        UInt32            oid
+    //   FixedSizeBinary  uuid          Time64(Micro)     time
+    //
+    // None is reachable from THIS battery: no orphan in `scalar_orphans`
+    // returns `float4`, `oid`, `uuid` or `time`, and `RetKind` has no variant
+    // that would decode one. They are listed rather than tested because a
+    // fixture for a type no case can produce would be a check on nothing.
+    // If one ever arrives, `render_cell`'s final arm makes it a loud "extend
+    // render_cell" rather than a silent wrong answer — which is why that arm
+    // errors instead of falling back to `Debug`, and why nothing here needs
+    // to guess at their text forms in advance.
+    //
+    // Arrow types Basin cannot produce at all (`Decimal256`, `LargeUtf8`,
+    // `Utf8View`, `LargeList`, `FixedSizeList`, `Struct`, `Map`, `Date64`,
+    // `Duration`, the other three `Interval` units) are out of scope for the
+    // same reason and by the same argument.
 
     // Dates and timestamps: render the hardcoded physical value, ask the
     // server for the literal's text, require equality.
@@ -2827,28 +3477,38 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("SET TimeZone TO 'UTC': {e}"))?;
     let mut agg_lines = Vec::new();
+    let mut agg_matches = 0usize;
+    let mut agg_failing = 0usize;
     for a in AGG_ORPHANS {
         let (_, resolution) = resolution_of(a.name, a.arg_types, a.oid);
-        let want = match client.query_one(a.pg_sql, &[]).await {
-            Ok(row) => row
-                .get::<_, Option<String>>(0)
-                .unwrap_or_else(|| "NULL".to_string()),
-            Err(e) => format!("<postgres errored: {}>", pg_err(&e)),
+        let pg = pg_agg_outcome(&client, a).await;
+        let basin = safe_basin_agg(a);
+        let verdict = match agg_compare(&basin, &pg, a.ret) {
+            None => {
+                agg_matches += 1;
+                format!("basin: MATCHES — {}", fmt_outcome(&basin))
+            }
+            Some((kind, b, p)) => {
+                agg_failing += 1;
+                format!("basin: {kind}\n        basin    = {b}\n        postgres = {p}")
+            }
         };
         agg_lines.push(format!(
             "  {:<16} oid {:<5} {:<22} postgres = {}\n      {}\n      {}",
             a.name,
             a.oid,
             format!("({})", a.kind),
-            want,
+            fmt_outcome(&pg),
             resolution,
-            if a.kind == "window" {
-                "basin: window.rs's WindowFunc enum has no variant — cannot be constructed"
-            } else {
-                "basin: aggregate.rs's AggFunc enum has no variant — cannot be constructed"
-            }
+            verdict
         ));
     }
+    // Each aggregate/window orphan is one more call site, compared the same
+    // way every scalar one is. Folding them into the headline rather than
+    // reporting them beside it is the point: while they were only
+    // *catalogued*, a name could be wrong, or absent, or right, and the
+    // acceptance criterion could not tell the difference.
+    total_cases += AGG_ORPHANS.len();
 
     // ── the metric, always printed ──────────────────────────────────────
     let n_unresolvable = reports
@@ -2864,7 +3524,8 @@ async fn run() -> Result<(), String> {
         .filter(|r| r.class == Class::Divergent)
         .count();
     let n_matches = reports.iter().filter(|r| r.class == Class::Matches).count();
-    let n_bad_cases: usize = reports.iter().map(|r| r.divergences.len()).sum();
+    let n_scalar_bad: usize = reports.iter().map(|r| r.divergences.len()).sum();
+    let n_bad_cases = n_scalar_bad + agg_failing;
 
     // Coverage against the census: the module docs claim 79 orphaned
     // `pg_catalog` names. Recount it from the tables themselves every run, so
@@ -2887,9 +3548,11 @@ async fn run() -> Result<(), String> {
 
     print_banner(&format!(
         "{} scalar overloads probed, {total_cases} call sites compared, {} aggregate/window \
-         orphans catalogued, {coverage} · UNRESOLVABLE {n_unresolvable} · UNIMPLEMENTED \
-         {n_unimplemented} · DIVERGENT {n_divergent} · MATCHES {n_matches} · {n_bad_cases} \
-         failing call sites",
+         orphans EXECUTED through basin_exec::build (not catalogued: {agg_matches} match \
+         PostgreSQL, {agg_failing} do not), {coverage} · UNRESOLVABLE {n_unresolvable} · \
+         UNIMPLEMENTED {n_unimplemented} · DIVERGENT {n_divergent} · MATCHES {n_matches} · \
+         {n_bad_cases} failing call sites ({n_scalar_bad} scalar + {agg_failing} \
+         aggregate/window)",
         reports.len(),
         AGG_ORPHANS.len(),
     ));
@@ -2947,9 +3610,17 @@ async fn run() -> Result<(), String> {
         }
     }
     out.push_str(&format!(
-        "\n### AGGREGATE / WINDOW ORPHANS — {} name(s), probed at the resolution layer only\n\
-         (AggFunc/WindowFunc are closed enums; these cannot be constructed, so there is no\n\
-          runtime comparison to make. The postgres value each must eventually reproduce:)\n\n{}\n",
+        "\n### AGGREGATE / WINDOW ORPHANS — {} name(s), EXECUTED: {agg_matches} match, \
+         {agg_failing} fail\n\
+         (Each one is planned as `LogicalPlan::Aggregate`/`Window` carrying the pg_proc OID and\n\
+          handed to `basin_exec::build::build`, which is the only code that maps an OID onto an\n\
+          `AggFunc`/`WindowFunc`. `cannot be constructed` below is a quoted `BuildError` from\n\
+          that path, never a claim this file makes on its own behalf.\n\
+          READ THE TWO LINES SEPARATELY. The resolution line is `basin_pgtype::func::resolve`\n\
+          on the NAME; the verdict line is execution from the OID. They answer different\n\
+          questions and can disagree: a MATCH here proves the accumulator is right and\n\
+          reachable by OID, NOT that `SELECT bool_and(x)` plans from SQL text — that needs a\n\
+          `FUNCS` row, which is what the resolution line reports.)\n\n{}\n",
         AGG_ORPHANS.len(),
         agg_lines.join("\n")
     ));
@@ -2966,10 +3637,11 @@ async fn run() -> Result<(), String> {
     }
 
     Err(format!(
-        "{n_bad_cases} of {total_cases} call sites across {} scalar overload(s) do not match \
-         PostgreSQL 18.2, and {} aggregate/window orphans have no owned implementation at all. \
-         THIS IS THE EXPECTED STATE until the re-hosting tranche lands — the listing above is \
-         the work queue, not a regression. Do not narrow the battery to shrink this number.",
+        "{n_bad_cases} of {total_cases} call sites do not match PostgreSQL 18.2: {n_scalar_bad} \
+         across {} scalar overload(s), plus {agg_failing} of the {} aggregate/window orphans \
+         (the other {agg_matches} were executed and matched). THIS IS THE EXPECTED STATE until \
+         the re-hosting tranche lands — the listing above is the work queue, not a regression. \
+         Do not narrow the battery to shrink this number.",
         reports.len() - n_matches,
         AGG_ORPHANS.len(),
     ))
