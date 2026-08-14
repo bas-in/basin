@@ -2767,14 +2767,7 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         OID_LEFT => eval_left_right(&a(0)?, &a(1)?, true),
         OID_RIGHT => eval_left_right(&a(0)?, &a(1)?, false),
 
-        OID_ABS_INT2 => abs_int16(&a(0)?),
-        OID_ABS_INT4 => abs_int32(&a(0)?),
-        OID_ABS_INT8 => abs_int64(&a(0)?),
-        OID_ABS_FLOAT4 => abs_float32(&a(0)?),
-        OID_ABS_FLOAT8 => abs_float64(&a(0)?),
-        OID_ABS_NUMERIC => abs_decimal(&a(0)?),
 
-        OID_ROUND_FLOAT8 => round_float8(&a(0)?),
         OID_ROUND_NUMERIC => decimal_round_fixed(&a(0)?, 0),
         OID_ROUND_NUMERIC_N => {
             let val = a(0)?;
@@ -2783,15 +2776,7 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         }
 
         OID_CEIL_NUMERIC => decimal_ceil(&a(0)?),
-        OID_CEIL_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::ceil,
-        ))),
         OID_FLOOR_NUMERIC => decimal_floor(&a(0)?),
-        OID_FLOOR_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::floor,
-        ))),
 
         OID_CONCAT => eval_concat(args, batch, session),
         OID_CONCAT_WS => eval_concat_ws(args, batch, session),
@@ -2869,47 +2854,7 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
             eval_split_part(&s, &delim, &field)
         }
 
-        OID_AGE_TIMESTAMP => {
-            let lhs = a(0)?;
-            let rhs = a(1)?;
-            eval_age(&lhs, &rhs)
-        }
 
-        OID_DATE_TRUNC_TIMESTAMP => {
-            let unit = a(0)?;
-            let value = a(1)?;
-            eval_date_trunc_timestamp(&unit, &value)
-        }
-        OID_DATE_TRUNC_TIMESTAMPTZ => {
-            let unit = a(0)?;
-            let value = a(1)?;
-            eval_date_trunc_timestamptz(&unit, &value, session)
-        }
-        OID_DATE_TRUNC_INTERVAL => {
-            let unit = a(0)?;
-            let value = a(1)?;
-            eval_date_trunc_interval(&unit, &value)
-        }
-        OID_DATE_PART_TIMESTAMP => {
-            let field = a(0)?;
-            let value = a(1)?;
-            eval_date_part_timestamp(&field, &value)
-        }
-        OID_DATE_PART_TIMESTAMPTZ => {
-            let field = a(0)?;
-            let value = a(1)?;
-            eval_date_part_timestamptz(&field, &value, session)
-        }
-        OID_DATE_PART_DATE => {
-            let field = a(0)?;
-            let value = a(1)?;
-            eval_date_part_date(&field, &value)
-        }
-        OID_DATE_PART_INTERVAL => {
-            let field = a(0)?;
-            let value = a(1)?;
-            eval_date_part_interval(&field, &value)
-        }
 
         // All six `extract` oids share ONE implementation, which reads the
         // argument's actual Arrow type rather than trusting the oid. See
@@ -2929,11 +2874,6 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         // implementation — which is also what lets a `date` argument work at
         // all, since PostgreSQL reaches 2049 from a `date` by an implicit
         // cast that Basin's lowering does not insert.
-        OID_TO_CHAR_TIMESTAMP | OID_TO_CHAR_TIMESTAMPTZ => {
-            let value = a(0)?;
-            let format = a(1)?;
-            eval_to_char_datetime(&value, &format, session)
-        }
 
         OID_SQRT_FLOAT8 => float8_unary_checked(&a(0)?, pg_sqrt_f64),
         OID_CBRT_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
@@ -2948,10 +2888,6 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         OID_LN_FLOAT8 => float8_unary_checked(&a(0)?, pg_ln_f64),
         OID_LOG_FLOAT8 => float8_unary_checked(&a(0)?, pg_log10_f64),
         OID_EXP_FLOAT8 => float8_unary_checked(&a(0)?, pg_exp_f64),
-        OID_TRUNC_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::trunc,
-        ))),
         OID_TRUNC_NUMERIC => decimal_trunc_fixed(&a(0)?, 0),
         OID_TRUNC_NUMERIC_N => {
             let val = a(0)?;
@@ -2964,15 +2900,7 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
             std::f64::consts::PI;
             batch.num_rows()
         ]))),
-        OID_SIGN_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            pg_sign_f64,
-        ))),
         OID_SIGN_NUMERIC => decimal_sign(&a(0)?),
-        OID_CEILING_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
-            downcast_array::<Float64Array>(&a(0)?, "double precision")?,
-            f64::ceil,
-        ))),
         OID_CEILING_NUMERIC => decimal_ceil(&a(0)?),
         OID_ACOS_FLOAT8 => float8_unary_checked(&a(0)?, pg_acos_f64),
         OID_ASIN_FLOAT8 => float8_unary_checked(&a(0)?, pg_asin_f64),
@@ -3113,7 +3041,6 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         }
 
         // `make_date`. Year zero is rejected; a negative year is BC.
-        OID_MAKE_DATE => eval_make_date(&a(0)?, &a(1)?, &a(2)?),
 
         other => Err(ExecError::Internal(format!(
             "scalar function oid {other} is not implemented in eval yet — the bridge should \
