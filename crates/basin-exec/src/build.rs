@@ -47,7 +47,7 @@ use crate::project::{Filter, Project};
 use crate::recursive::{RecursiveCte, RecursiveTermFactory};
 use crate::scan::{BatchSource, Scan};
 use crate::setop::{Distinct, Empty, SetOp, Values};
-use crate::sort::{Sort, SortKey, TopK};
+use crate::sort::{LimitWithTies, Sort, SortKey, TopK};
 use crate::window::{OrderKey, WindowAgg, WindowFunc, WindowSpec};
 
 /// The current outer row a correlated rebuild is bound to — `Some` only
@@ -526,9 +526,6 @@ fn build_inner(
             fetch,
             with_ties,
         } => {
-            if *with_ties {
-                return Err(BuildError::Unsupported("FETCH … WITH TIES".into()));
-            }
             let fetch = fetch
                 .as_ref()
                 .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
@@ -538,6 +535,7 @@ fn build_inner(
                 .map(|e| bind_outer(e, outer, tables, dml, budget, ctes, session))
                 .transpose()?
             {
+                Some(e) if is_null_literal(&e) => None,
                 Some(e) => Some(
                     const_usize(&e)
                         .ok_or_else(|| BuildError::Unsupported("non-constant OFFSET".into()))?,
@@ -545,12 +543,35 @@ fn build_inner(
                 None => None,
             };
             let fetch_n = match &fetch {
+                Some(e) if is_null_literal(e) => None,
                 Some(e) => Some(
                     const_usize(e)
                         .ok_or_else(|| BuildError::Unsupported("non-constant LIMIT".into()))?,
                 ),
                 None => None,
             };
+            // `WITH TIES` needs the ORDER BY key to decide what ties, so it is
+            // matched before the shapes below — none of which carry one.
+            // Postgres itself rejects `FETCH … WITH TIES` without an `ORDER
+            // BY` ("WITH TIES cannot be specified without ORDER BY clause"),
+            // so the only legal input plan is a Limit directly over a Sort;
+            // anything else is refused rather than silently degraded to
+            // `ONLY`, which is exactly the wrong answer the incumbent path
+            // gives (see `LimitWithTies`).
+            if *with_ties {
+                let (LogicalPlan::Sort { input: si, keys }, None, Some(k)) =
+                    (input.as_ref(), skip_n, fetch_n)
+                else {
+                    return Err(BuildError::Unsupported(
+                        "FETCH … WITH TIES without a plain ORDER BY".into(),
+                    ));
+                };
+                let child = build_inner(si, tables, dml, budget, ctes, session, outer)?;
+                let keys = bind_sort_keys(keys, outer, tables, dml, budget, ctes, session)?;
+                let sorted = Box::new(Sort::new(child, sort_keys(&keys)?, budget));
+                return Ok(Box::new(LimitWithTies::new(sorted, sort_keys(&keys)?, k)));
+            }
+
             if fetch_n.is_none() && skip_n.is_none() {
                 return build_inner(input, tables, dml, budget, ctes, session, outer);
             }
@@ -2392,6 +2413,22 @@ fn column_index(e: &Expr) -> Option<usize> {
     }
 }
 
+/// A literal SQL `NULL`, for the `LIMIT`/`OFFSET` bounds.
+///
+/// `LIMIT ALL` is not a distinct parse-tree shape: Postgres lowers it to a
+/// `LIMIT` whose count is a NULL constant, which arrives here as
+/// `Literal(Datum::Null, _)`. `const_usize` cannot read a count out of that
+/// and the builder refused the whole statement as a "non-constant LIMIT" —
+/// so `SELECT id FROM t LIMIT ALL`, which is ordinary SQL, fell back.
+///
+/// The bound is genuinely absent, not zero: measured live on PostgreSQL
+/// 18.2, `LIMIT ALL`, `LIMIT NULL` and `OFFSET NULL` over a five-row input
+/// all return all five rows. The same spelling covers all three because
+/// Postgres itself does not distinguish them past the parser.
+fn is_null_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(basin_plan::Datum::Null, _))
+}
+
 /// A constant non-negative integer, for `LIMIT`.
 fn const_usize(e: &Expr) -> Option<usize> {
     match e {
@@ -3795,9 +3832,15 @@ mod tests {
         assert_eq!(err, BuildError::UnknownTable(TableId(999)));
     }
 
-    /// `WITH TIES` currently degrades to `ONLY` in the DataFusion path
+    /// `WITH TIES` degrades to `ONLY` in the DataFusion path
     /// (select_advanced.rs:455), silently returning fewer rows than Postgres.
-    /// The owned builder refuses instead — an error beats a wrong row count.
+    /// The owned builder now SERVES the legal shape — see
+    /// `with_ties_over_an_order_by_builds_the_ties_operator` — but this
+    /// plan is not it: there is no `ORDER BY` for a tie to be defined
+    /// against, and Postgres rejects that spelling outright ("WITH TIES
+    /// cannot be specified without ORDER BY clause"). It must still be
+    /// refused rather than quietly answered as `ONLY`, which is the wrong
+    /// row count this test has always existed to prevent.
     #[test]
     fn with_ties_is_refused_rather_than_silently_degraded() {
         let plan = LogicalPlan::Limit {
@@ -3811,6 +3854,71 @@ mod tests {
             Ok(_) => panic!("WITH TIES must be refused, not silently degraded"),
         };
         assert!(matches!(err, BuildError::Unsupported(ref s) if s.contains("WITH TIES")));
+    }
+
+    /// The legal `WITH TIES` shape — a `Limit` directly over a `Sort` — now
+    /// builds, and builds something ties-aware rather than a plain
+    /// `Limit`/`TopK` that would truncate at `fetch`. Measured live on
+    /// PostgreSQL 18.2 over `(1,'a'),(2,'b'),(3,'c'),(100,NULL),(101,'a')`:
+    /// `ORDER BY name FETCH FIRST 1 ROW WITH TIES` returns TWO rows, `(1,'a')`
+    /// and `(101,'a')` — more than `fetch`.
+    ///
+    /// The assertion is on BEHAVIOUR, not on the operator's name: `dyn
+    /// Operator` is not `Debug`, and a name check would pass for a
+    /// correctly-named operator that still truncated. The sort key here is
+    /// `three_col_table`'s `k`, which is `0` in every row, so `FETCH FIRST 1
+    /// ROW WITH TIES` must return all THREE. A key with distinct values would
+    /// have passed against a truncating operator too, which is the whole
+    /// thing this has to rule out.
+    #[test]
+    fn with_ties_over_an_order_by_returns_the_whole_tie_group() {
+        let (schema, batch) = three_col_table();
+        let mut r = MemTableResolver::new();
+        r.insert(TableId(1), schema, vec![batch]);
+
+        let plan = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Sort {
+                // position 0 of `projection` == table column 1 == `k`.
+                input: Box::new(scan_plan(vec![ColId(1)], vec![])),
+                keys: vec![basin_plan::SortKey {
+                    expr: col(0, "k"),
+                    descending: false,
+                    nulls_first: false,
+                }],
+            }),
+            skip: None,
+            fetch: Some(Expr::Literal(Datum::Int64(1), PgType::INT8)),
+            with_ties: true,
+        };
+        let op = build(&plan, &r).expect("WITH TIES over ORDER BY must build");
+        let rows: usize = drain(op).iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            rows, 3,
+            "every row ties with the first on `k`, so all three come back — \
+             a truncating operator would return 1"
+        );
+    }
+
+    /// `LIMIT ALL` is not a distinct parse-tree shape — Postgres lowers it to
+    /// a `LIMIT` whose count is a NULL constant. `const_usize` cannot read a
+    /// count out of that, so the builder refused the whole statement as a
+    /// "non-constant LIMIT" and `SELECT id FROM t LIMIT ALL`, which is
+    /// ordinary SQL, fell back. The bound is genuinely ABSENT, not zero:
+    /// live PostgreSQL 18.2 returns all five rows of a five-row input for
+    /// `LIMIT ALL`, `LIMIT NULL` and `OFFSET NULL` alike.
+    #[test]
+    fn limit_all_is_no_limit_rather_than_a_non_constant_one() {
+        for bound in ["fetch", "skip"] {
+            let null = Some(Expr::Literal(Datum::Null, PgType::UNKNOWN));
+            let plan = LogicalPlan::Limit {
+                input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+                skip: if bound == "skip" { null.clone() } else { None },
+                fetch: if bound == "fetch" { null } else { None },
+                with_ties: false,
+            };
+            build(&plan, &resolver())
+                .unwrap_or_else(|e| panic!("a NULL {bound} bound means no bound, got {e:?}"));
+        }
     }
     /// A set-returning function reaches the operator through the builder.
     /// `generate_series` in a target list is one of the two shapes that

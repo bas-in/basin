@@ -75,7 +75,7 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use basin_plan::{Datum, Expr, OpId};
 
 use crate::eval;
-use crate::operator::{default_session, ExecError, Operator, SessionRef};
+use crate::operator::{batch_with_row_count, default_session, ExecError, Operator, SessionRef};
 
 /// Operator names (`pg_operator.oprname`, Postgres's own internal spelling)
 /// that **cannot** return NULL unless one of their operands is NULL. Every
@@ -401,7 +401,11 @@ impl Operator for Project {
             arrays.push(eval::eval_with(expr, &batch, &self.session)?);
         }
 
-        let out = RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+        // A projection to ZERO columns is a real plan, and its ROW COUNT is
+        // the whole payload — see [`batch_with_row_count`], which is where
+        // the reasoning lives so that every operator with a prunable schema
+        // shares one answer.
+        let out = batch_with_row_count(Arc::clone(&self.schema), arrays, batch.num_rows())
             .map_err(|e| ExecError::Internal(e.to_string()))?;
         Ok(Some(out))
     }
@@ -1161,5 +1165,32 @@ mod tests {
         let mut project = Project::new(input2, vec![(col(0, "x"), "x".to_string())]).unwrap();
         project.next_batch().unwrap();
         assert_eq!(project.memory_used(), 0);
+    }
+
+    /// A projection to ZERO columns is a real plan, not a degenerate one:
+    /// `SELECT count(*) FROM t CROSS JOIN d` needs no input column, so column
+    /// pruning leaves a `Project` with no expressions under the aggregate.
+    /// Its ROW COUNT is the entire payload — it is exactly what `count(*)`
+    /// counts — and `RecordBatch::try_new` cannot carry one without an array
+    /// to infer it from: it fails with "must either specify a row count or at
+    /// least one column". That error is precisely what the fallback probe
+    /// measured on that query, and it is why the row count has to be passed
+    /// explicitly.
+    #[test]
+    fn a_zero_column_projection_still_carries_its_row_count() {
+        let schema = schema_1i32("x");
+        let batch = batch_i32(&schema, vec![Some(1), Some(2), Some(3), Some(4)]);
+        let input = Feed::boxed(schema, vec![batch]);
+        let mut project = Project::new(input, vec![]).unwrap();
+        let out = project
+            .next_batch()
+            .expect("a zero-column projection must build, not error")
+            .expect("one batch in, one batch out");
+        assert_eq!(out.num_columns(), 0);
+        assert_eq!(
+            out.num_rows(),
+            4,
+            "the row count is the whole point — count(*) reads it"
+        );
     }
 }

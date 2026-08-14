@@ -79,6 +79,37 @@ pub fn default_session() -> SessionRef {
     std::rc::Rc::new(crate::eval::EvalSession::DEFAULT)
 }
 
+/// Build a batch that keeps its row count even with no columns to infer it
+/// from.
+///
+/// A ZERO-COLUMN batch is a real thing an operator must be able to emit, not
+/// a degenerate case: `SELECT count(*) FROM t CROSS JOIN d` reads no column
+/// of either table, so column pruning leaves both sides — and the join
+/// between them — with an empty schema. The row count is then the entire
+/// payload, because it is exactly what `count(*)` counts.
+///
+/// `RecordBatch::try_new` cannot express that. With no array to take a
+/// length from it fails outright: "must either specify a row count or at
+/// least one column". Every operator that builds its output from a
+/// possibly-pruned schema therefore has to pass the count explicitly, and
+/// they all do it through here so the next such operator cannot forget.
+/// `setop.rs` had already discovered this independently for `SELECT 1`.
+pub(crate) fn batch_with_row_count(
+    schema: SchemaRef,
+    columns: Vec<arrow_array::ArrayRef>,
+    rows: usize,
+) -> Result<RecordBatch, arrow_schema::ArrowError> {
+    if columns.is_empty() {
+        RecordBatch::try_new_with_options(
+            schema,
+            columns,
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+    } else {
+        RecordBatch::try_new(schema, columns)
+    }
+}
+
 /// A pull-based physical operator.
 ///
 /// `next_batch` returns `Ok(None)` at end of stream. Implementations must

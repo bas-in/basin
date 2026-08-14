@@ -402,6 +402,214 @@ impl Operator for TopK {
     }
 }
 
+/// `ORDER BY … FETCH FIRST n ROWS WITH TIES` — the first `n` rows, plus
+/// every row after them that ties with the `n`th on the ORDER BY key.
+///
+/// # This closes a wrong answer, not just a gap
+///
+/// The builder used to refuse `WITH TIES` outright
+/// (`BuildError::Unsupported("FETCH … WITH TIES")`), which sent the statement
+/// to the incumbent DataFusion path — where `with_ties` is **degraded to
+/// `ONLY`** (see `basin_plan`'s `LogicalPlan::Limit` docs). So the answer
+/// Basin gave was not merely served by another engine, it was short by
+/// however many tied rows there were. Measured live on PostgreSQL 18.2 over
+/// `(1,'a'),(2,'b'),(3,'c'),(100,NULL),(101,'a')`:
+///
+/// ```text
+/// SELECT id, name FROM t ORDER BY name FETCH FIRST 1 ROW WITH TIES;
+///  id  | name
+/// -----+------
+///    1 | a
+///  101 | a
+/// ```
+///
+/// Two rows, not one.
+///
+/// # What counts as a tie
+///
+/// Equality on the ORDER BY key columns only — never on the rest of the row,
+/// and never on the arrival-order tiebreak
+/// [`sort_columns_with_tiebreak`] appends (that exists to make the *order*
+/// deterministic; letting it into the tie test would make every row unique
+/// and `WITH TIES` a no-op).
+///
+/// The test is `arrow_ord::cmp::not_distinct`, i.e. `IS NOT DISTINCT FROM`,
+/// so two NULL keys tie with each other — which is what Postgres does, since
+/// `ORDER BY` groups NULLs together. The key columns are run through
+/// [`normalize_for_sort`] first so the tie test agrees with the *ordering*
+/// on the two float cases that module documents: all NaNs tie with each
+/// other (IEEE equality alone would say `NaN <> NaN` and split a group the
+/// sort had placed adjacent), and `-0.0` ties with `0.0`.
+///
+/// # Streaming
+///
+/// The `n`th row's key is retained as a one-row slice of each key column, so
+/// the tie test works across a batch boundary as well as within one. Nothing
+/// else is buffered: this operator adds `O(number of key columns)` on top of
+/// whatever the child holds.
+pub struct LimitWithTies {
+    child: Box<dyn Operator>,
+    keys: Vec<SortKey>,
+    fetch: usize,
+    schema: SchemaRef,
+    /// Rows emitted so far, saturating at `fetch`.
+    emitted: usize,
+    /// The `fetch`th row's key columns, one one-row array each, normalized.
+    /// `Some` exactly once `emitted == fetch` and the stream has not ended.
+    boundary: Option<Vec<ArrayRef>>,
+    done: bool,
+}
+
+impl std::fmt::Debug for LimitWithTies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LimitWithTies")
+            .field("fetch", &self.fetch)
+            .field("emitted", &self.emitted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LimitWithTies {
+    pub fn new(child: Box<dyn Operator>, keys: Vec<SortKey>, fetch: usize) -> Self {
+        let schema = child.schema();
+        Self {
+            child,
+            keys,
+            fetch,
+            schema,
+            emitted: 0,
+            boundary: None,
+            done: false,
+        }
+    }
+
+    /// Row `row`'s key columns, normalized, as one-row arrays.
+    fn key_row(&self, batch: &RecordBatch, row: usize) -> Vec<ArrayRef> {
+        self.keys
+            .iter()
+            .map(|k| normalize_for_sort(&batch.column(k.column).slice(row, 1)))
+            .collect()
+    }
+
+    /// A mask over `batch`: true where the row's key equals `boundary`'s.
+    fn tie_mask(
+        &self,
+        batch: &RecordBatch,
+        boundary: &[ArrayRef],
+    ) -> Result<arrow_array::BooleanArray, ExecError> {
+        let mut mask: Option<arrow_array::BooleanArray> = None;
+        for (k, b) in self.keys.iter().zip(boundary) {
+            let col = normalize_for_sort(batch.column(k.column));
+            let same = arrow::compute::kernels::cmp::not_distinct(
+                &col,
+                &arrow_array::Scalar::new(Arc::clone(b)),
+            )
+            .map_err(arrow_err)?;
+            mask = Some(match mask {
+                None => same,
+                Some(prev) => arrow::compute::kernels::boolean::and(&prev, &same)
+                    .map_err(arrow_err)?,
+            });
+        }
+        // A `WITH TIES` limit with no sort keys cannot arise — Postgres
+        // rejects `FETCH … WITH TIES` without an `ORDER BY` — but if one ever
+        // did, every row would tie with every other, so `true` is the honest
+        // answer rather than a panic.
+        Ok(mask.unwrap_or_else(|| {
+            arrow_array::BooleanArray::from(vec![true; batch.num_rows()])
+        }))
+    }
+}
+
+impl Operator for LimitWithTies {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
+        if self.done {
+            return Ok(None);
+        }
+        // `FETCH FIRST 0 ROWS WITH TIES` yields nothing — there is no `0`th
+        // row for anything to tie with. Checked before pulling, so the child
+        // is never touched.
+        if self.fetch == 0 {
+            self.done = true;
+            return Ok(None);
+        }
+        loop {
+            let Some(batch) = self.child.next_batch()? else {
+                self.done = true;
+                return Ok(None);
+            };
+            let rows = batch.num_rows();
+            if rows == 0 {
+                continue;
+            }
+
+            if self.emitted < self.fetch {
+                let need = self.fetch - self.emitted;
+                if rows <= need {
+                    // The whole batch is still inside the first `fetch` rows.
+                    self.emitted += rows;
+                    if self.emitted == self.fetch {
+                        self.boundary = Some(self.key_row(&batch, rows - 1));
+                    }
+                    return Ok(Some(batch));
+                }
+                // The cut falls inside this batch: row `need - 1` is the
+                // `fetch`th row overall, and everything after it that ties
+                // with it comes too.
+                let boundary = self.key_row(&batch, need - 1);
+                let ties = self.tie_mask(&batch, &boundary)?;
+                let mut end = need;
+                while end < rows && ties.value(end) {
+                    end += 1;
+                }
+                self.emitted = self.fetch;
+                if end < rows {
+                    // A non-tying row inside this batch ends the answer; no
+                    // later batch can contain a tie, because the input is
+                    // sorted and ties are contiguous.
+                    self.done = true;
+                } else {
+                    self.boundary = Some(boundary);
+                }
+                return Ok(Some(batch.slice(0, end)));
+            }
+
+            // Past the first `fetch` rows: only a tying PREFIX of this batch
+            // survives, for the same contiguity reason.
+            let boundary = self
+                .boundary
+                .clone()
+                .expect("boundary is recorded the moment `emitted` reaches `fetch`");
+            let ties = self.tie_mask(&batch, &boundary)?;
+            let mut end = 0;
+            while end < rows && ties.value(end) {
+                end += 1;
+            }
+            if end < rows {
+                self.done = true;
+            }
+            if end == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(batch.slice(0, end)));
+        }
+    }
+
+    fn memory_used(&self) -> usize {
+        // Only the retained boundary key, which is one row wide.
+        self.child.memory_used()
+            + self
+                .boundary
+                .as_ref()
+                .map(|b| b.iter().map(|a| a.get_array_memory_size()).sum::<usize>())
+                .unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,5 +981,159 @@ mod tests {
         );
         let err = sort.next_batch().unwrap_err();
         assert!(matches!(err, ExecError::OutOfMemory { .. }), "{err:?}");
+    }
+
+    // ── FETCH FIRST n ROWS WITH TIES ────────────────────────────────────
+
+    /// Drain a `LimitWithTies` over an already-sorted `Feed`, in the batch
+    /// shape the caller chose, and report the `v` column it produced.
+    fn ties_over(batches: Vec<Vec<Option<i32>>>, fetch: usize) -> Vec<Option<i32>> {
+        let schema = int32_schema();
+        let child = Box::new(Feed::new(
+            Arc::clone(&schema),
+            batches.into_iter().map(int32_batch).collect(),
+        ));
+        let keys = vec![SortKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let mut op = LimitWithTies::new(child, keys, fetch);
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch().unwrap() {
+            out.extend(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter(),
+            );
+        }
+        out
+    }
+
+    /// The whole point of `WITH TIES`: the answer is longer than `fetch`
+    /// whenever the `fetch`th row has company. Live PostgreSQL 18.2 over
+    /// `(1,'a'),(2,'b'),(3,'c'),(100,NULL),(101,'a')` ordered by `name`,
+    /// `FETCH FIRST 1 ROW WITH TIES` returns TWO rows — `(1,'a')` and
+    /// `(101,'a')`. The incumbent DataFusion path degrades this to `ONLY`
+    /// and returns one, which is the wrong answer this operator exists to
+    /// stop giving.
+    #[test]
+    fn with_ties_returns_more_rows_than_fetch_when_the_boundary_row_has_peers() {
+        assert_eq!(
+            ties_over(vec![vec![Some(10), Some(10), Some(20), Some(30)]], 1),
+            vec![Some(10), Some(10)],
+            "fetch is 1 but the first row ties with the second"
+        );
+    }
+
+    /// A `fetch` that lands on a row with no peers returns exactly `fetch`
+    /// rows — `WITH TIES` must not over-return.
+    #[test]
+    fn with_ties_returns_exactly_fetch_when_the_boundary_row_is_unique() {
+        assert_eq!(
+            ties_over(vec![vec![Some(10), Some(20), Some(20), Some(30)]], 1),
+            vec![Some(10)]
+        );
+    }
+
+    /// The tie group can straddle a batch boundary — the `fetch`th row is
+    /// the last row of one batch and its peers are the first rows of the
+    /// next. An implementation that only looked within a single batch would
+    /// silently truncate here, which is the same wrong answer as degrading
+    /// to `ONLY`, just harder to see.
+    #[test]
+    fn a_tie_group_spanning_a_batch_boundary_is_not_truncated() {
+        assert_eq!(
+            ties_over(
+                vec![
+                    vec![Some(10), Some(10)],
+                    vec![Some(10), Some(10)],
+                    vec![Some(20)],
+                ],
+                2
+            ),
+            vec![Some(10), Some(10), Some(10), Some(10)],
+            "all four 10s tie with the 2nd row; the 20 does not"
+        );
+    }
+
+    /// NULL keys tie with each other. Postgres's `ORDER BY` groups NULLs
+    /// together, so `WITH TIES` landing on a NULL must take every other NULL
+    /// with it — which is `IS NOT DISTINCT FROM`, not `=` (under `=`, NULL
+    /// never equals NULL and every NULL row would look unique).
+    #[test]
+    fn null_keys_tie_with_each_other() {
+        // ASC NULLS LAST, so the NULLs are the tail; fetch 3 lands on the
+        // first of them.
+        assert_eq!(
+            ties_over(vec![vec![Some(10), Some(20), None, None, None]], 3),
+            vec![Some(10), Some(20), None, None, None]
+        );
+    }
+
+    /// `FETCH FIRST 0 ROWS WITH TIES` yields nothing — there is no zeroth row
+    /// for anything to tie with. Without the guard this would look for a
+    /// boundary that was never recorded.
+    #[test]
+    fn fetch_zero_with_ties_is_empty() {
+        assert_eq!(ties_over(vec![vec![Some(10), Some(10)]], 0), Vec::new());
+    }
+
+    /// A `fetch` larger than the input returns the whole input rather than
+    /// running off the end looking for a boundary row that does not exist.
+    #[test]
+    fn fetch_beyond_the_end_returns_everything() {
+        assert_eq!(
+            ties_over(vec![vec![Some(10), Some(20)]], 9),
+            vec![Some(10), Some(20)]
+        );
+    }
+
+    /// All NaNs tie with each other and `-0.0` ties with `0.0`, matching the
+    /// ORDERING this module already corrects (see the module docs' float
+    /// section). IEEE equality alone says `NaN <> NaN`, which would split a
+    /// group the sort had deliberately placed adjacent — so the tie test has
+    /// to run the key through `normalize_for_sort` exactly as the sort does.
+    #[test]
+    fn float_ties_agree_with_the_sort_on_nan_and_negative_zero() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![
+                Some(-0.0),
+                Some(0.0),
+                Some(1.0),
+            ]))],
+        )
+        .unwrap();
+        let keys = vec![SortKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }];
+        let child = Box::new(Feed::new(Arc::clone(&schema), vec![batch]));
+        let mut op = LimitWithTies::new(child, keys.clone(), 1);
+        let out = op.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 2, "-0.0 and 0.0 tie, as they do when sorting");
+
+        // Two NaNs with DIFFERENT sign bits: `total_cmp` ranks them at
+        // opposite ends and IEEE `=` says neither equals the other, but
+        // Postgres treats every NaN as equal to every other.
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(-f64::NAN),
+                Some(1.0),
+            ]))],
+        )
+        .unwrap();
+        let child = Box::new(Feed::new(Arc::clone(&schema), vec![batch]));
+        let mut op = LimitWithTies::new(child, keys, 1);
+        let out = op.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 2, "every NaN ties with every other NaN");
     }
 }

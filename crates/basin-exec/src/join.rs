@@ -119,7 +119,7 @@ use arrow_select::take::take;
 use basin_plan::{ColumnRef, Expr, JoinKind};
 
 use crate::eval;
-use crate::operator::{default_session, ExecError, Operator, SessionRef};
+use crate::operator::{batch_with_row_count, default_session, ExecError, Operator, SessionRef};
 
 /// Rewrite `filter` so every column it reads is a flat index into the
 /// concatenated left++right row, ready for direct use with `eval::eval`.
@@ -915,7 +915,10 @@ impl HashJoin {
         let right_idx = UInt32Array::from(right_idx);
         let mut cols = take_by_indices(left_batch, &left_idx)?;
         cols.extend(take_by_indices(self.right_table(), &right_idx)?);
-        let out = RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)?;
+        // `l * r` rows, and possibly NO columns: `SELECT count(*) FROM t
+        // CROSS JOIN d` reads no column of either side, so pruning empties
+        // both schemas and the count is all that is left to carry.
+        let out = batch_with_row_count(Arc::clone(&self.schema), cols, l * r).map_err(arrow_err)?;
         // In practice `basin-plan` always relabels a `Cross` carrying a
         // condition to `Inner` before it reaches this builder (see
         // `lower/select.rs`), so `self.filter` is `None` here today — this
@@ -930,11 +933,12 @@ impl HashJoin {
         left_idx: &[Option<u32>],
         right_idx: &[Option<u32>],
     ) -> Result<RecordBatch, ExecError> {
+        let rows = left_idx.len();
         let left_idx = UInt32Array::from(left_idx.to_vec());
         let right_idx = UInt32Array::from(right_idx.to_vec());
         let mut cols = take_by_indices(left_batch, &left_idx)?;
         cols.extend(take_by_indices(self.right_table(), &right_idx)?);
-        RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)
+        batch_with_row_count(Arc::clone(&self.schema), cols, rows).map_err(arrow_err)
     }
 
     /// The tail batch of never-matched right rows for `Right`/`Full`: real
@@ -955,7 +959,7 @@ impl HashJoin {
         let left_cols = null_columns(&self.left_schema, unmatched.len());
         let mut cols = left_cols;
         cols.extend(right_cols);
-        RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)
+        batch_with_row_count(Arc::clone(&self.schema), cols, unmatched.len()).map_err(arrow_err)
     }
 }
 
@@ -1480,6 +1484,44 @@ mod tests {
         let mut join =
             HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 30).unwrap();
         assert_eq!(collect_all(&mut join).num_rows(), 0, "empty left side");
+    }
+
+    /// A cross join between two ZERO-COLUMN inputs. This is not a contrived
+    /// shape: `SELECT count(*) FROM t CROSS JOIN d` reads no column of either
+    /// table, so column pruning empties both schemas and the join's own
+    /// output schema with them. All that is left to carry is the row count —
+    /// which is exactly what `count(*)` then counts.
+    ///
+    /// `RecordBatch::try_new` cannot express "no columns, N rows": with no
+    /// array to infer a length from it fails with "must either specify a row
+    /// count or at least one column". That is verbatim the error the fallback
+    /// probe measured on that query, and it made the whole statement fall
+    /// back to DataFusion.
+    #[test]
+    fn a_cross_join_of_two_zero_column_inputs_still_carries_its_row_count() {
+        let empty_schema = Arc::new(Schema::empty());
+        let rows = |n: usize| {
+            RecordBatch::try_new_with_options(
+                Arc::clone(&empty_schema),
+                vec![],
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(n)),
+            )
+            .unwrap()
+        };
+        let left = Box::new(Feed::new(Arc::clone(&empty_schema), vec![rows(5)]));
+        let right = Box::new(Feed::new(Arc::clone(&empty_schema), vec![rows(2)]));
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 30).unwrap();
+
+        let mut total = 0;
+        while let Some(b) = join
+            .next_batch()
+            .expect("a zero-column cross join must build, not error")
+        {
+            assert_eq!(b.num_columns(), 0);
+            total += b.num_rows();
+        }
+        assert_eq!(total, 10, "5 left x 2 right = 10, and the count is all there is");
     }
 
     // ─── Empty inputs, other kinds ─────────────────────────────────────

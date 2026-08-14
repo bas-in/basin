@@ -230,11 +230,11 @@ use arrow_array::{
     Float64Array,
     Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, ListArray, RecordBatch,
     StringArray,
-    TimestampMicrosecondArray,
+    TimestampMicrosecondArray, UInt32Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow_schema::{ArrowError, DataType, Field};
-use arrow_select::interleave;
+use arrow_select::{interleave, take};
 use chrono::{
     offset::MappedLocalTime, DateTime, Datelike, NaiveDate, NaiveDateTime, Offset, TimeDelta,
     TimeZone as _, Timelike,
@@ -261,6 +261,28 @@ const OR_OP: OpId = OpId(Oid(u32::MAX - 1));
 /// though they share the same sentinel numbering scheme.
 const NOT_OP: OpId = OpId(Oid(u32::MAX - 2));
 
+// ─── Date/integer operator OIDs ─────────────────────────────────────────────
+//
+// Real `pg_operator.oid`s, read from a live PostgreSQL 18.2:
+//
+// ```sql
+// SELECT oid, oprname, oprleft::regtype, oprright::regtype,
+//        oprresult::regtype, oprcode
+//   FROM pg_operator
+//  WHERE 'date'::regtype IN (oprleft, oprright) AND oprname IN ('+','-');
+// ```
+//
+// These four are dispatched by OID rather than by the operator NAME the rest
+// of `eval_binary` keys on, because the name cannot tell them apart: `-`
+// covers both `date - integer` (which yields another *date*) and
+// `date - date` (which yields an *integer* count of days), and the arrow
+// arrays alone would not distinguish `date + interval` (a *timestamp*, oid
+// 1076, already served by arrow's kernel) from `date + integer`.
+const OID_OP_DATE_PLI: u32 = 1100; // date + integer -> date
+const OID_OP_DATE_MII: u32 = 1101; // date - integer -> date
+const OID_OP_DATE_MI_DATE: u32 = 1099; // date - date -> integer
+const OID_OP_INT_PL_DATE: u32 = 2555; // integer + date -> date
+
 // ─── Scalar function OIDs ───────────────────────────────────────────────────
 //
 // Every value below is a real `pg_proc.oid`, read from a live PostgreSQL 18
@@ -285,6 +307,17 @@ const NOT_OP: OpId = OpId(Oid(u32::MAX - 2));
 const OID_LOWER: u32 = 870; // lower(text)
 const OID_UPPER: u32 = 871; // upper(text)
 const OID_LENGTH_TEXT: u32 = 1317; // length(text)
+// `char_length(text)` and `character_length(text)` are the SQL-standard
+// spellings of `length(text)`. Postgres gives each its own `pg_proc` row
+// rather than aliasing them, so a dispatch keyed on OID must name all three
+// even though one implementation answers them: measured live on PG 18.2,
+// `length`/`char_length`/`character_length` all return 5 for 'héllo',
+// 3 for '日本語' and 7 for '🎉party🎉' — characters, not bytes.
+const OID_CHAR_LENGTH_TEXT: u32 = 1381; // char_length(text)
+const OID_CHARACTER_LENGTH_TEXT: u32 = 1369; // character_length(text)
+// `array_length(anyarray, integer)`. See [`eval_array_length`] for the three
+// ways Postgres answers NULL here.
+const OID_ARRAY_LENGTH: u32 = 2176; // array_length(anyarray, integer)
 const OID_SUBSTR_2: u32 = 883; // substr(text, int)
 const OID_SUBSTR_3: u32 = 877; // substr(text, int, int)
 
@@ -672,6 +705,7 @@ pub fn eval_with(
         }
         Expr::ScalarFn { func, args } => eval_scalar_fn(*func, args, batch, session),
         Expr::ArrayLit(elements) => eval_array_lit(elements, batch, session),
+        Expr::Subscript { arg, indices } => eval_subscript(arg, indices, batch, session),
         Expr::DistinctFrom { lhs, rhs, negated } => eval_distinct_from(lhs, rhs, *negated, batch, session),
         Expr::InList { arg, list, negated } => eval_in_list(arg, list, *negated, batch, session),
         Expr::Between {
@@ -868,6 +902,19 @@ fn eval_unary(op: OpId, arg: &Expr, batch: &RecordBatch,
     // the null buffer across and only negates the underlying bits, never
     // manufacturing a value where there was none.
     if op == NOT_OP {
+        // A bare `NULL` literal is typed `unknown`, which
+        // `basin_pgtype::physical` materializes as `Utf8` — so `NOT NULL`
+        // arrives here as a string array and `require_bool` rejects it, even
+        // though Postgres resolves the untyped NULL under `NOT` to boolean
+        // (`SELECT (NOT NULL) IS NULL` is `t`, measured live). Recognise the
+        // LITERAL rather than loosening `require_bool` to accept any all-NULL
+        // array: that broader rule would turn `NOT <text column>` — which
+        // Postgres rejects outright ("argument of NOT must be type boolean")
+        // — from an honest error into a wrong answer on the day every row of
+        // that column happens to be NULL.
+        if matches!(arg, Expr::Literal(PlanDatum::Null, _)) {
+            return Ok(new_null_array(&DataType::Boolean, batch.num_rows()));
+        }
         let b = require_bool(&v)?;
         return Ok(Arc::new(boolean::not(b).map_err(|e| map_arrow(e, "NOT"))?));
     }
@@ -924,6 +971,19 @@ fn eval_binary(
     })?;
 
     let (l, r) = eval_operand_pair(lhs, rhs, batch, session)?;
+
+    // Date/integer arithmetic, before the name-keyed table below: arrow has
+    // no kernel for it (`numeric::add` refuses a Date32/Int32 pair with
+    // "Invalid date arithmetic operation") and the operator NAME alone cannot
+    // tell `date - integer` from `date - date`. See the OID block near the
+    // top of this file.
+    match op.0.get() {
+        OID_OP_DATE_PLI => return date_offset_days(&l, &r, 1),
+        OID_OP_INT_PL_DATE => return date_offset_days(&r, &l, 1),
+        OID_OP_DATE_MII => return date_offset_days(&l, &r, -1),
+        OID_OP_DATE_MI_DATE => return date_diff_days(&l, &r),
+        _ => {}
+    }
 
     match name {
         "=" => Ok(Arc::new(cmp::eq(&l, &r).map_err(|e| map_arrow(e, "="))?)),
@@ -1386,6 +1446,192 @@ fn eval_array_lit(
     ))
 }
 
+/// Downcast to the one array layout `basin_pgtype::physical` produces for a
+/// Postgres array type. Anything else reaching here is a planner bug, so it
+/// is reported rather than improvised around.
+fn require_list<'a>(arr: &'a ArrayRef, what: &str) -> Result<&'a ListArray, ExecError> {
+    arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        ExecError::TypeMismatch(format!(
+            "{what} expects an array, found {:?}",
+            arr.data_type()
+        ))
+    })
+}
+
+/// `array_length(a, d)` — the length of array `a` along dimension `d`.
+///
+/// Postgres answers NULL — not 0, and not an error — in four distinct
+/// situations. All six rows below were measured live on PostgreSQL 18.2:
+///
+/// | call                               | result |
+/// |------------------------------------|--------|
+/// | `array_length(ARRAY['x','y'], 1)`  | 2      |
+/// | `array_length(ARRAY['x','y'], 2)`  | NULL — no such dimension |
+/// | `array_length(ARRAY['x','y'], 0)`  | NULL — dimensions are 1-based |
+/// | `array_length(ARRAY[]::text[], 1)` | NULL — an EMPTY array has no dimensions at all, so not even dimension 1 exists |
+/// | `array_length(NULL::text[], 1)`    | NULL — strict in the array |
+/// | `array_length(ARRAY[1,NULL,3], 1)` | 3 — a NULL *element* still occupies a slot |
+///
+/// The empty-array row is the one worth stating explicitly: `0` is the
+/// natural reading of "length" there and it is the wrong answer.
+///
+/// Only dimension 1 can ever be non-NULL here because Arrow's `ListArray` is
+/// the physical form of a one-dimensional Postgres array; a genuinely
+/// multi-dimensional `int[][]` has no physical type in `basin_pgtype` yet, so
+/// no such value can reach this function.
+fn eval_array_length(arr: &ArrayRef, dim: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let list = require_list(arr, "array_length")?;
+    let dims = cast::cast(dim, &DataType::Int64).map_err(|e| map_arrow(e, "array_length"))?;
+    let dims = dims
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("just cast to Int64");
+    let offsets = list.value_offsets();
+    let out: Int32Array = (0..list.len())
+        .map(|i| {
+            if list.is_null(i) || dims.is_null(i) || dims.value(i) != 1 {
+                return None;
+            }
+            let len = offsets[i + 1] - offsets[i];
+            // An empty array has NO dimensions — see the table above.
+            if len == 0 {
+                None
+            } else {
+                Some(len)
+            }
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `a[i]` — a single array subscript.
+///
+/// Postgres subscripts are 1-based and, unlike almost everything else in the
+/// language, do NOT error when they miss: `(ARRAY['x','y'])[9]`,
+/// `(ARRAY['x','y'])[0]` and `(ARRAY['x','y'])[-1]` are all NULL, measured
+/// live, and so is a subscript of a NULL array. That is why the whole thing
+/// is expressed as a `take` with a null-carrying index vector rather than as
+/// a bounds check that raises.
+///
+/// Only the single-index form is built. `a[i:j]` (a slice) and chained
+/// subscripts fall through to the caller's catch-all, so the bridge keeps
+/// falling back for them rather than answering a shape this does not
+/// implement.
+fn eval_subscript(
+    arg: &Expr,
+    indices: &[basin_plan::Subscript],
+    batch: &RecordBatch,
+    session: &EvalSession,
+) -> Result<ArrayRef, ExecError> {
+    let [basin_plan::Subscript::Index(idx_expr)] = indices else {
+        return Err(ExecError::Internal(format!(
+            "array subscript {indices:?} is not implemented in eval yet"
+        )));
+    };
+    let arr = eval_with(arg, batch, session)?;
+    let list = require_list(&arr, "array subscript")?;
+    let idx = eval_with(idx_expr, batch, session)?;
+    let idx = cast::cast(&idx, &DataType::Int64).map_err(|e| map_arrow(e, "array subscript"))?;
+    let idx = idx
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("just cast to Int64");
+
+    // `value_offsets()` is already relative to this array's own window, and
+    // `values()` is the full child buffer those offsets index into, so a
+    // sliced ListArray needs no extra adjustment here.
+    let offsets = list.value_offsets();
+    let picks: UInt32Array = (0..list.len())
+        .map(|i| {
+            if list.is_null(i) || idx.is_null(i) {
+                return None;
+            }
+            let one_based = idx.value(i);
+            let len = i64::from(offsets[i + 1] - offsets[i]);
+            if one_based < 1 || one_based > len {
+                return None;
+            }
+            Some(u32::try_from(i64::from(offsets[i]) + one_based - 1).expect("offset fits u32"))
+        })
+        .collect();
+    take::take(list.values().as_ref(), &picks, None)
+        .map_err(|e| map_arrow(e, "array subscript"))
+}
+
+/// `date + integer` / `date - integer` — Postgres's `date_pli`/`date_mii`
+/// (and `integer + date`, `integer_pl_date`), which have no Arrow kernel:
+/// `numeric::add` refuses a `Date32`/`Int32` pair outright with "Invalid date
+/// arithmetic operation". `Date32` is a count of days since the epoch, so all
+/// of it is integer arithmetic on that day number.
+///
+/// `sign` is `1` for `+` and `-1` for `-`. Measured live:
+/// `'2024-01-15'::DATE + 1` is `2024-01-16` and `- 1` is `2024-01-14`, both
+/// of type `date` — not `timestamp`, which is what `date + interval` yields.
+fn date_offset_days(date: &ArrayRef, days: &ArrayRef, sign: i32) -> Result<ArrayRef, ExecError> {
+    let d = date
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .ok_or_else(|| {
+            ExecError::TypeMismatch(format!(
+                "date arithmetic expects a date, found {:?}",
+                date.data_type()
+            ))
+        })?;
+    let n = cast::cast(days, &DataType::Int32).map_err(|e| map_arrow(e, "date arithmetic"))?;
+    let n = n
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("just cast to Int32");
+    let out: Date32Array = (0..d.len())
+        .map(|i| {
+            if d.is_null(i) || n.is_null(i) {
+                return Ok(None);
+            }
+            n.value(i)
+                .checked_mul(sign)
+                .and_then(|off| d.value(i).checked_add(off))
+                .map(Some)
+                .ok_or(ExecError::Overflow("date"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `date - date` — Postgres's `date_mi`, which yields an `integer` count of
+/// days, not another date and not an interval. Measured live:
+/// `'2024-01-15'::DATE - '2024-01-01'::DATE` is `14`.
+fn date_diff_days(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let cast_date = |a: &ArrayRef| -> Result<Date32Array, ExecError> {
+        a.as_any()
+            .downcast_ref::<Date32Array>()
+            .cloned()
+            .ok_or_else(|| {
+                ExecError::TypeMismatch(format!(
+                    "date subtraction expects a date, found {:?}",
+                    a.data_type()
+                ))
+            })
+    };
+    let l = cast_date(lhs)?;
+    let r = cast_date(rhs)?;
+    let out: Int32Array = (0..l.len())
+        .map(|i| {
+            if l.is_null(i) || r.is_null(i) {
+                return Ok(None);
+            }
+            l.value(i)
+                .checked_sub(r.value(i))
+                .map(Some)
+                .ok_or(ExecError::Overflow("integer"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect();
+    Ok(Arc::new(out))
+}
+
 fn eval_coalesce(exprs: &[Expr], batch: &RecordBatch,
     session: &EvalSession) -> Result<ArrayRef, ExecError> {
     if exprs.is_empty() {
@@ -1650,7 +1896,10 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
     match oid {
         OID_LOWER => text_unary(&a(0)?, str::to_lowercase),
         OID_UPPER => text_unary(&a(0)?, str::to_uppercase),
-        OID_LENGTH_TEXT => text_char_length(&a(0)?),
+        OID_LENGTH_TEXT | OID_CHAR_LENGTH_TEXT | OID_CHARACTER_LENGTH_TEXT => {
+            text_char_length(&a(0)?)
+        }
+        OID_ARRAY_LENGTH => eval_array_length(&a(0)?, &a(1)?),
 
         OID_SUBSTR_2 | OID_SUBSTRING_2 => eval_substr(&a(0)?, &a(1)?, None),
         OID_SUBSTR_3 | OID_SUBSTRING_3 => {
@@ -5287,6 +5536,238 @@ mod tests {
         assert_eq!(
             seen,
             vec![Some("A!"), Some("B!"), None, None, Some("A!")]
+        );
+    }
+
+    /// A one-column `text[]` batch modelled on the fallback probe's `e.tags`:
+    /// row 0 is `{x,y}`, row 1 is `{}` (an EMPTY array, which is not the same
+    /// thing as NULL), row 2 is a NULL array.
+    fn batch_text_list() -> RecordBatch {
+        let item = Arc::new(Field::new("item", DataType::Utf8, true));
+        let values = Arc::new(StringArray::from(vec![Some("x"), Some("y")])) as ArrayRef;
+        let offsets = OffsetBuffer::new(vec![0, 2, 2, 2].into());
+        let nulls = arrow::buffer::NullBuffer::from(vec![true, true, false]);
+        let list = ListArray::try_new(item, offsets, values, Some(nulls)).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            list.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(list)]).unwrap()
+    }
+
+    /// `char_length` and `character_length` are the SQL-standard spellings of
+    /// `length`, and Postgres gives each its own `pg_proc` row (1381 and 1369
+    /// against `length`'s 1317) rather than aliasing them — so a dispatch
+    /// keyed on OID answers `length(s)` and falls back on `char_length(s)`
+    /// unless all three are named. That is exactly what the probe measured on
+    /// `SELECT length(s), char_length(s) FROM mb`.
+    ///
+    /// All four expectations are live PostgreSQL 18.2, and all four are
+    /// CHARACTER counts, not byte counts — `héllo` is 6 bytes and 5
+    /// characters, `日本語` is 9 bytes and 3, `🎉party🎉` is 13 bytes and 7
+    /// (each emoji is one astral-plane code point), `naïve café` is 12 bytes
+    /// and 10.
+    #[test]
+    fn char_length_and_character_length_count_the_same_characters_as_length() {
+        for (input, expected) in [
+            ("héllo", 5),
+            ("日本語", 3),
+            ("🎉party🎉", 7),
+            ("naïve café", 10),
+        ] {
+            for oid in [OID_LENGTH_TEXT, OID_CHAR_LENGTH_TEXT, OID_CHARACTER_LENGTH_TEXT] {
+                let got = eval(&sf(oid, vec![lit_text(input)]), &one_row()).unwrap();
+                assert_eq!(
+                    i32_array(&got).value(0),
+                    expected,
+                    "oid {oid} on {input:?}"
+                );
+            }
+        }
+    }
+
+    /// `array_length(a, d)`. Every row here is live PostgreSQL 18.2, and the
+    /// interesting ones are the NULLs: an EMPTY array has no dimensions at
+    /// all, so `array_length(ARRAY[]::text[], 1)` is NULL and not 0 —
+    /// returning 0 is the natural reading and the wrong answer.
+    #[test]
+    fn array_length_is_null_for_an_empty_array_and_for_a_missing_dimension() {
+        let batch = batch_text_list();
+        let tags = col(0, "tags");
+        let got = eval(&sf(OID_ARRAY_LENGTH, vec![tags.clone(), lit_i32(1)]), &batch).unwrap();
+        let got = i32_array(&got);
+        assert_eq!(got.value(0), 2, "array_length(ARRAY['x','y'], 1) = 2");
+        assert!(got.is_null(1), "an EMPTY array has no dimension 1, so NULL — not 0");
+        assert!(got.is_null(2), "array_length(NULL::text[], 1) is NULL");
+
+        // Dimensions are 1-based, and a 1-D array has no dimension 2.
+        for dim in [0, 2, -1] {
+            let got = eval(
+                &sf(OID_ARRAY_LENGTH, vec![tags.clone(), lit_i32(dim)]),
+                &batch,
+            )
+            .unwrap();
+            assert!(
+                i32_array(&got).is_null(0),
+                "array_length(ARRAY['x','y'], {dim}) is NULL"
+            );
+        }
+    }
+
+    /// `a[i]`. Postgres subscripts are 1-based and, unlike almost everything
+    /// else in the language, do NOT error when they miss — live PostgreSQL
+    /// 18.2 gives NULL for `(ARRAY['x','y'])[9]`, `[0]` and `[-1]` alike, and
+    /// for any subscript of a NULL array.
+    #[test]
+    fn array_subscript_is_one_based_and_null_outside_the_bounds() {
+        let batch = batch_text_list();
+        let sub = |i: i32| Expr::Subscript {
+            arg: Box::new(col(0, "tags")),
+            indices: vec![basin_plan::Subscript::Index(lit_i32(i))],
+        };
+
+        let got = eval(&sub(1), &batch).unwrap();
+        let s = str_array(&got);
+        assert_eq!(s.value(0), "x", "(ARRAY['x','y'])[1] is 'x'");
+        assert!(s.is_null(1), "an empty array has no element 1");
+        assert!(s.is_null(2), "(NULL::text[])[1] is NULL");
+
+        let got = eval(&sub(2), &batch).unwrap();
+        assert_eq!(str_array(&got).value(0), "y");
+
+        for miss in [9, 0, -1] {
+            let got = eval(&sub(miss), &batch).unwrap();
+            assert!(
+                str_array(&got).is_null(0),
+                "(ARRAY['x','y'])[{miss}] is NULL, not an error"
+            );
+        }
+    }
+
+    /// A two-`date` batch, for the `date`/`integer` operators.
+    fn batch_two_dates(a: Option<i32>, b: Option<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::Date32, true),
+            Field::new("r", DataType::Date32, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Date32Array::from(vec![a])),
+                Arc::new(Date32Array::from(vec![b])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn date_array(v: &ArrayRef) -> &Date32Array {
+        v.as_any().downcast_ref::<Date32Array>().unwrap()
+    }
+
+    /// `date + integer` and `date - integer` (`date_pli` 1100, `date_mii`
+    /// 1101, `integer_pl_date` 2555). Arrow has no kernel for the mixed pair
+    /// — `numeric::add` refuses it with "Invalid date arithmetic operation:
+    /// Date32 + Int32", which is exactly what the probe measured on `SELECT
+    /// '2024-01-15'::DATE + 1`.
+    ///
+    /// Live PostgreSQL 18.2: `'2024-01-15'::DATE + 1` is `2024-01-16` and
+    /// `- 1` is `2024-01-14`, and `pg_typeof` of each is `date` — NOT the
+    /// `timestamp` that `date + interval` produces. As day numbers since the
+    /// epoch (`'…'::date - '1970-01-01'::date`, live): 19737, 19738, 19736.
+    #[test]
+    fn date_plus_or_minus_an_integer_is_another_date() {
+        let batch = batch_two_dates(Some(19737), None);
+        let d = col(0, "l");
+
+        let plus = Expr::Binary {
+            op: op(OID_OP_DATE_PLI),
+            lhs: Box::new(d.clone()),
+            rhs: Box::new(lit_i32(1)),
+        };
+        let got = eval(&plus, &batch).unwrap();
+        assert_eq!(got.data_type(), &DataType::Date32, "date + int stays a date");
+        assert_eq!(date_array(&got).value(0), 19738, "2024-01-15 + 1 = 2024-01-16");
+
+        let minus = Expr::Binary {
+            op: op(OID_OP_DATE_MII),
+            lhs: Box::new(d.clone()),
+            rhs: Box::new(lit_i32(1)),
+        };
+        assert_eq!(
+            date_array(&eval(&minus, &batch).unwrap()).value(0),
+            19736,
+            "2024-01-15 - 1 = 2024-01-14"
+        );
+
+        // `integer + date` is a DIFFERENT pg_operator row (2555) with the
+        // operands the other way round; it must agree with 1100.
+        let flipped = Expr::Binary {
+            op: op(OID_OP_INT_PL_DATE),
+            lhs: Box::new(lit_i32(1)),
+            rhs: Box::new(d),
+        };
+        assert_eq!(date_array(&eval(&flipped, &batch).unwrap()).value(0), 19738);
+    }
+
+    /// `date - date` (`date_mi`, 1099) yields an INTEGER count of days — not
+    /// another date, and not an interval. The operator NAME `-` cannot tell
+    /// this apart from `date - integer`, which is why the dispatch is keyed
+    /// on the OID. Live PostgreSQL 18.2: `'2024-01-15'::DATE -
+    /// '2024-01-01'::DATE` is `14`.
+    #[test]
+    fn date_minus_date_is_an_integer_count_of_days() {
+        let batch = batch_two_dates(Some(19737), Some(19723));
+        let expr = Expr::Binary {
+            op: op(OID_OP_DATE_MI_DATE),
+            lhs: Box::new(col(0, "l")),
+            rhs: Box::new(col(1, "r")),
+        };
+        let got = eval(&expr, &batch).unwrap();
+        assert_eq!(got.data_type(), &DataType::Int32, "date - date is an integer");
+        assert_eq!(i32_array(&got).value(0), 14);
+
+        // Strict in both operands.
+        let batch = batch_two_dates(Some(19737), None);
+        assert!(i32_array(&eval(&expr, &batch).unwrap()).is_null(0));
+    }
+
+    /// `NOT NULL` over a bare, untyped NULL literal. Lowering types it
+    /// `unknown`, which `basin_pgtype::physical` materializes as `Utf8`, so
+    /// `require_bool` rejected it and `SELECT (NOT NULL) IS NULL` fell back —
+    /// even though Postgres resolves the untyped NULL under `NOT` to boolean
+    /// and answers `t` (live PostgreSQL 18.2; `NOT NULL` itself is NULL).
+    #[test]
+    fn not_of_an_untyped_null_literal_is_a_boolean_null() {
+        let expr = Expr::Unary {
+            op: NOT_OP,
+            arg: Box::new(Expr::Literal(Datum::Null, PgType::UNKNOWN)),
+        };
+        let got = eval(&expr, &one_row()).unwrap();
+        assert_eq!(
+            got.data_type(),
+            &DataType::Boolean,
+            "NOT of an untyped NULL is boolean, not text"
+        );
+        assert!(bool_array(&got).is_null(0), "NOT NULL is NULL");
+    }
+
+    /// The narrow fix above must NOT become "any all-NULL array is
+    /// acceptable to NOT". Postgres rejects `NOT <text>` outright ("argument
+    /// of NOT must be type boolean, not type text"), so a text COLUMN under
+    /// `NOT` has to stay an error here even when every row of it happens to
+    /// be NULL — otherwise the day the data is all-NULL is the day the query
+    /// silently starts answering.
+    #[test]
+    fn not_of_an_all_null_text_column_is_still_an_error() {
+        let batch = batch_str1("s", vec![None, None]);
+        let expr = Expr::Unary {
+            op: NOT_OP,
+            arg: Box::new(col(0, "s")),
+        };
+        assert!(
+            eval(&expr, &batch).is_err(),
+            "NOT over a text column must stay an error, all-NULL or not"
         );
     }
 
