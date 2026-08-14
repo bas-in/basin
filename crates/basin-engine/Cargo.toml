@@ -65,7 +65,16 @@ vortex = "0.71"
 datafusion-datasource = "53"
 datafusion-physical-expr = "53"
 datafusion-physical-plan = "53"
-datafusion-session = "53"
+# `datafusion-session` was here and is gone: measured at zero uses in source
+# (`grep -rn datafusion_session --include='*.rs' crates/` returns nothing), and
+# the crate compiles clean without it. See
+# docs/migration/df-removal/22-removal-surface-measured.md, Tier 0.
+#
+# The three above are NOT removable the same way. They are the reason deleting
+# the workspace's `datafusion = "53"` does not remove DataFusion: with the
+# umbrella crate gone from both manifests, `cargo tree` still shows eighteen
+# datafusion-* v53.1.0 crates, arriving through these literal-versioned direct
+# deps and through vortex-datafusion.
 sqlparser.workspace = true
 object_store.workspace = true
 thiserror.workspace = true

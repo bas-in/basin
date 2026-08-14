@@ -1235,7 +1235,6 @@ dependencies = [
  "datafusion-datasource",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
- "datafusion-session",
  "futures",
  "geo",
  "hdrhistogram",
