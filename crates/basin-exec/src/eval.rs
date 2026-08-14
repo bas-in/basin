@@ -2746,7 +2746,11 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
     };
 
     match oid {
-        OID_LOWER => text_unary(&a(0)?, str::to_lowercase),
+        // OID_LOWER's arm is GONE — `lower` is hosted in
+        // `crate::funcs::str_fns::Lower` and answered by the registry above.
+        // Deleting the arm is step 3 of a port and is not optional: the
+        // registry is consulted first, so a left-behind arm is unreachable
+        // code that still reads as live.
         OID_UPPER => text_unary(&a(0)?, str::to_uppercase),
         OID_LENGTH_TEXT | OID_CHAR_LENGTH_TEXT | OID_CHARACTER_LENGTH_TEXT => {
             text_char_length(&a(0)?)
@@ -3122,7 +3126,7 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
 /// [`ExecError::TypeMismatch`] naming what was expected. `what` is a
 /// human-readable label (e.g. `"text"`), not a Rust type name, since this is
 /// surfaced to whatever reports the error.
-fn downcast_array<'a, T: Array + 'static>(
+pub(crate) fn downcast_array<'a, T: Array + 'static>(
     array: &'a ArrayRef,
     what: &'static str,
 ) -> Result<&'a T, ExecError> {

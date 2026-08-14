@@ -49,6 +49,8 @@ use basin_pgtype::{Oid, PgType};
 use crate::eval::EvalSession;
 use crate::operator::ExecError;
 
+pub mod str_fns;
+
 /// The `pg_proc` row for `oid`, or `None`.
 ///
 /// A linear scan of [`basin_pgtype::func::FUNCS`]. Called at registration
@@ -176,6 +178,7 @@ pub fn builtins() -> &'static FuncRegistry {
         let mut r = FuncRegistry::new();
         // Phase 1 slices append their registrations here. Append-only, so two
         // agents porting different oid ranges conflict only on adjacent lines.
+        r.register_scalar(Box::new(str_fns::Lower));
         r
     })
 }
@@ -184,18 +187,34 @@ pub fn builtins() -> &'static FuncRegistry {
 mod tests {
     use super::*;
 
-    /// At zero registrations every lookup must miss, sending the caller to
-    /// the `match` fallback. This is the property that makes the migration
-    /// incremental: with nothing hosted, the engine behaves exactly as it did
-    /// before this module existed.
+    /// A lookup for an oid nobody has ported must MISS, so the caller falls
+    /// through to `eval_scalar_fn`'s `match`. This is the property that makes
+    /// the migration incremental — an unported function must behave exactly
+    /// as it did before this module existed.
+    ///
+    /// Oid 1395 is `abs(float8)`, deliberately chosen as one that is still in
+    /// the `match`. When a slice ports it, pick another unported oid rather
+    /// than deleting this test: the fallthrough is what keeps every
+    /// intermediate commit runnable.
     #[test]
-    fn the_builtin_registry_starts_empty_and_defers_everything() {
+    fn an_unported_oid_misses_and_falls_through_to_the_match() {
+        assert!(
+            builtins().scalar(Oid(1395)).is_none(),
+            "abs(float8) is not hosted, so it must fall through"
+        );
+    }
+
+    /// The hosted count comes off the registry itself. It is the Phase 1
+    /// progress metric, so it must not be a maintained constant — that is
+    /// exactly the hardcoded census the orphan battery was caught keeping.
+    #[test]
+    fn the_registry_reports_what_is_actually_hosted() {
         assert_eq!(
             builtins().len(),
-            0,
-            "nothing is hosted yet — this assertion moves as Phase 1 lands"
+            1,
+            "one function is hosted (lower, oid 870); this number rises as \
+             Phase 1 slices land and is read from the registry, not tracked"
         );
-        assert!(builtins().scalar(Oid(870)).is_none(), "lower() is not hosted");
     }
 
     /// `catalog_row` must agree with the catalog rather than with a
