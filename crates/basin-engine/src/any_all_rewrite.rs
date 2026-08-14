@@ -17,7 +17,7 @@
 //!
 //! We only rewrite when:
 //! * `subquery.outer_ref_columns.is_empty()` — truly uncorrelated
-//! * `quantifier` is `Any` or `All`
+//! * `quantifier` is `Any` (**`All` is always declined** — see `agg_for`)
 //! * `op` is one of `Gt`, `GtEq`, `Lt`, `LtEq` (equality handled by InSubquery)
 //! * The subquery projection has exactly ONE output column
 //! * The subquery's top-level logical plan is NOT already an `Aggregate`
@@ -26,14 +26,28 @@
 //!
 //! ## NULL / empty-input semantics
 //!
-//! SQL spec:
-//! * `ANY` over an empty set returns `false`
-//! * `ALL`  over an empty set returns `true`
+//! Measured against live PostgreSQL 18.2, `x OP ANY/ALL (S)` is a Kleene
+//! fold over the element comparisons, not a comparison against an extremum:
 //!
-//! `MIN`/`MAX` return NULL on an empty input, so `lhs > NULL` is NULL.  To
-//! preserve the spec semantics we wrap:
-//! * Any:  `(lhs op scalar_subq) IS TRUE`      — NULL/false both become false ✓
-//! * All:  `CASE WHEN (cmp IS NULL) THEN true ELSE cmp END` — NULL becomes true  ✓
+//! * `ANY` — TRUE if any element comparison is TRUE, else NULL if any is
+//!   NULL, else FALSE. Empty `S` → FALSE.
+//! * `ALL` — FALSE if any element comparison is FALSE, else NULL if any is
+//!   NULL, else TRUE. Empty `S` → TRUE (vacuously).
+//!
+//! `MIN`/`MAX` skip NULL elements and return NULL on empty input, so a
+//! scalar comparison against them cannot represent the NULL arm of either
+//! fold. What that costs each quantifier is different:
+//!
+//! * Any:  `(lhs op scalar_subq) IS TRUE` — turns the NULL arm into FALSE.
+//!   A `WHERE` or `JOIN … ON` position cannot tell those apart, so this
+//!   rewrite is answer-preserving there. It is **not** exact in a *value*
+//!   position: PostgreSQL gives `1.5 > ANY (SELECT amt FROM t WHERE id
+//!   < 101)` = NULL over a NULL-containing subquery, this rule gives FALSE.
+//!   Kept for the O(n) plan, with that caveat recorded rather than hidden.
+//! * All:  declined outright. The old `CASE WHEN (cmp IS NULL) THEN true
+//!   ELSE cmp END` wrapper turned NULL into TRUE, which a `WHERE` clause
+//!   *does* expose, and it produced wrong rows even when the subquery held
+//!   no NULLs at all. `agg_for`'s doc comment has the measured rows.
 
 use std::sync::Arc;
 
@@ -42,9 +56,9 @@ use datafusion::common::{
     Column, Result,
 };
 use datafusion::logical_expr::{
-    expr::{BinaryExpr, Case, SetComparison, SetQuantifier},
+    expr::{BinaryExpr, SetComparison, SetQuantifier},
     expr_fn::scalar_subquery,
-    lit, Expr, LogicalPlan, LogicalPlanBuilder, Operator,
+    Expr, LogicalPlan, LogicalPlanBuilder, Operator,
 };
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -57,6 +71,45 @@ enum AggKind {
 
 /// Map `(quantifier, op)` → the aggregate function needed for the scalar
 /// rewrite, or `None` if this combination is not handled (e.g. `Eq`).
+///
+/// # `ALL` is deliberately absent
+///
+/// This rule used to map `ALL` onto `max`/`min` too, wrapped in
+/// `CASE WHEN cmp IS NULL THEN true ELSE cmp END`. That form is wrong, and
+/// wrong in a way a `WHERE` clause exposes. Measured against live PostgreSQL
+/// 18.2 on the golden seed
+/// `t(id, amt) = (1,1.5),(2,2.5),(3,3.5),(100,NULL),(101,10.5)`:
+///
+/// ```text
+/// WHERE amt > ALL (SELECT amt FROM t WHERE id < 2)    -- plain subquery
+///   PostgreSQL: {2,3,101}          CASE/max form: {2,3,100,101}
+/// WHERE amt > ALL (SELECT amt FROM t WHERE id < 101)  -- subquery has a NULL
+///   PostgreSQL: (no rows)          CASE/max form: {100,101}
+/// ```
+///
+/// Two independent defects, both of which turn NULL into TRUE:
+///
+/// * The `CASE WHEN cmp IS NULL THEN true` arm cannot tell *why* `cmp` is
+///   NULL. It is meant to catch "the subquery was empty, so `max` is NULL,
+///   so the predicate is vacuously true" — but it fires just as eagerly when
+///   the NULL came from the **left** operand. Row 100 has `amt IS NULL`, so
+///   `NULL > 1.5` is NULL, and the rule promotes that row to TRUE. That is
+///   the extra `100` in the plain case, where the subquery holds no NULLs at
+///   all and the empty-set rationale does not even apply.
+/// * `max`/`min` skip NULLs *inside* the subquery, so a NULL element that
+///   should force the whole Kleene AND-fold to NULL is silently dropped.
+///
+/// `x OP ALL (S)` is a three-valued AND-fold: FALSE if any element
+/// comparison is FALSE, else NULL if any is NULL, else TRUE (and TRUE for
+/// empty `S`, vacuously). No single `max`/`min` scalar comparison can encode
+/// the "some element compared NULL" state, so `ALL` is declined outright and
+/// left to DataFusion's `RewriteSetComparison`, whose two-EXISTS
+/// decomposition tracks the NULL arm explicitly.
+///
+/// `ANY` is kept: `IsTrue(k op min/max)` collapses NULL to FALSE, which a
+/// `WHERE`/`JOIN` position cannot distinguish. It is still not exact in a
+/// *value* position — PostgreSQL gives `1.5 > ANY (SELECT amt FROM t WHERE
+/// id < 101)` = NULL where this rule gives FALSE — see the module-level note.
 fn agg_for(quantifier: SetQuantifier, op: Operator) -> Option<AggKind> {
     match (quantifier, op) {
         // k > ANY(subq)  ≡  k > min(subq)   — true iff at least one element < k
@@ -67,12 +120,7 @@ fn agg_for(quantifier: SetQuantifier, op: Operator) -> Option<AggKind> {
         (SetQuantifier::Any, Operator::Lt) => Some(AggKind::Max),
         // k <= ANY(subq) ≡  k <= max(subq)
         (SetQuantifier::Any, Operator::LtEq) => Some(AggKind::Max),
-        // k > ALL(subq)  ≡  k > max(subq)   — true iff every element < k
-        (SetQuantifier::All, Operator::Gt) => Some(AggKind::Max),
-        (SetQuantifier::All, Operator::GtEq) => Some(AggKind::Max),
-        // k < ALL(subq)  ≡  k < min(subq)   — true iff every element > k
-        (SetQuantifier::All, Operator::Lt) => Some(AggKind::Min),
-        (SetQuantifier::All, Operator::LtEq) => Some(AggKind::Min),
+        // `ALL` in every form: declined — see the doc comment above.
         _ => None,
     }
 }
@@ -164,22 +212,16 @@ fn try_rewrite(set_cmp: SetComparison) -> Result<Transformed<Expr>> {
         right: Box::new(scalar_subq),
     });
 
-    // 8. Apply NULL/empty-set semantics wrapper.
-    let result = match quantifier {
-        // ANY over empty set → false; (lhs op NULL) → NULL → false via IS TRUE.
-        SetQuantifier::Any => Expr::IsTrue(Box::new(cmp)),
-
-        // ALL over empty set → true; (lhs op NULL) → NULL → true.
-        // Build as CASE WHEN (cmp IS NULL) THEN true ELSE cmp END.
-        SetQuantifier::All => Expr::Case(Case {
-            expr: None,
-            when_then_expr: vec![(
-                Box::new(Expr::IsNull(Box::new(cmp.clone()))),
-                Box::new(lit(true)),
-            )],
-            else_expr: Some(Box::new(cmp)),
-        }),
-    };
+    // 8. Apply the NULL/empty-set semantics wrapper.
+    //
+    // Only `Any` can reach here — `agg_for` declines every `All` form (see
+    // its doc comment). ANY over an empty set is FALSE, and `lhs op NULL` is
+    // NULL, both of which `IS TRUE` collapses to FALSE.
+    debug_assert!(
+        matches!(quantifier, SetQuantifier::Any),
+        "agg_for must decline ALL before this point"
+    );
+    let result = Expr::IsTrue(Box::new(cmp));
 
     Ok(Transformed::yes(result))
 }
@@ -329,63 +371,44 @@ mod tests {
         Ok(())
     }
 
-    // ── test: all_lt_rewrites_to_scalar_subquery_with_min ─────────────────
+    // ── test: all_quantifier_is_declined ──────────────────────────────────
 
-    /// `lit(5) < ALL (SELECT v FROM t)` must rewrite to a CASE expression
-    /// wrapping `5 < (SELECT MIN(v) FROM t)`.
+    /// Every `ALL` form must be left as a `SetComparison` for DataFusion's
+    /// `RewriteSetComparison` to lower.
+    ///
+    /// This test previously asserted the opposite — that `5 < ALL (SELECT v
+    /// FROM t)` became `CASE WHEN cmp IS NULL THEN true ELSE cmp END` over
+    /// `5 < (SELECT MIN(v) FROM t)`. That form was measured wrong against
+    /// live PostgreSQL 18.2 on the golden seed and is no longer produced:
+    /// `WHERE amt > ALL (SELECT amt FROM t WHERE id < 2)` returned
+    /// `{2,3,101}` from PostgreSQL and `{2,3,100,101}` from the CASE form,
+    /// because row 100's NULL `amt` makes `cmp` NULL and the CASE promoted
+    /// that to TRUE. See `agg_for`'s doc comment for the full measurement.
     #[test]
-    fn all_lt_rewrites_to_scalar_subquery_with_min() -> datafusion::common::Result<()> {
-        let subq_plan = make_scan("t", vec![("v", DataType::Int64)]);
-        let subquery = make_subquery(subq_plan);
+    fn all_quantifier_is_declined() -> datafusion::common::Result<()> {
+        for op in [Operator::Gt, Operator::GtEq, Operator::Lt, Operator::LtEq] {
+            let subq_plan = make_scan("t", vec![("v", DataType::Int64)]);
+            let subquery = make_subquery(subq_plan);
 
-        let set_cmp = SetComparison {
-            expr: Box::new(lit(5i64)),
-            subquery,
-            op: Operator::Lt,
-            quantifier: SetQuantifier::All,
-        };
+            let set_cmp = SetComparison {
+                expr: Box::new(lit(5i64)),
+                subquery,
+                op,
+                quantifier: SetQuantifier::All,
+            };
 
-        let rewritten = Expr::SetComparison(set_cmp)
-            .transform_up(|e: Expr| match e {
-                Expr::SetComparison(sc) => try_rewrite(sc),
-                other => Ok(Transformed::no(other)),
-            })?
-            .data;
+            let rewritten = Expr::SetComparison(set_cmp)
+                .transform_up(|e: Expr| match e {
+                    Expr::SetComparison(sc) => try_rewrite(sc),
+                    other => Ok(Transformed::no(other)),
+                })?
+                .data;
 
-        assert!(
-            !matches!(rewritten, Expr::SetComparison(_)),
-            "Expected SetComparison to be rewritten"
-        );
-
-        // ALL uses a CASE expression for NULL-to-true semantics.
-        assert!(
-            matches!(rewritten, Expr::Case(_)),
-            "Expected CASE wrapper for ALL, got: {:?}",
-            rewritten
-        );
-
-        // Dig into the CASE to confirm MIN in the scalar subquery.
-        let Expr::Case(case_expr) = &rewritten else {
-            unreachable!()
-        };
-        let else_branch = case_expr.else_expr.as_ref().unwrap();
-        let Expr::BinaryExpr(BinaryExpr { right, op, .. }) = else_branch.as_ref() else {
-            panic!("Expected BinaryExpr in else branch, got: {:?}", else_branch);
-        };
-        assert_eq!(*op, Operator::Lt);
-        let Expr::ScalarSubquery(sq) = right.as_ref() else {
-            panic!("Expected ScalarSubquery, got: {:?}", right);
-        };
-        let LogicalPlan::Aggregate(agg) = sq.subquery.as_ref() else {
-            panic!("Expected Aggregate, got: {:?}", sq.subquery);
-        };
-        let agg_display = format!("{:?}", agg.aggr_expr);
-        assert!(
-            agg_display.to_lowercase().contains("min"),
-            "Expected MIN aggregate, got: {}",
-            agg_display
-        );
-
+            assert!(
+                matches!(rewritten, Expr::SetComparison(_)),
+                "`{op:?} ALL` must be declined, got: {rewritten:?}"
+            );
+        }
         Ok(())
     }
 

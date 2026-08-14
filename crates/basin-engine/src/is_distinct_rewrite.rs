@@ -13,22 +13,48 @@
 //! doesn't push either operator, so they fall back to a residual filter
 //! over a fully-decoded column.
 //!
-//! Semantics (SQL three-valued logic):
+//! Semantics (SQL three-valued logic).  Both operators are **total**: they
+//! return TRUE or FALSE and never NULL, for every combination of operands.
+//! Measured against PostgreSQL 18.2 in a *value* position (`SELECT a IS
+//! DISTINCT FROM b`, where NULL and FALSE are distinguishable):
+//!
+//! | a    | b    | `IS DISTINCT FROM` | `IS NOT DISTINCT FROM` |
+//! |------|------|--------------------|------------------------|
+//! | NULL | NULL | false              | true                   |
+//! | NULL | 1    | true               | false                  |
+//! | 1    | NULL | true               | false                  |
+//! | 1    | 1    | false              | true                   |
+//! | 1    | 2    | true               | false                  |
+//!
+//! The rewrite must reproduce that table exactly:
 //!
 //!   * `a IS DISTINCT FROM b` ≡
 //!         `(a IS NULL AND b IS NOT NULL)
 //!          OR (a IS NOT NULL AND b IS NULL)
-//!          OR (a != b)`
-//!     The last clause returns FALSE if either operand is NULL, so the
-//!     three-arm OR exactly captures the SQL semantics.
+//!          OR (a IS NOT NULL AND b IS NOT NULL AND a != b)`
 //!
 //!   * `a IS NOT DISTINCT FROM b` ≡
-//!         `(a IS NULL AND b IS NULL) OR (a = b)`
-//!     `a = b` returns FALSE if either operand is NULL, so the two-arm
-//!     OR matches the standard semantics.
+//!         `(a IS NULL AND b IS NULL)
+//!          OR (a IS NOT NULL AND b IS NOT NULL AND a = b)`
+//!
+//! ## Why the last arm carries an explicit NOT-NULL guard
+//!
+//! A bare `a != b` / `a = b` arm evaluates to **NULL**, not FALSE, when
+//! either operand is NULL, and `FALSE OR NULL` is NULL.  Without the guard
+//! the rewrites returned NULL where PostgreSQL returns FALSE:
+//!
+//! * `NULL IS DISTINCT FROM NULL` — every arm of the un-guarded three-arm
+//!   OR is `FALSE, FALSE, NULL` → NULL; PostgreSQL says **false**.
+//! * `NULL IS NOT DISTINCT FROM 1` — `FALSE OR NULL` → NULL; PostgreSQL
+//!   says **false**.
+//!
+//! Both errors are invisible in a `WHERE` or `JOIN … ON` position, which
+//! treats NULL and FALSE identically, and visible in a value position.
+//! The guarded arms above were verified cell-by-cell against the live
+//! PostgreSQL 18.2 server and match all ten cells of the table.
 //!
 //! Each clause is a simple operator Vortex's converter accepts (`IsNull`,
-//! `IsNotNull`, `BinaryExpr { Eq | NotEq }`), and the outer OR is also
+//! `IsNotNull`, `BinaryExpr { Eq | NotEq }`), and the outer AND/OR are also
 //! supported.  Pushing the full predicate down avoids the residual
 //! filter's full-column decode.
 //!
@@ -257,18 +283,36 @@ fn rewrite_is_distinct_expr(expr: Expr) -> Result<Transformed<Expr>> {
             let b = (**right).clone();
             // (a IS NULL AND b IS NOT NULL)
             //   OR (a IS NOT NULL AND b IS NULL)
-            //   OR (a != b)
+            //   OR (a IS NOT NULL AND b IS NOT NULL AND a != b)
+            //
+            // The third arm's NOT-NULL guard is load-bearing: a bare
+            // `a != b` is NULL (not FALSE) when either side is NULL, and
+            // `FALSE OR NULL` is NULL — so `NULL IS DISTINCT FROM NULL`
+            // would yield NULL where PostgreSQL yields FALSE.
             let lhs = a.clone().is_null().and(b.clone().is_not_null());
             let mid = a.clone().is_not_null().and(b.clone().is_null());
-            let rhs = a.not_eq(b);
+            let rhs = a
+                .clone()
+                .is_not_null()
+                .and(b.clone().is_not_null())
+                .and(a.not_eq(b));
             Ok(Transformed::yes(lhs.or(mid).or(rhs)))
         }
         Operator::IsNotDistinctFrom => {
             let a = (**left).clone();
             let b = (**right).clone();
-            // (a IS NULL AND b IS NULL) OR (a = b)
+            // (a IS NULL AND b IS NULL)
+            //   OR (a IS NOT NULL AND b IS NOT NULL AND a = b)
+            //
+            // Same guard, same reason: a bare `a = b` is NULL when either
+            // side is NULL, so `NULL IS NOT DISTINCT FROM 1` would yield
+            // NULL where PostgreSQL yields FALSE.
             let lhs = a.clone().is_null().and(b.clone().is_null());
-            let rhs = a.eq(b);
+            let rhs = a
+                .clone()
+                .is_not_null()
+                .and(b.clone().is_not_null())
+                .and(a.eq(b));
             Ok(Transformed::yes(lhs.or(rhs)))
         }
         _ => Ok(Transformed::no(expr)),
@@ -352,6 +396,119 @@ mod tests {
             "IsNotDistinctFrom should be gone; predicate:\n{pred}"
         );
         assert!(pred.contains("IsNull") && pred.contains("Eq"));
+        Ok(())
+    }
+
+    // ── value-position truth table ──────────────────────────────────────────
+
+    /// Evaluate `rewrite_is_distinct_expr(a OP b)` in a *value* position over
+    /// the five-row operand table and return one `Option<bool>` per row.
+    ///
+    /// A `WHERE`/`JOIN` position cannot see the difference between NULL and
+    /// FALSE, so a projection is the only position that pins these semantics.
+    async fn eval_rewritten(op: Operator) -> Result<Vec<Option<bool>>> {
+        use datafusion::arrow::array::{Array, BooleanArray, Int64Array};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::prelude::SessionContext;
+
+        // a    | b
+        // NULL | NULL
+        // NULL | 1
+        // 1    | NULL
+        // 1    | 1
+        // 1    | 2
+        let a = Int64Array::from(vec![None, None, Some(1), Some(1), Some(1)]);
+        let b = Int64Array::from(vec![None, Some(1), None, Some(1), Some(2)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(a), Arc::new(b)])?;
+
+        let rewritten = rewrite_is_distinct_expr(Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("a")),
+            op,
+            right: Box::new(col("b")),
+        }))?;
+        assert!(rewritten.transformed, "{op:?} must be rewritten");
+
+        let ctx = SessionContext::new();
+        ctx.register_batch("p", batch)?;
+        // Sort to keep row order deterministic across partitioning changes —
+        // but ASC NULLS FIRST explicitly, not `sort_by`'s default. The default
+        // is NULLS LAST, which reorders these five rows to
+        // (1,1),(1,2),(1,NULL),(NULL,1),(NULL,NULL) while the expectations
+        // below are labelled in the *input* order. That mismatch made both of
+        // these tests fail against a correct rewrite.
+        let batches = ctx
+            .table("p")
+            .await?
+            .select(vec![
+                col("a"),
+                col("b"),
+                rewritten.data.alias("r"),
+            ])?
+            .sort(vec![
+                col("a").sort(true, true),
+                col("b").sort(true, true),
+            ])?
+            .collect()
+            .await?;
+
+        let mut out = Vec::new();
+        for batch in &batches {
+            let arr = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("boolean result column");
+            for i in 0..arr.len() {
+                out.push(if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// `a IS DISTINCT FROM b` is total — never NULL. Recorded from live
+    /// PostgreSQL 18.2; rows ordered by (a, b) NULLS FIRST:
+    /// (NULL,NULL)=false, (NULL,1)=true, (1,NULL)=true, (1,1)=false, (1,2)=true.
+    ///
+    /// Before the NOT-NULL guard on the third arm, row (NULL, NULL) evaluated
+    /// to NULL here — invisible in `WHERE`, wrong in a projection.
+    #[tokio::test]
+    async fn is_distinct_from_value_position_matches_postgres() -> Result<()> {
+        assert_eq!(
+            eval_rewritten(Operator::IsDistinctFrom).await?,
+            vec![
+                Some(false), // NULL, NULL
+                Some(true),  // NULL, 1
+                Some(true),  // 1, NULL
+                Some(false), // 1, 1
+                Some(true),  // 1, 2
+            ]
+        );
+        Ok(())
+    }
+
+    /// `a IS NOT DISTINCT FROM b` is the exact negation, also never NULL.
+    /// Before the guard, (NULL,1) and (1,NULL) evaluated to NULL where
+    /// PostgreSQL returns false.
+    #[tokio::test]
+    async fn is_not_distinct_from_value_position_matches_postgres() -> Result<()> {
+        assert_eq!(
+            eval_rewritten(Operator::IsNotDistinctFrom).await?,
+            vec![
+                Some(true),  // NULL, NULL
+                Some(false), // NULL, 1
+                Some(false), // 1, NULL
+                Some(true),  // 1, 1
+                Some(false), // 1, 2
+            ]
+        );
         Ok(())
     }
 

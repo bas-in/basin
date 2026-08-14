@@ -1487,35 +1487,68 @@ fn rewrite_one_any_op(sql: &str, op_lower: &str, agg: &str) -> String {
     s
 }
 
-/// Rewrite `expr OP ALL (SELECT single_expr FROM ...)` to scalar subquery form.
+/// Rewrite `expr <> ALL (subquery)` / `expr != ALL (subquery)` to `NOT IN`.
 ///
-/// - `> ALL`  → `> (SELECT MAX(...))`
-/// - `>= ALL` → `>= (SELECT MAX(...))`
-/// - `< ALL`  → `< (SELECT MIN(...))`
-/// - `<= ALL` → `<= (SELECT MIN(...))`
 /// - `<> ALL` / `!= ALL` → `NOT IN (...)`
+///
+/// # Why the ordering comparisons are NOT rewritten here
+///
+/// This rewriter used to also turn
+///
+/// ```text
+/// > ALL  → > (SELECT MAX(...))      >= ALL → >= (SELECT MAX(...))
+/// < ALL  → < (SELECT MIN(...))      <= ALL → <= (SELECT MIN(...))
+/// ```
+///
+/// That is **wrong**, and wrong in a way a `WHERE` clause exposes. `x OP ALL
+/// (S)` is a Kleene AND-fold over `S`: FALSE if any element comparison is
+/// FALSE, else NULL if any is NULL, else TRUE — and TRUE for an empty `S`,
+/// vacuously. `MIN`/`MAX` skip NULLs and return NULL on empty input, so
+/// neither of the two interesting cases survives the rewrite. Measured on
+/// live PostgreSQL 18.2 with the golden seed
+/// `t(id, amt) = (1,1.5),(2,2.5),(3,3.5),(100,NULL),(101,10.5)`:
+///
+/// ```text
+/// SELECT id FROM t WHERE amt >  ALL (SELECT amt FROM t WHERE id < 101)
+///   PostgreSQL: (no rows)          rewritten to MAX: {101}
+/// SELECT id FROM t WHERE amt >  ALL (SELECT amt FROM t WHERE id < 0)
+///   PostgreSQL: {1,2,3,100,101}    rewritten to MAX: (no rows)
+/// SELECT id FROM t WHERE amt <  ALL (SELECT amt FROM t WHERE id > 1)
+///   PostgreSQL: (no rows)          rewritten to MIN: {1}
+/// ```
+///
+/// The first and third fail because the subquery contains a NULL: PostgreSQL
+/// folds to NULL, `MAX` ignores the NULL and folds to TRUE. The second fails
+/// because `x > ALL (empty)` is vacuously TRUE while `x > MAX(empty)` is
+/// `x > NULL` → NULL. `MAX` cannot express vacuous truth, and no
+/// single-aggregate scalar form can, so the rewrite is declined rather than
+/// patched: `expr OP ALL (subquery)` is left in the SQL text for the planner,
+/// which lowers it to the Kleene decomposition that gets all three right.
+///
+/// `<> ALL` → `NOT IN` is kept because it is exact, not approximate: `NOT IN`
+/// is *defined* as the Kleene AND-fold of `<>`, including vacuous truth over
+/// an empty subquery. Verified on the same seed — the `<> ALL` and `NOT IN`
+/// forms return identical rows over empty, NULL-containing, and plain
+/// subqueries.
 ///
 /// Only handles simple single-column subqueries. Complex subqueries
 /// (UNION, aggregates, etc.) are left untouched.
 fn rewrite_all_subquery(sql: &str) -> String {
     let mut s = sql.to_string();
-    // Pairs: (op, aggregate_fn) — longer operators first.
-    const OPS: &[(&str, &str)] = &[
-        (">= all", "MAX"),
-        ("<= all", "MIN"),
-        ("> all", "MAX"),
-        ("< all", "MIN"),
-        // <> ALL / != ALL → NOT IN
-        ("<> all", "NOT_IN"),
-        ("!= all", "NOT_IN"),
-    ];
-    for (op_lower, agg) in OPS {
-        s = rewrite_one_all_op(&s, op_lower, agg);
+    // `<> ALL` / `!= ALL` → NOT IN. The ordering comparisons (`>`, `>=`, `<`,
+    // `<=`) are deliberately absent — see the doc comment above.
+    const OPS: &[&str] = &["<> all", "!= all"];
+    for op_lower in OPS {
+        s = rewrite_one_all_op(&s, op_lower);
     }
     s
 }
 
-fn rewrite_one_all_op(sql: &str, op_lower: &str, agg: &str) -> String {
+/// Replace one `<> ALL (subq)` / `!= ALL (subq)` occurrence with
+/// `NOT IN (subq)`. Deliberately handles no other operator: the ordering
+/// comparisons have no sound single-aggregate scalar form (see
+/// [`rewrite_all_subquery`]).
+fn rewrite_one_all_op(sql: &str, op_lower: &str) -> String {
     let mut s = sql.to_string();
     let mut search_from = 0usize;
     loop {
@@ -1556,53 +1589,14 @@ fn rewrite_one_all_op(sql: &str, op_lower: &str, agg: &str) -> String {
         // Extract the subquery body (without outer parens).
         let subq_body = s[j + 1..subq_end].trim().to_string();
 
-        // For NOT IN, just replace `OP ALL (subq)` with `NOT IN (subq)`.
-        if agg == "NOT_IN" {
-            // Replace `op_lower (subq)` with `NOT IN (subq)`.
-            let op_part = &op_lower[..op_lower.len() - 4]; // strip " all"
-            let replacement = format!("{op_part} NOT IN ({subq_body})");
-            s.replace_range(kw_start..subq_end + 1, &replacement);
-            search_from = kw_start + replacement.len();
-            continue;
-        }
-
-        // Parse the subquery: must be `SELECT expr FROM ...` with no GROUP BY,
-        // HAVING, LIMIT, UNION — keep it simple.
-        let subq_lower = subq_body.to_ascii_lowercase();
-        if !subq_lower.trim_start().starts_with("select ") {
-            search_from = kw_end;
-            continue;
-        }
-        // Reject complex subqueries to avoid incorrect rewrites.
-        if subq_lower.contains("group by")
-            || subq_lower.contains("having")
-            || subq_lower.contains(" union ")
-            || subq_lower.contains(" intersect ")
-            || subq_lower.contains(" except ")
-        {
-            search_from = kw_end;
-            continue;
-        }
-
-        // Extract the SELECT expression (between `SELECT ` and `FROM `).
-        // Naive: find `FROM` at depth 0 after `SELECT`.
-        let after_select = subq_body.trim_start();
-        let sel_offset = after_select
-            .to_ascii_lowercase()
-            .find("select ")
-            .unwrap_or(0)
-            + 7;
-        let from_lower = after_select.to_ascii_lowercase();
-        let Some(from_pos) = find_from_at_depth0(&from_lower, sel_offset) else {
-            search_from = kw_end;
-            continue;
-        };
-        let col_expr = after_select[sel_offset..from_pos].trim().to_string();
-        let from_clause = &after_select[from_pos..]; // includes `FROM ...`
-
-        // Build the replacement: `op (SELECT AGG(col_expr) FROM ...)`.
-        let op_str = &op_lower[..op_lower.len() - 4].trim(); // strip " all"
-        let replacement = format!("{op_str} (SELECT {agg}({col_expr}) {from_clause})");
+        // Replace the whole `<> ALL (subq)` span — operator included — with
+        // `NOT IN (subq)`. Keeping the `<>` would emit `amt <> NOT IN (…)`,
+        // which is not parseable SQL.  Re-insert a separating space when the
+        // operator abuts the left operand (`amt<> ALL (…)`), which the span
+        // replacement would otherwise glue into `amtNOT IN (…)`.
+        let need_space = kw_start > 0 && !s.as_bytes()[kw_start - 1].is_ascii_whitespace();
+        let replacement =
+            format!("{}NOT IN ({subq_body})", if need_space { " " } else { "" });
         s.replace_range(kw_start..subq_end + 1, &replacement);
         search_from = kw_start + replacement.len();
     }
@@ -8643,6 +8637,78 @@ mod tests {
         let sql = "SELECT id > ALL(SELECT id FROM t)";
         let out = rewrite_all_array(sql);
         assert_eq!(out, sql, "subquery form must be unchanged: {out}");
+    }
+
+    // ── OP ALL (subquery) — ordering comparisons are declined ───────────────
+
+    /// `> / >= / < / <= ALL (subquery)` must survive the text pipeline
+    /// untouched. The old `MAX`/`MIN` scalar-subquery rewrite was measurably
+    /// wrong against PostgreSQL 18.2 in two ways a `WHERE` clause exposes:
+    /// an empty subquery (`x > ALL (empty)` is vacuously TRUE, `x > MAX(empty)`
+    /// is NULL) and a NULL-containing subquery (PostgreSQL folds to NULL,
+    /// `MAX` skips the NULL and folds to TRUE). Declining routes the shape to
+    /// the planner's Kleene decomposition, which gets both right.
+    #[test]
+    fn all_subquery_ordering_comparisons_are_declined() {
+        for sql in [
+            "SELECT id FROM t WHERE amt > ALL (SELECT amt FROM t WHERE id < 101)",
+            "SELECT id FROM t WHERE amt >= ALL (SELECT amt FROM t WHERE id < 101)",
+            "SELECT id FROM t WHERE amt < ALL (SELECT amt FROM t WHERE id > 1)",
+            "SELECT id FROM t WHERE amt <= ALL (SELECT amt FROM t WHERE id > 1)",
+        ] {
+            let out = rewrite_any_some_subquery(sql);
+            assert_eq!(out, sql, "OP ALL (subquery) must be left alone: {out}");
+            assert!(!out.contains("MAX(") && !out.contains("MIN("), "got: {out}");
+        }
+    }
+
+    /// `<> ALL` / `!= ALL` → `NOT IN` is kept: `NOT IN` *is* the Kleene
+    /// AND-fold of `<>`, vacuous truth included (verified against PostgreSQL
+    /// over empty, NULL-containing and plain subqueries).
+    ///
+    /// The whole `<> ALL` span is replaced, operator included. Keeping the
+    /// `<>` emitted `amt <> NOT IN (…)`, which is not parseable SQL.
+    #[test]
+    fn ne_all_subquery_becomes_not_in() {
+        let out = rewrite_any_some_subquery(
+            "SELECT id FROM t WHERE amt <> ALL (SELECT amt FROM t WHERE id < 101)",
+        );
+        assert_eq!(
+            out,
+            "SELECT id FROM t WHERE amt NOT IN (SELECT amt FROM t WHERE id < 101)",
+            "got: {out}"
+        );
+
+        let out = rewrite_any_some_subquery("SELECT id FROM t WHERE amt != ALL (SELECT amt FROM t)");
+        assert_eq!(
+            out,
+            "SELECT id FROM t WHERE amt NOT IN (SELECT amt FROM t)",
+            "got: {out}"
+        );
+    }
+
+    /// `amt<> ALL (…)` — no space *before* the operator — still has to come
+    /// out token-separated, because the whole `<> ALL (…)` span is replaced.
+    #[test]
+    fn ne_all_subquery_reinserts_separator_before_not_in() {
+        let out = rewrite_any_some_subquery("SELECT id FROM t WHERE amt<> ALL (SELECT amt FROM t)");
+        assert_eq!(
+            out,
+            "SELECT id FROM t WHERE amt NOT IN (SELECT amt FROM t)",
+            "got: {out}"
+        );
+    }
+
+    /// The `rewrite_any_some_subquery` fast path screens on `" all"` (with a
+    /// leading space), and `rewrite_one_all_op` matches the literal `"<> all"`,
+    /// so the fully-unspaced form `amt<>ALL(…)` never enters the rewriter and
+    /// reaches the planner verbatim. That is a correct outcome — DataFusion
+    /// lowers `<> ALL` natively — so this pins the boundary, it does not
+    /// widen it.
+    #[test]
+    fn ne_all_subquery_without_spaces_is_not_reached() {
+        let sql = "SELECT id FROM t WHERE amt<>ALL(SELECT amt FROM t)";
+        assert_eq!(rewrite_any_some_subquery(sql), sql);
     }
 
     // ── LATERAL unnest rewriter ─────────────────────────────────────────────
