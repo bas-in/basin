@@ -60,7 +60,19 @@
 //! current statement timestamp — PostgreSQL's autocommit semantics, where
 //! each statement is its own transaction.
 //!
-//! Both are registered per session by [`register_datetime_session_udfs`],
+//! ### now(), CURRENT_TIMESTAMP, LOCALTIMESTAMP → the transaction timestamp
+//! `now()` **is** `transaction_timestamp()` in PostgreSQL, and so is
+//! `CURRENT_TIMESTAMP`; `LOCALTIMESTAMP` is the same instant without a zone
+//! label. All four are therefore the same read of the same clock, and all
+//! four are registered here as that one implementation under four names —
+//! `current_timestamp` via [`ScalarUDFImpl::aliases`], because DataFusion's
+//! built-in `now()` claims that name as an alias and nothing else takes it
+//! back. See [`register_datetime_session_udfs`] for the full account; the
+//! short version is that overriding `now` alone left `CURRENT_TIMESTAMP` on
+//! DataFusion's separate clock and `SELECT now() = current_timestamp`
+//! answering `false`.
+//!
+//! These are all registered per session by [`register_datetime_session_udfs`],
 //! against the `DateTimeSessionState` that session's `SessionState` owns.
 
 use std::any::Any;
@@ -195,6 +207,7 @@ pub(crate) fn register_datetime_session_udfs(ctx: &SessionContext, dt: Arc<DateT
     ctx.register_udf(ScalarUDF::from(TxnTimestampUdf {
         dt: Arc::clone(&dt),
         name: "transaction_timestamp",
+        aliases: Vec::new(),
         signature: Signature::nullary(Volatility::Stable),
     }));
 
@@ -208,10 +221,63 @@ pub(crate) fn register_datetime_session_udfs(ctx: &SessionContext, dt: Arc<DateT
     // within ONE query — that is `statement_timestamp()` semantics wearing
     // `now()`'s name, and it is wrong for exactly the case the name exists to
     // serve: two statements in one transaction disagreeing about when "now"
-    // is. `CURRENT_TIMESTAMP` follows, because the parser lowers it to `now`.
+    // is.
+    //
+    // # Why `current_timestamp` must be listed explicitly
+    //
+    // It is tempting to assume `CURRENT_TIMESTAMP` follows `now` for free,
+    // "because the parser lowers it to `now`". It does not, and that
+    // assumption shipped a live regression: `SELECT now() = current_timestamp`
+    // returned **false**, which PostgreSQL guarantees is `true`
+    // (`now()` = `transaction_timestamp()` = `CURRENT_TIMESTAMP`, all
+    // txn-stable — measured on 18.2).
+    //
+    // The real mechanism is DataFusion's function *registry*, not its parser.
+    // `SessionState::register_udf` inserts a udf under `name()` and under
+    // every `aliases()` entry, and the built-in `NowFunc` declares
+    // `aliases: ["current_timestamp"]`. So the built-in occupies TWO keys.
+    // Registering a replacement named only `now` reclaims one of them and
+    // leaves `current_timestamp` still pointing at the built-in — a second,
+    // independent clock answering to a name PostgreSQL says is the same
+    // function. That is visible in the type as well as the value: the
+    // built-in returns `Timestamp(Nanosecond, None)` where this one returns
+    // `Timestamp(Microsecond, Some("UTC"))`.
+    //
+    // Claiming the alias here routes the name to this one implementation
+    // rather than duplicating the logic behind it — the lesson of the
+    // `to_char` incident (f97ba3ba), where two implementations answering to
+    // one name drifted apart.
+    ctx.register_udf(ScalarUDF::from(TxnTimestampUdf {
+        dt: Arc::clone(&dt),
+        name: "now",
+        aliases: vec!["current_timestamp".to_string()],
+        signature: Signature::nullary(Volatility::Stable),
+    }));
+
+    // LOCALTIMESTAMP is the transaction timestamp too — PostgreSQL defines it
+    // as `now()` rendered without a zone, and `SELECT localtimestamp =
+    // now()::timestamp` is `true` on 18.2, inside a transaction and out.
+    //
+    // What it replaces is `pg_scalar_aliases`' engine-wide `NowStubUdf`, which
+    // is `Volatility::Volatile` and snaps a fresh `Utc::now()` on every
+    // invocation — `clock_timestamp()` semantics wearing `LOCALTIMESTAMP`'s
+    // name. Measured before this change: two `SELECT localtimestamp` in one
+    // `BEGIN` returned different instants, and one of them differed from
+    // `now()` in the same block. PostgreSQL never moves it inside a
+    // transaction, so anchoring it here is the fix.
+    //
+    // **Still wrong, and deliberately not fixed here:** the *type*. PG's
+    // `LOCALTIMESTAMP` is `timestamp WITHOUT time zone` in the session's
+    // `TimeZone`; this returns the same UTC-labelled `timestamptz` the stub
+    // it replaces returned. Correcting that needs the `TimeZone` GUC at
+    // invocation time, which this registration does not carry — a separate
+    // change with its own live-measured tests, not a silent rider on this
+    // one. The drift is what was making it disagree with itself; that is
+    // what this fixes.
     ctx.register_udf(ScalarUDF::from(TxnTimestampUdf {
         dt,
-        name: "now",
+        name: "localtimestamp",
+        aliases: Vec::new(),
         signature: Signature::nullary(Volatility::Stable),
     }));
 }
@@ -1088,10 +1154,20 @@ impl ScalarUDFImpl for StmtTimestampUdf {
 #[derive(Debug)]
 struct TxnTimestampUdf {
     dt: Arc<DateTimeSessionState>,
-    /// The name this registration answers to — `transaction_timestamp` or
-    /// `now`. They are the *same function* in PostgreSQL, and registering one
-    /// implementation twice is what keeps them from drifting apart.
+    /// The name this registration answers to — `transaction_timestamp`,
+    /// `now` or `localtimestamp`. They are the *same function* in
+    /// PostgreSQL, and registering one implementation under each name is
+    /// what keeps them from drifting apart.
     name: &'static str,
+    /// Extra names DataFusion's registry should resolve to *this* instance.
+    ///
+    /// Not cosmetic, and not interchangeable with a second registration:
+    /// `SessionState::register_udf` inserts the udf under `name()` **and**
+    /// under every entry of `aliases()`, so a name that some *other* udf
+    /// already claims as an alias can only be taken back by claiming it
+    /// here. That is exactly the case for `current_timestamp` — see
+    /// [`register_datetime_session_udfs`].
+    aliases: Vec<String>,
     signature: Signature,
 }
 
@@ -1100,6 +1176,7 @@ impl PartialEq for TxnTimestampUdf {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.dt, &other.dt)
             && self.name == other.name
+            && self.aliases == other.aliases
             && self.signature == other.signature
     }
 }
@@ -1108,6 +1185,7 @@ impl std::hash::Hash for TxnTimestampUdf {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         (Arc::as_ptr(&self.dt) as usize).hash(state);
         self.name.hash(state);
+        self.aliases.hash(state);
         self.signature.hash(state);
     }
 }
@@ -1118,6 +1196,9 @@ impl ScalarUDFImpl for TxnTimestampUdf {
     }
     fn name(&self) -> &str {
         self.name
+    }
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
     fn signature(&self) -> &Signature {
         &self.signature

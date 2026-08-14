@@ -7,8 +7,18 @@
 //!    e.g. `ceiling` vs `ceil`, `sign` vs `signum`.
 //!
 //! 2. **Timestamp stubs** — `clock_timestamp`, `transaction_timestamp`,
-//!    `statement_timestamp`, `localtime`, `localtimestamp` all return the same
-//!    value as `now()` in v0.1 (no statement/clock-tick distinction yet).
+//!    `statement_timestamp`, `localtime`, `localtimestamp` each return a fresh
+//!    wall-clock instant here, with no statement/transaction tick distinction.
+//!
+//!    These are the ENGINE-WIDE fallbacks only. Every one of them except
+//!    `localtime` is overridden per session, against that session's own
+//!    clock state, by `datetime_more_udf::register_datetime_session_udfs`
+//!    (`statement_timestamp`, `transaction_timestamp`, `now`,
+//!    `current_timestamp`, `localtimestamp`) and
+//!    `register_datetime_more_udfs` (`clock_timestamp`). A stub that survives
+//!    to execution is `clock_timestamp()` wearing another function's name,
+//!    which is why the session registrations exist — see that module for the
+//!    live-measured semantics each name owes.
 //!
 //! 3. **Missing scalars** — `make_time`, `make_timestamp`, `make_interval`,
 //!    `to_number`, `width_bucket` — functions DataFusion does not ship.
@@ -22,7 +32,8 @@
 //! | `abs`, `ceil`/`floor`, `round`, `trunc`, `sqrt`, `exp`, `ln`, `log`, `pi`, `random` | DataFusion builtin |
 //! | `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `degrees`, `radians` | DataFusion builtin |
 //! | `power` (+ alias `pow`) | DataFusion builtin |
-//! | `now`, `current_timestamp` (alias), `current_date`, `current_time` | DataFusion builtin |
+//! | `now`, `current_timestamp` (alias of `now`), `localtimestamp` | `datetime_more_udf::register_datetime_session_udfs` — the transaction timestamp |
+//! | `current_date`, `current_time` | DataFusion builtin |
 //! | `make_date`, `to_date`, `to_char`, `to_timestamp` | DataFusion builtin / basin udf.rs |
 //! | `coalesce`, `nullif`, `greatest`, `least` | DataFusion builtin |
 //! | `mod`, `age`, `power` (float64 override) | `udf::register_pg_compat_udfs` |

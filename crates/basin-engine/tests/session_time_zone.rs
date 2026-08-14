@@ -574,3 +574,131 @@ async fn rollback_releases_the_transaction_timestamp() {
         "ROLLBACK ends the transaction, so now() moves on: {inside} → {after}"
     );
 }
+
+
+/// The spellings that are ONE function, and the two that are not.
+///
+/// PostgreSQL has three clocks and six spellings, and the mapping between
+/// them is not guessable from the names. Measured on a live 18.2, in one
+/// `BEGIN` block, one statement per protocol message:
+///
+/// ```text
+/// BEGIN;
+/// SELECT now() = current_timestamp, now() = transaction_timestamp(),
+///        now() = statement_timestamp(), now() = clock_timestamp();
+///  t | t | f | f
+/// SELECT current_date = date(now()), localtimestamp = now()::timestamp;
+///  t | t
+/// COMMIT;
+/// ```
+///
+/// So `now()`, `transaction_timestamp()` and `CURRENT_TIMESTAMP` are three
+/// names for one value, `LOCALTIMESTAMP` is that same instant unlabelled, and
+/// `statement_timestamp()` / `clock_timestamp()` are two other clocks that
+/// must NOT be folded onto it.
+///
+/// # The regression this pins
+///
+/// `CURRENT_TIMESTAMP` was the one that got away. Overriding DataFusion's
+/// `now()` with the transaction clock left `current_timestamp` resolving to
+/// the built-in — DataFusion registers a udf under its name *and* its
+/// aliases, and the built-in `NowFunc` claims `current_timestamp` as one — so
+/// `SELECT now() = current_timestamp` returned `false` against a server that
+/// guarantees `true`. Two clocks, one name, in a family whose entire purpose
+/// is that the name and the value agree.
+///
+/// The assertions below are equality on the *instant*, not on rendered text:
+/// what is being claimed is that these spellings read the same clock, which
+/// is a claim about values and survives any later change to rendering.
+#[tokio::test]
+async fn the_transaction_timestamp_family_is_one_clock_and_the_other_two_are_not() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "BEGIN").await;
+
+    let now_1 = scalar_ts_micros(&sess, "SELECT now()").await;
+    let ct_1 = scalar_ts_micros(&sess, "SELECT current_timestamp").await;
+    let txn_1 = scalar_ts_micros(&sess, "SELECT transaction_timestamp()").await;
+    let local_1 = scalar_ts_micros(&sess, "SELECT localtimestamp").await;
+
+    assert_eq!(
+        now_1, ct_1,
+        "CURRENT_TIMESTAMP is now() — not a second clock under another name"
+    );
+    assert_eq!(now_1, txn_1, "…and so is transaction_timestamp()");
+    assert_eq!(
+        now_1, local_1,
+        "LOCALTIMESTAMP is the same instant as now(); only its zone label differs"
+    );
+
+    // A statement boundary is what makes this falsifiable: a per-query clock
+    // (which is what DataFusion's built-in `now()` is) also passes every
+    // assertion above, and fails every one below.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let now_2 = scalar_ts_micros(&sess, "SELECT now()").await;
+    let ct_2 = scalar_ts_micros(&sess, "SELECT current_timestamp").await;
+    let local_2 = scalar_ts_micros(&sess, "SELECT localtimestamp").await;
+
+    assert_eq!(now_1, now_2, "now() is pinned for the transaction");
+    assert_eq!(
+        ct_1, ct_2,
+        "CURRENT_TIMESTAMP is pinned for the transaction too: {ct_1} → {ct_2}"
+    );
+    assert_eq!(
+        local_1, local_2,
+        "LOCALTIMESTAMP is pinned for the transaction too: {local_1} → {local_2}"
+    );
+    assert_eq!(now_2, ct_2, "…and they are still the same value");
+
+    // The reverse hazard: routing the family onto one clock must not sweep in
+    // the two functions that exist precisely BECAUSE they are not it.
+    let stmt = scalar_ts_micros(&sess, "SELECT statement_timestamp()").await;
+    let clock = scalar_ts_micros(&sess, "SELECT clock_timestamp()").await;
+    assert!(
+        stmt > now_1,
+        "statement_timestamp() must have advanced past the transaction's: {now_1} vs {stmt}"
+    );
+    assert!(
+        clock > now_1,
+        "clock_timestamp() must not be pinned to the transaction: {now_1} vs {clock}"
+    );
+
+    exec(&sess, "COMMIT").await;
+}
+
+/// The family agrees *within* one statement as well as across statements —
+/// the shape the failing integration test asserted, and the one a user hits
+/// first: `SELECT now() = current_timestamp` in a single autocommit
+/// statement. On 18.2 this is `true` with no transaction block in sight,
+/// because an autocommit statement is its own transaction.
+#[tokio::test]
+async fn one_autocommit_statement_sees_one_value_for_every_name_in_the_family() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    for sql in [
+        "SELECT now() = current_timestamp",
+        "SELECT now() = transaction_timestamp()",
+        "SELECT current_timestamp = transaction_timestamp()",
+        "SELECT now() = localtimestamp",
+    ] {
+        let batches = rows(&sess, sql).await;
+        let b = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .unwrap_or_else(|| panic!("no rows from {sql:?}"));
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap_or_else(|| panic!("{sql:?} did not return a boolean"));
+        assert!(
+            !col.is_null(0) && col.value(0),
+            "{sql:?} must be true — PostgreSQL 18.2 says so, measured"
+        );
+    }
+}
