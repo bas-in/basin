@@ -40,6 +40,20 @@
 //! error, just as unactionable to the caller) when one applies. See that
 //! function's body for the precise list.
 //!
+//! That list was originally drawn up against the HOT tier, and it was
+//! incomplete for exactly that reason: the DataFusion `SELECT` pipeline
+//! also applies **cold-tier read-time rewrites**, every one of them
+//! downstream of this bridge's call site, and three of them changed a
+//! served statement's answer with nothing to signal it —
+//! `apply_soft_delete_to_select`'s `<col> IS NULL` injection (a `DELETE`
+//! against a `SOFT DELETE` table leaves the row live in the cold files),
+//! `citext_analyzer::CitextAnalyzerRule`'s case folding, and
+//! `enum_ordinal::rewrite_enum_ordering`'s declaration-order `CASE`.
+//! [`build_resolver`] now declines those three shapes as well. They are
+//! **gates, not implementations**: declining is the whole fix for now, and
+//! each one becomes real work in the owned pipeline only when there is no
+//! DataFusion left to decline to.
+//!
 //! The same class of silent-wrong-rows failure applies to WHICH FILES the
 //! scan reads, and that one is not a check but a choice made in
 //! [`build_resolver`]: the file set comes from the catalog's
@@ -1474,6 +1488,85 @@ async fn build_resolver(
                 "table carries promoted JSONB shadow columns",
             ));
         }
+        // ── Cold-tier read-time rewrites ────────────────────────────────
+        //
+        // Everything above this line was written against the HOT tier, and
+        // the three checks below are the ones that list missed. They are a
+        // different family: the DataFusion `SELECT` pipeline also applies
+        // rewrites that change a COLD read's answer, all of them downstream
+        // of this bridge's call site (`executor.rs`'s
+        // `owned_engine::try_execute`), so a statement served here never
+        // reaches any of them. None of the three produces an `Err` when it
+        // is skipped — each one silently returns different rows, which is
+        // exactly what "fall back on error" cannot catch.
+        //
+        // The incumbent's own bare-cold-read fast paths gate on this same
+        // list (`executor.rs`'s simple-SELECT gate: view / RLS / soft
+        // delete / txn / citext; the PK point path repeats it verbatim and
+        // says so — "the normal gate routes those to DataFusion"). This
+        // bridge is a bare cold read too, so it owes the same list.
+        //
+        // Each check declines the whole TABLE, not the specific expression
+        // that would have been rewritten. That is deliberately blunter than
+        // the incumbent fast path's per-column check, for a reason that
+        // matters more here than there: the fast path only ever serves one
+        // recognised shape (it knows its own predicate and ORDER BY column),
+        // while this bridge serves arbitrary SQL, where a citext or enum
+        // column is consumed by comparisons, `ORDER BY`, `GROUP BY`,
+        // `DISTINCT`, set-operation dedup and join keys alike. Enumerating
+        // those safely is re-implementing the analyzer rule, which is the
+        // Phase 2 work these gates exist to defer.
+
+        // A `SOFT DELETE` column means DELETE does not remove the row: it
+        // stamps `<col> = now()` and rewrites the file with the row still in
+        // it (`dml_mutate.rs`'s `exec_soft_delete`). Visibility is restored
+        // purely at read time, by `executor.rs`'s `apply_soft_delete_to_select`
+        // AND-merging `<col> IS NULL` into every scan. The hot-tier check
+        // below cannot stand in for this one: a soft delete is a cold
+        // copy-on-write and leaves the memtable empty by construction, so
+        // the table looks perfectly clean to it while the cold files hold
+        // rows the user deleted.
+        if crate::types::soft_delete_column(meta.schema.as_ref()).is_some() {
+            return Err(Fallback::Ineligible(
+                "table has a SOFT DELETE column (deleted rows stay in the cold files)",
+            ));
+        }
+        // CITEXT is stored as plain Arrow `Utf8`; the case-insensitive
+        // contract is delivered by a DataFusion `AnalyzerRule`
+        // (`citext_analyzer::CitextAnalyzerRule`, registered in
+        // `session.rs`) that folds `=`, `<>`, ordered comparisons, `LIKE`
+        // and sort keys on such columns through `lower(...)`. There is no
+        // citext anywhere in `basin-exec`/`basin-plan`/`basin-pgtype`, so
+        // this path compares the raw bytes and MISSES rows — the failure
+        // mode with nothing to point at.
+        if meta
+            .schema
+            .fields()
+            .iter()
+            .any(|f| crate::types::field_is_citext(f))
+        {
+            return Err(Fallback::Ineligible(
+                "table has a CITEXT column (case-insensitive compare is a DataFusion analyzer rule)",
+            ));
+        }
+        // Enum columns are `Utf8` + `BASIN_ENUM_TYPE=<name>`, and PG's
+        // declaration-order semantics for `ORDER BY` / `<` / `>` / `BETWEEN`
+        // come from a SQL-TEXT rewrite into a `CASE` ordinal expression
+        // (`enum_ordinal::rewrite_enum_ordering`). `executor.rs` runs it
+        // where the rewrite pipeline runs — after this bridge — so a served
+        // statement sorts `'active','archived','pending'` alphabetically
+        // instead of in the order the type was declared in.
+        if meta
+            .schema
+            .fields()
+            .iter()
+            .any(|f| f.metadata().contains_key(crate::types::BASIN_ENUM_TYPE_KEY))
+        {
+            return Err(Fallback::Ineligible(
+                "table has an enum-typed column (declaration-order compare is a pre-parse rewrite)",
+            ));
+        }
+
         // Any hot-tier footprint (unflushed inserts, or update/delete
         // tombstones — `tombstone_cold_scan.rs`'s own doc comment confirms
         // DELETE tombstones live in this same registry, not a separate
