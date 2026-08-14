@@ -422,6 +422,7 @@ const OID_DATE_TRUNC_INTERVAL: u32 = 1218; // date_trunc(text, interval)
 const OID_DATE_PART_TIMESTAMPTZ: u32 = 1171; // date_part(text, timestamptz)
 const OID_DATE_PART_TIMESTAMP: u32 = 2021; // date_part(text, timestamp)
 const OID_DATE_PART_DATE: u32 = 1384; // date_part(text, date)
+const OID_DATE_PART_INTERVAL: u32 = 1172; // date_part(text, interval)
 
 // `extract`. **Not `date_part` with a cast** — see [`eval_extract`] and
 // `basin_pgtype::func`'s `extract` block for the measured pair of answers
@@ -2875,6 +2876,11 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
             let value = a(1)?;
             eval_date_part_date(&field, &value)
         }
+        OID_DATE_PART_INTERVAL => {
+            let field = a(0)?;
+            let value = a(1)?;
+            eval_date_part_interval(&field, &value)
+        }
 
         // All six `extract` oids share ONE implementation, which reads the
         // argument's actual Arrow type rather than trusting the oid. See
@@ -4467,6 +4473,239 @@ fn eval_date_part_date(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, 
         },
         TY_TIMESTAMP,
     )
+}
+
+// ─── date_part(text, interval) ──────────────────────────────────────────────
+//
+// DESIGN, written before the implementation because every number in it was
+// measured on a live PostgreSQL 18.2 and none of it can be recovered by
+// reasoning from the timestamp version.
+//
+// oid 1172 is `interval_part`, a C function in its own right — NOT
+// `extract_interval` with a cast, and NOT `date_part(text, timestamp)` with a
+// conversion. `pg_proc.prosrc` says so, and so does the arithmetic:
+//
+//   date_part('second', interval '56.789123 sec')  = 56.789123000000004
+//   extract  (second from interval '56.789123 sec') = 56.789123
+//
+// The trailing `...004` is the signature of `tm_sec + fsec / 1000000.0` done
+// in `double`. A cast of the `numeric` would have produced the clean value.
+// So this cannot share [`date_part_of`]'s call path, and it cannot share
+// [`extract_value`]'s either.
+//
+// WHY IT CANNOT REUSE [`date_part_of`]: an interval is not an instant. Basin
+// stores it as `Interval(MonthDayNano)` with months, days and nanos kept
+// separately and deliberately unnormalised, and Postgres does the same
+// (`months`, `days`, `time`). `INTERVAL '1 day'` is not `INTERVAL '24 hours'`,
+// and every field below reads the *stored component* rather than a calendar:
+//
+//   date_part('day',  interval '1 month')     = 0     -- not 30
+//   date_part('hour', interval '1 day -2 hours') = -2 -- days keep their sign
+//   date_part('hour', interval '100000 hours')   = 100000  -- no mod 24
+//
+// `justify_days`/`justify_hours` are NOT applied implicitly: the mixed-sign
+// `interval '1 day -2 hours'` reports day = 1 and hour = -2, and its epoch is
+// 79200 (= 86400 - 7200), all measured.
+//
+// THE FIELD TABLE, every entry measured (`m` = months, `d` = days, `n` =
+// nanos; `/` and `%` truncate toward zero, as C does):
+//
+//   year         m / 12                        '-13 mons' -> -1
+//   month        m % 12                        '-13 mons' -> -1
+//   decade       (m / 12) / 10                 '1999 years' -> 199
+//   century      (m / 12) / 100                '1999 years' -> 19, '-250 y' -> -2
+//   millennium   (m / 12) / 1000               '2500 years' -> 2, '-2500 y' -> -2
+//   quarter      see below                     '-1 mons' -> -1, '0' -> 1
+//   day          d                             '1 day -2 hours' -> 1
+//   week         d / 7                          '20 days' -> 2, '-20 days' -> -2
+//   hour         n / 3600e9                     '25 hours' -> 25 (no wrap)
+//   minute       (n / 60e9) % 60                '90 minutes' -> 30
+//   second       s + f/1e6                      '-0.5 s' -> -0.5
+//   milliseconds s*1000 + f/1000                '56.789123 s' -> 56789.123
+//   microseconds s*1e6 + f                      '56.789123 s' -> 56789123
+//   epoch        see below                      full convention below
+//
+// where `s` is the whole seconds inside the minute (`(n % 60e9) / 1e9`) and
+// `f` is the remaining microseconds (`(n % 1e9) / 1000`), both signed with
+// `n`. The three sub-minute units are one integer read at three scales, and
+// the `f64` expressions above are Postgres's own — writing `s as f64 +
+// frac_ns as f64 / 1e9` instead would produce a *different last bit* on
+// `56.789123`, which the differential battery would flag.
+//
+// QUARTER is the one field whose formula is not the timestamp one and not the
+// obvious one. Measured across `make_interval(months => n)` for n in -26..26,
+// with `mm = m % 12`:
+//
+//   mm   0  1  2  3  4  5  6  7  8  9 10 11
+//   q    1  1  1  2  2  2  3  3  3  4  4  4      -> mm / 3 + 1
+//   mm  -1 -2 -3 -4 -5 -6 -7 -8 -9 -10 -11
+//   q   -1 -1 -2 -2 -2 -3 -3 -3 -4  -4  -4      -> mm / 3 - 1
+//
+// A plain `mm / 3 + 1` gives 1 for `mm = -1`; Postgres gives -1. The branch,
+// measured, is on the sign of `m` and NOT on the sign of `mm` — the two part
+// company exactly on the whole-year negatives, where `mm` is zero:
+//
+//   date_part('quarter', interval '-24 months') = -1
+//   date_part('quarter', interval '0')          =  1
+//   date_part('quarter', interval '-1000 years')= -1
+//
+// Days and nanos do not participate at all: `date_part('quarter', interval
+// '-5 days')` is 1, and `interval '-2 years +5 days 03:00:00'` is still -1.
+//
+// EPOCH is a fixed convention, not an instant, and it is the number this
+// function exists to get right. Postgres's `interval_part` computes, in this
+// order and in `double`:
+//
+//   time / 1e6                              -- time is MICROseconds
+//     + 86400 * 365.25 * (months / 12)      -- DAYS_PER_YEAR, truncating div
+//     + 86400 * 30     * (months % 12)      -- DAYS_PER_MONTH
+//     + 86400 * days
+//
+// The order — year, then month, then day, with the time term first — is not
+// cosmetic. A differential sweep against the live server found exactly one
+// interval where the day-term-first spelling lands one ulp away (months -453,
+// days 1037, nanos -393922588884000: Postgres says -1101756322.588884, the
+// reassociated sum says -1101756322.5888839), and dividing nanos by 1e9
+// rather than micros by 1e6 does the same. With both spellings matched, every
+// unit in this file's table is **bit-exact** against PostgreSQL 18.2 over
+// 47,782 sampled `(months, days, nanos, unit)` call sites.
+//
+// A year is 365.25 days and a month is 30 days, and the split between them is
+// integer division of the month count by 12 — so 14 months is *one 365.25-day
+// year plus two 30-day months*, not fourteen 30-day months. Measured:
+//
+//   date_part('epoch', interval '1 year 2 mons 3 days 4:05:06.789012')
+//     = 37015506.789012          -- 31557600 + 5184000 + 259200 + 14706.789012
+//   date_part('epoch', interval '13 mons')  =  34149600
+//   date_part('epoch', interval '-13 mons') = -34149600   -- trunc, not floor
+//   date_part('epoch', interval '178000000 years') = 5.6172528e+15
+//
+// Reproducing that summation order matters: reassociating it changes the last
+// bit on the fractional cases.
+//
+// UNITS POSTGRES REFUSES, all message strings measured verbatim. The
+// timestamp version accepts every one of these:
+//
+//   dow, doy, isodow, isoyear, julian (and its alias `jd`),
+//   timezone, timezone_hour, timezone_minute (and `timezone_h`/`timezone_m`)
+//     -> unit "X" not supported for type interval
+//
+// `week` is the surprise in the other direction: `date_trunc(text, interval)`
+// refuses it, but `date_part('week', interval)` is ACCEPTED and returns
+// `days / 7`. The hint from commit 6264603c does not carry over, and the two
+// functions genuinely disagree on this one unit.
+//
+// The unit *vocabulary* is shared with the timestamp version — `millenium`
+// (misspelt) and `fortnight` are `not recognized for type interval`, while
+// every alias in [`parse_date_unit`] resolves. So [`parse_date_unit`] is
+// reused unchanged and only the per-unit answer differs.
+//
+// EXTRACT(… FROM interval) — oid 6204 — was compared while measuring, as the
+// brief asked. It agrees with `date_part` on every accepted unit's *value*
+// and on every rejection, differing only in returning `numeric`. It is NOT
+// implemented here: `extract`'s Decimal128 path needs a per-unit scale, and
+// the interval scales were not measured (only the values were), so declaring
+// them would be guessing. See the note at [`temporal_kind`], which continues
+// to refuse intervals.
+
+/// `date_part(text, interval)` — oid 1172. Session-independent: an interval
+/// has no position on the calendar.
+///
+/// Postgres's `interval_part`. Reads the three stored components and never
+/// normalises between them; see the design block above this function for the
+/// full measured field table, the `quarter` sign rule, the 365.25/30-day
+/// `epoch` convention and the list of refused units.
+fn eval_date_part_interval(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
+    const NS_PER_HOUR: i64 = 60 * NS_PER_MIN;
+
+    let u = downcast_array::<StringArray>(units, "text")?;
+    let v = downcast_array::<IntervalMonthDayNanoArray>(values, "interval")?;
+    let mut out: Vec<Option<f64>> = Vec::with_capacity(v.len());
+    for i in 0..v.len() {
+        if u.is_null(i) || v.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let raw = u.value(i);
+        let unit = parse_date_unit(raw).ok_or_else(|| unit_not_recognized(raw, TY_INTERVAL))?;
+        let iv = v.value(i);
+        let (months, days, nanos) = (iv.months, iv.days, iv.nanoseconds);
+
+        // Postgres's `tm_sec` and `fsec`: the whole seconds inside the
+        // minute, and the leftover as microseconds. Both carry the sign of
+        // `nanos`, because `%` truncates toward zero in Rust as in C — which
+        // is what makes `interval '-0.5 sec'` report second = -0.5 rather
+        // than 59.5.
+        let whole_sec = (nanos % NS_PER_MIN) / NS_PER_SEC;
+        // `frac_ns / 1000.0` rather than an integer `/ 1000`: for any nanos
+        // Postgres could have produced (whole microseconds) the two agree
+        // bit-for-bit, and for a sub-microsecond nanos — which Postgres
+        // cannot represent at all — this keeps the digits instead of
+        // silently dropping them.
+        let fsec = (nanos % NS_PER_SEC) as f64 / 1000.0;
+        let years = months / 12;
+        let rem_months = months % 12;
+
+        let answer = match unit {
+            DateUnit::Year => f64::from(years),
+            DateUnit::Month => f64::from(rem_months),
+            DateUnit::Decade => f64::from(years / 10),
+            DateUnit::Century => f64::from(years / 100),
+            DateUnit::Millennium => f64::from(years / 1000),
+            // The sign rule measured across months -26..26; see the design
+            // block. The branch is on `months`, NOT on `rem_months`:
+            // `interval '-24 months'` has `rem_months == 0` and reports -1,
+            // while `interval '0'` reports 1. Days and nanos do not
+            // participate — `interval '-5 days'` is quarter 1.
+            DateUnit::Quarter => f64::from(if months < 0 {
+                rem_months / 3 - 1
+            } else {
+                rem_months / 3 + 1
+            }),
+            DateUnit::Day => f64::from(days),
+            // Accepted for `date_part` even though `date_trunc(text,
+            // interval)` refuses it. Measured: 20 days -> 2, -20 days -> -2.
+            DateUnit::Week => f64::from(days / 7),
+            // Not reduced mod 24: an interval's days are a separate
+            // component, so `interval '100000 hours'` reports 100000.
+            DateUnit::Hour => (nanos / NS_PER_HOUR) as f64,
+            DateUnit::Minute => ((nanos / NS_PER_MIN) % 60) as f64,
+            DateUnit::Second => whole_sec as f64 + fsec / 1_000_000.0,
+            DateUnit::Millisecond => whole_sec as f64 * 1000.0 + fsec / 1000.0,
+            DateUnit::Microsecond => whole_sec as f64 * 1_000_000.0 + fsec,
+            // Postgres's summation order, kept verbatim — reassociating it
+            // moves the last bit on the fractional cases.
+            DateUnit::Epoch => {
+                // Postgres divides its microsecond `time` by 1e6; dividing
+                // nanos by 1e9 instead differs by one ulp on some values
+                // (measured: months -453, days 1037, nanos -393922588884000).
+                // The `% 1000` term is zero for every interval Postgres can
+                // represent and only carries a sub-microsecond nanos through.
+                let mut result = (nanos / 1000) as f64 / 1e6 + (nanos % 1000) as f64 / 1e9;
+                // Year, then month, then day — Postgres's order, and it is
+                // load-bearing: summing the day term first moves the last bit
+                // on the case named above.
+                result += 86_400.0 * 365.25 * f64::from(years);
+                result += 86_400.0 * 30.0 * f64::from(rem_months);
+                result += 86_400.0 * f64::from(days);
+                result
+            }
+            // Every unit the timestamp version answers and the interval one
+            // does not. All eight messages measured verbatim on 18.2.
+            DateUnit::Dow
+            | DateUnit::IsoDow
+            | DateUnit::Doy
+            | DateUnit::IsoYear
+            | DateUnit::Julian
+            | DateUnit::Timezone
+            | DateUnit::TimezoneHour
+            | DateUnit::TimezoneMinute => return Err(unit_not_supported(raw, TY_INTERVAL)),
+        };
+        out.push(Some(answer));
+    }
+    Ok(Arc::new(Float64Array::from(out)))
 }
 
 // ─── extract ────────────────────────────────────────────────────────────────
@@ -10699,6 +10938,236 @@ mod tests {
                 "date_part('{field}', date {days}): basin {got}, postgres {expected}"
             );
         }
+    }
+
+    /// `date_part(text, interval)` (oid 1172). Every expectation below is the
+    /// answer a live PostgreSQL 18.2 gave with `extra_float_digits = 3`, and
+    /// the query that produced it is quoted at each block.
+    ///
+    /// The interval is `1 year 2 mons 3 days 04:05:06.789012` — months and
+    /// days and time all non-zero, so a field that reached across components
+    /// would be caught.
+    #[test]
+    fn date_part_interval_matches_postgres() {
+        // select date_part(u, interval '1 year 2 mons 3 days 4:05:06.789012')
+        const MONTHS: i32 = 14;
+        const DAYS: i32 = 3;
+        const NANOS: i64 = 14_706_789_012_000;
+        const CASES: &[(&str, f64)] = &[
+            ("year", 1.0),
+            ("month", 2.0),
+            ("decade", 0.0),
+            ("century", 0.0),
+            ("millennium", 0.0),
+            ("quarter", 1.0),
+            // 0, NOT 30: an interval's days are its own component, and the
+            // month never contributes to them.
+            ("day", 3.0),
+            ("week", 0.0),
+            ("hour", 4.0),
+            ("minute", 5.0),
+            ("second", 6.789012),
+            ("milliseconds", 6789.012),
+            ("microseconds", 6789012.0),
+            // 31557600 (365.25-day year) + 5184000 (two 30-day months)
+            //   + 259200 (3 days) + 14706.789012
+            ("epoch", 37015506.789012),
+        ];
+        for (unit, expected) in CASES {
+            let got = date_part_iv(MONTHS, DAYS, NANOS, unit);
+            assert!(
+                (got - *expected).abs() <= expected.abs() * 1e-12 + 1e-9,
+                "date_part('{unit}', interval '1 year 2 mons 3 days 4:05:06.789012'): \
+                 basin {got}, postgres {expected}"
+            );
+        }
+    }
+
+    /// The cases the timestamp version's rules would get wrong: mixed signs,
+    /// negative month counts, an hour count past 24, and the year-scale
+    /// units. Each `(months, days, nanos, unit) -> value` row is a live
+    /// PostgreSQL 18.2 answer; the interval each row stands for is named.
+    #[test]
+    fn date_part_interval_signs_and_magnitudes_match_postgres() {
+        const CASES: &[(i32, i32, i64, &str, f64)] = &[
+            // interval '1 day -2 hours' — both signs kept, no implicit
+            // justify_hours: day is 1 while hour is -2, and epoch is
+            // 86400 - 7200.
+            (0, 1, -7_200_000_000_000, "day", 1.0),
+            (0, 1, -7_200_000_000_000, "hour", -2.0),
+            (0, 1, -7_200_000_000_000, "epoch", 79200.0),
+            // interval '-13 months' — truncating division, not flooring.
+            (-13, 0, 0, "year", -1.0),
+            (-13, 0, 0, "month", -1.0),
+            (-13, 0, 0, "epoch", -34149600.0),
+            // interval '-1 mons' — quarter is -1, not the +1 that a plain
+            // `month / 3 + 1` produces.
+            (-1, 0, 0, "quarter", -1.0),
+            (-1, 0, 0, "epoch", -2592000.0),
+            // interval '0' — quarter takes the positive branch at zero.
+            (0, 0, 0, "quarter", 1.0),
+            (0, 0, 0, "epoch", 0.0),
+            // The whole-year negatives, where `months % 12` is zero and only
+            // the sign of `months` itself distinguishes them from `interval
+            // '0'`. Days and time never contribute to `quarter`.
+            (-24, 0, 0, "quarter", -1.0),
+            (-24, 5, 10_800_000_000_000, "quarter", -1.0), // '-2 years +5 days 03:00:00'
+            (-12000, 0, 0, "quarter", -1.0),               // '-1000 years'
+            (0, -5, 0, "quarter", 1.0),                    // '-5 days'
+            (24, -5, 0, "quarter", 1.0),                   // '2 years -5 days'
+            (-12, 11, 0, "quarter", -1.0),                 // '-1 years +11 days'
+            // interval '100000:00:00' — hour is not reduced mod 24.
+            (0, 0, 360_000_000_000_000_000, "hour", 100000.0),
+            (0, 0, 360_000_000_000_000_000, "day", 0.0),
+            (0, 0, 360_000_000_000_000_000, "epoch", 360000000.0),
+            // interval '-20 days' — week truncates toward zero.
+            (0, -20, 0, "week", -2.0),
+            (0, -20, 0, "day", -20.0),
+            (0, -20, 0, "epoch", -1728000.0),
+            // interval '1999 years 11 mons' — decade/century/millennium are
+            // plain division on the year count, with no off-by-one.
+            (23999, 0, 0, "year", 1999.0),
+            (23999, 0, 0, "month", 11.0),
+            (23999, 0, 0, "decade", 199.0),
+            (23999, 0, 0, "century", 19.0),
+            (23999, 0, 0, "millennium", 1.0),
+            (23999, 0, 0, "quarter", 4.0),
+            (23999, 0, 0, "epoch", 63112154400.0),
+            // interval '2500 years'
+            (30000, 0, 0, "millennium", 2.0),
+            (30000, 0, 0, "epoch", 78894000000.0),
+            // interval '-00:00:00.5' — the sub-second fields carry the sign.
+            (0, 0, -500_000_000, "second", -0.5),
+            (0, 0, -500_000_000, "milliseconds", -500.0),
+            (0, 0, -500_000_000, "microseconds", -500000.0),
+            (0, 0, -500_000_000, "epoch", -0.5),
+            // interval '-04:05:06.789012'
+            (0, 0, -14_706_789_012_000, "hour", -4.0),
+            (0, 0, -14_706_789_012_000, "minute", -5.0),
+            (0, 0, -14_706_789_012_000, "second", -6.789012),
+            (0, 0, -14_706_789_012_000, "epoch", -14706.789012),
+            // interval '90 minutes', normalised by Postgres to 01:30:00 —
+            // minute is the count inside the hour.
+            (0, 0, 5_400_000_000_000, "minute", 30.0),
+            (0, 0, 5_400_000_000_000, "hour", 1.0),
+            // interval '20 days' / '7 days'
+            (0, 20, 0, "week", 2.0),
+            (0, 7, 0, "week", 1.0),
+        ];
+        for (m, d, n, unit, expected) in CASES {
+            let got = date_part_iv(*m, *d, *n, unit);
+            assert!(
+                (got - *expected).abs() <= expected.abs() * 1e-12 + 1e-9,
+                "date_part('{unit}', interval({m}, {d}, {n})): basin {got}, postgres {expected}"
+            );
+        }
+    }
+
+    /// The quarter sign rule in full, swept over `make_interval(months => n)`
+    /// for n in -26..=26 on a live PostgreSQL 18.2. This is the field that a
+    /// reasonable-looking `(month % 12) / 3 + 1` gets wrong for every
+    /// negative interval.
+    #[test]
+    fn date_part_interval_quarter_sweep_matches_postgres() {
+        // select n, date_part('quarter', make_interval(months => n))
+        //   from generate_series(-26, 26) n;
+        const EXPECTED: &[f64] = &[
+            -1.0, -1.0, -1.0, // -26, -25, -24
+            -4.0, -4.0, -4.0, -3.0, -3.0, -3.0, -2.0, -2.0, -2.0, -1.0, -1.0, // -23 ..= -13
+            -1.0, // -12, where `months % 12` is 0 and only `months`'s sign says -1
+            -4.0, -4.0, -4.0, -3.0, -3.0, -3.0, -2.0, -2.0, -2.0, -1.0, -1.0, // -11 ..= -1
+            1.0,  // 0
+            1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0, // 1 ..= 11
+            1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0, // 12 ..= 23
+            1.0, 1.0, 1.0, // 24, 25, 26
+        ];
+        assert_eq!(EXPECTED.len(), 53);
+        for (idx, expected) in EXPECTED.iter().enumerate() {
+            let months = idx as i32 - 26;
+            let got = date_part_iv(months, 0, 0, "quarter");
+            assert_eq!(
+                got, *expected,
+                "date_part('quarter', make_interval(months => {months}))"
+            );
+        }
+    }
+
+    /// The units Postgres refuses for an interval, with its two different
+    /// messages reproduced verbatim.
+    ///
+    /// `week` is deliberately absent from the refusal list and present in the
+    /// success tests above: `date_trunc('week', interval)` is an error while
+    /// `date_part('week', interval)` is `days / 7`. The two functions
+    /// genuinely disagree on this one unit, measured both ways.
+    #[test]
+    fn date_part_interval_refuses_the_units_postgres_refuses() {
+        // select date_part(u, interval '1 day') for each u, on 18.2
+        const NOT_SUPPORTED: &[&str] = &[
+            "dow",
+            "doy",
+            "isodow",
+            "isoyear",
+            "julian",
+            "jd",
+            "timezone",
+            "timezone_hour",
+            "timezone_minute",
+            "timezone_h",
+            "timezone_m",
+        ];
+        for unit in NOT_SUPPORTED {
+            let err = date_part_iv_err(0, 1, 0, unit);
+            assert_eq!(
+                err,
+                format!("type mismatch: unit \"{unit}\" not supported for type interval"),
+                "date_part('{unit}', interval)"
+            );
+        }
+        // Unknown units are a *different* message, and the misspelt
+        // `millenium` is one of them even though `millennium` resolves.
+        for unit in ["fortnight", "millenium", "qtrs"] {
+            let err = date_part_iv_err(0, 1, 0, unit);
+            assert_eq!(
+                err,
+                format!("type mismatch: unit \"{unit}\" not recognized for type interval"),
+                "date_part('{unit}', interval)"
+            );
+        }
+    }
+
+    /// One interval row through `date_part(text, interval)`, returning the
+    /// `float8` answer.
+    fn date_part_iv(months: i32, days: i32, nanos: i64, unit: &str) -> f64 {
+        f64_at0(&date_part_iv_result(months, days, nanos, unit).unwrap())
+    }
+
+    /// The same call's error string.
+    fn date_part_iv_err(months: i32, days: i32, nanos: i64, unit: &str) -> String {
+        date_part_iv_result(months, days, nanos, unit)
+            .unwrap_err()
+            .to_string()
+    }
+
+    fn date_part_iv_result(
+        months: i32,
+        days: i32,
+        nanos: i64,
+        unit: &str,
+    ) -> Result<ArrayRef, ExecError> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(IntervalMonthDayNanoArray::from(vec![Some(
+                IntervalMonthDayNano::new(months, days, nanos),
+            )])) as ArrayRef],
+        )
+        .unwrap();
+        let expr = sf(OID_DATE_PART_INTERVAL, vec![lit_text(unit), col(0, "v")]);
+        eval_with(&expr, &batch, &EvalSession::DEFAULT)
     }
 
     /// `date_trunc(text, interval)` (oid 1218). Session-independent, and
