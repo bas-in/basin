@@ -70,6 +70,8 @@ use pg_query::protobuf::{
     OnConflictClause, OverridingKind, RangeVar, UpdateStmt,
 };
 
+use basin_pgtype::PgType;
+
 use crate::lower::expr::{
     lower_expr, ColumnResolver, FunctionResolver, LowerCtx, OperatorResolver, SubqueryLowerer,
 };
@@ -228,6 +230,26 @@ impl FlatScope {
         })
     }
 
+    /// The type at a flat column index, but only if the column there really
+    /// is the one named `name` — the same fail-closed cross-check
+    /// `lower::select`'s `ScopeResolver::column_type_local` makes, and for
+    /// the same reason: a type that belongs to some *other* column is a
+    /// misresolved overload, which is worse than no type at all.
+    fn flat_type(&self, index: u16, name: &str) -> PgType {
+        let mut offset = 0u16;
+        for (_, schema) in &self.relations {
+            let len = schema.len() as u16;
+            if index < offset + len {
+                return match schema.get((index - offset) as usize) {
+                    Some((n, ty)) if n == name => *ty,
+                    _ => PgType::UNKNOWN,
+                };
+            }
+            offset += len;
+        }
+        PgType::UNKNOWN
+    }
+
     /// Every `(name, flat index)` pair `*` or `t.*` expands to.
     fn star_columns(&self, qualifier: Option<&str>) -> Vec<(String, u16)> {
         let mut out = Vec::new();
@@ -249,6 +271,10 @@ struct FlatScopeResolver<'a>(&'a FlatScope);
 impl ColumnResolver for FlatScopeResolver<'_> {
     fn resolve(&self, parts: &[String]) -> Option<ColumnRef> {
         self.0.resolve(parts)
+    }
+
+    fn column_type(&self, c: &ColumnRef) -> PgType {
+        self.0.flat_type(c.index, &c.name)
     }
 }
 
@@ -299,6 +325,24 @@ impl ColumnResolver for ConflictColumnResolver<'_> {
             index: pos as u16,
             name: name.clone(),
         })
+    }
+
+    /// Both halves of this scope — the existing row and `excluded` — are the
+    /// *same* table-shaped schema laid out twice, so an index past its width
+    /// is the `excluded` copy of the very same column and has the very same
+    /// type. Cross-checked on the name for the same fail-closed reason as
+    /// [`FlatScope::flat_type`].
+    fn column_type(&self, c: &ColumnRef) -> PgType {
+        let width = self.schema.len() as u16;
+        let pos = if c.index >= width {
+            c.index - width
+        } else {
+            c.index
+        };
+        match self.schema.get(pos as usize) {
+            Some((n, ty)) if *n == c.name => *ty,
+            _ => PgType::UNKNOWN,
+        }
     }
 }
 

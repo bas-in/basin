@@ -53,6 +53,35 @@ use crate::LogicalPlan;
 /// whatever relation is in scope) plugs in later without this file changing.
 pub trait ColumnResolver {
     fn resolve(&self, parts: &[String]) -> Option<ColumnRef>;
+
+    /// The catalog type of a column **this resolver itself produced** from
+    /// [`ColumnResolver::resolve`], or [`PgType::UNKNOWN`] when it cannot
+    /// say.
+    ///
+    /// # Why the type lives here and not on [`ColumnRef`]
+    ///
+    /// A column's type is needed only while *lowering* — it is an input to
+    /// operator and function overload resolution, and to nothing else. Once
+    /// a plan exists, a relation's column types come from
+    /// [`crate::schema::output_schema`] (or, for a `Scan`, from the catalog
+    /// the resolver was built over), so a `ty` field on `ColumnRef` would be
+    /// a second, redundant copy that every plan rewrite has to keep in step.
+    /// Worse, `ColumnRef`s are *synthesized* — `opt::pushdown` and
+    /// `opt::projection` renumber them across a join, and `basin-exec`'s
+    /// physical builder invents them for repartition/spill projections —
+    /// at sites that have a position but no catalog. Those sites would have
+    /// to invent a type, and an invented type in the IR is exactly the
+    /// silent-wrong-answer shape a `PgType::UNKNOWN` honestly is not.
+    ///
+    /// Asking the resolver instead keeps the type where the knowledge is:
+    /// the resolver already owns the name -> position mapping, so answering
+    /// "and what type is that position" is the same responsibility, not a
+    /// new one. The default implementation returns `UNKNOWN` so a resolver
+    /// with no catalog behind it (a test double, `dml`'s `RETURNING` scope
+    /// before it has one) keeps exactly its previous behaviour.
+    fn column_type(&self, _c: &ColumnRef) -> PgType {
+        PgType::UNKNOWN
+    }
 }
 
 /// Resolves an operator name and operand types to a `pg_operator` entry.
@@ -257,17 +286,23 @@ fn operator_name(name_nodes: &[Node]) -> Result<String, LowerError> {
     }
 }
 
-/// The type used for operator resolution when the true type of an operand is
-/// not known. Column types are not available in this increment — the
-/// `ColumnResolver` seam returns a position, not a catalog type — so every
-/// operand that isn't a literal, cast, or other self-typed expression
-/// resolves as `unknown` and the `OperatorResolver` must cope with that, the
-/// same way Postgres's own operator resolution copes with an `unknown`-typed
-/// operand (deferring to the other side, or to a default).
-pub(crate) fn best_effort_type(e: &Expr) -> PgType {
+/// The type used for operator and function resolution.
+///
+/// A literal, cast or parameter carries its own type. A **column** does not
+/// carry one (see [`ColumnResolver::column_type`] for why it deliberately
+/// does not), so its type is asked of the resolver that produced it —
+/// `columns` must therefore be the same resolver the expression was lowered
+/// against, which every call site here satisfies by passing `ctx.columns`.
+///
+/// Everything else — an operator or function result, a `CASE`, a subquery —
+/// still resolves as `unknown`, and the `OperatorResolver` must cope with
+/// that, the same way Postgres's own resolution copes with an
+/// `unknown`-typed operand (deferring to the other side, or to a default).
+pub(crate) fn best_effort_type(e: &Expr, columns: &dyn ColumnResolver) -> PgType {
     match e {
         Expr::Literal(_, ty) | Expr::Parameter { ty, .. } => *ty,
         Expr::Cast { to, .. } => *to,
+        Expr::Column(c) => columns.column_type(c),
         _ => PgType::UNKNOWN,
     }
 }
@@ -278,8 +313,8 @@ fn resolve_op(
     left: Option<&Expr>,
     right: &Expr,
 ) -> Result<OpId, LowerError> {
-    let left_ty = left.map(best_effort_type);
-    let right_ty = best_effort_type(right);
+    let left_ty = left.map(|l| best_effort_type(l, ctx.columns));
+    let right_ty = best_effort_type(right, ctx.columns);
     ctx.operators
         .resolve(name, left_ty, right_ty)
         .ok_or_else(|| {
@@ -348,11 +383,11 @@ fn lower_aexpr_any_all(ae: &AExpr, ctx: &LowerCtx, kind: AExprKind) -> Result<Ex
         .collect::<Result<Vec<_>, _>>()?;
     let elem_ty = elements
         .first()
-        .map(best_effort_type)
+        .map(|e| best_effort_type(e, ctx.columns))
         .unwrap_or(PgType::UNKNOWN);
     let op = ctx
         .operators
-        .resolve(&name, Some(best_effort_type(&lhs)), elem_ty)
+        .resolve(&name, Some(best_effort_type(&lhs, ctx.columns)), elem_ty)
         .ok_or_else(|| {
             LowerError::NoMatchingOperator(format!(
                 "no operator `{name}` for ANY/ALL over element type {elem_ty:?}"
@@ -1102,7 +1137,10 @@ fn lower_func_call(fc: &FuncCall, ctx: &LowerCtx) -> Result<Expr, LowerError> {
         .iter()
         .map(|n| lower_expr(n, ctx))
         .collect::<Result<Vec<_>, _>>()?;
-    let arg_types: Vec<PgType> = args.iter().map(best_effort_type).collect();
+    let arg_types: Vec<PgType> = args
+        .iter()
+        .map(|a| best_effort_type(a, ctx.columns))
+        .collect();
 
     let (func, kind) = ctx.functions.resolve(&name, &arg_types).ok_or_else(|| {
         LowerError::NoMatchingOperator(format!(
@@ -1398,7 +1436,7 @@ fn lower_sub_link(sl: &SubLink, ctx: &LowerCtx) -> Result<Expr, LowerError> {
                 SubqueryKind::In
             } else {
                 let name = operator_name(&sl.oper_name)?;
-                let lhs_ty = operand.as_deref().map(best_effort_type);
+                let lhs_ty = operand.as_deref().map(|o| best_effort_type(o, ctx.columns));
                 let op = ctx
                     .operators
                     .resolve(&name, lhs_ty, PgType::UNKNOWN)

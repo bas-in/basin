@@ -311,19 +311,25 @@ impl Scope {
         })
     }
 
-    /// The type at a given flat column index, if any — used to give a
-    /// bare-column SELECT list entry its real type in
-    /// [`select_output_schema`] without needing a second, catalog-free type
-    /// inference pass (`crate::schema::expr_type` cannot help here: it
-    /// itself needs an input schema, which for anything rooted at a `Scan`
-    /// is exactly what that module's own docs say it cannot produce without
-    /// a catalog — this `Scope` already carries the real one).
-    fn flat_type(&self, index: u16) -> Option<PgType> {
+    /// The `(name, type)` at a given flat column index, if any — the whole
+    /// of what makes a column's real catalog type reachable during lowering,
+    /// without needing a second, catalog-free type inference pass
+    /// (`crate::schema::expr_type` cannot help here: it itself needs an
+    /// input schema, which for anything rooted at a `Scan` is exactly what
+    /// that module's own docs say it cannot produce without a catalog — this
+    /// `Scope` already carries the real one).
+    ///
+    /// The name rides along because [`ScopeResolver::column_type`]
+    /// cross-checks a correlated reference against it — see there.
+    fn flat_entry(&self, index: u16) -> Option<(&str, PgType)> {
         let mut offset = 0u16;
         for rel in &self.relations {
             let len = rel.schema.len() as u16;
             if index < offset + len {
-                return rel.schema.get((index - offset) as usize).map(|(_, ty)| *ty);
+                return rel
+                    .schema
+                    .get((index - offset) as usize)
+                    .map(|(n, ty)| (n.as_str(), *ty));
             }
             offset += len;
         }
@@ -373,6 +379,18 @@ impl<'a> ScopeResolver<'a> {
     fn new(scope: &'a Scope, outer: Option<&'a dyn ColumnResolver>) -> Self {
         Self { scope, outer }
     }
+
+    /// The type at `index` in this resolver's own [`Scope`], but only if the
+    /// column there really is the one named `name`.
+    ///
+    /// The name cross-check is what makes [`ScopeResolver::column_type`]'s
+    /// correlated case fail closed rather than wrong — see there.
+    fn column_type_local(&self, index: u16, name: &str) -> PgType {
+        match self.scope.flat_entry(index) {
+            Some((n, ty)) if n == name => ty,
+            _ => PgType::UNKNOWN,
+        }
+    }
 }
 
 impl ColumnResolver for ScopeResolver<'_> {
@@ -386,6 +404,39 @@ impl ColumnResolver for ScopeResolver<'_> {
             index: cr.index,
             name: cr.name,
         })
+    }
+
+    /// The type of a column this resolver returned.
+    ///
+    /// A local hit (`relation == 0`) is a direct lookup in [`Scope`], which
+    /// carries the real catalog schema of every `FROM` item.
+    ///
+    /// An [`OUTER_REF`] hit came from `self.outer`, and its `index` is in
+    /// *that* resolver's own flat space — so the question is handed straight
+    /// back to `outer` re-tagged as local, which is what it was before
+    /// [`ColumnResolver::resolve`] above rewrote it. That is exact for a
+    /// singly-correlated reference and, importantly, **fails closed** for a
+    /// doubly-correlated one: the `OUTER_REF` tag collapses a deeper chain
+    /// (see this type's own docs), so `index` could belong to a
+    /// grandparent's space instead. [`ScopeResolver::column_type_local`]'s
+    /// name cross-check is what catches that — a chain only forms when the
+    /// parent's scope did *not* contain the name, so a parent lookup at that
+    /// index cannot match the name, and the answer is `UNKNOWN` rather than
+    /// some other column's type. A wrong type here would be a misresolved
+    /// overload, which is the exact failure mode this method exists to
+    /// remove.
+    fn column_type(&self, c: &ColumnRef) -> PgType {
+        if c.relation == OUTER_REF {
+            let Some(outer) = self.outer else {
+                return PgType::UNKNOWN;
+            };
+            return outer.column_type(&ColumnRef {
+                relation: 0,
+                index: c.index,
+                name: c.name.clone(),
+            });
+        }
+        self.column_type_local(c.index, &c.name)
     }
 }
 
@@ -1251,7 +1302,7 @@ fn lower_values(stmt: &SelectStmt, res: &Resolvers) -> Result<(LogicalPlan, Sche
         .map(|i| {
             let ty = rows
                 .iter()
-                .map(|r| best_effort_type(&r[i]))
+                .map(|r| best_effort_type(&r[i], &resolver))
                 .find(|t| !t.is_unknown())
                 .unwrap_or(PgType::UNKNOWN);
             (format!("column{}", i + 1), ty)
@@ -1500,8 +1551,9 @@ const ALIAS_NAMED_SRFS: &[&str] = &[
 /// [`FunctionResolver`] seam returned, because one `pg_proc` oid can have
 /// several result types: `unnest` is oid 2331 for every array element type,
 /// so the oid alone cannot distinguish `unnest(int[]) -> int4` from
-/// `unnest(text[]) -> text`. The argument types are `best_effort_type`'s, so
-/// a bare column argument reports `unknown` and picks the first
+/// `unnest(text[]) -> text`. The argument types are `best_effort_type`'s —
+/// a column's real catalog type, a literal/cast/parameter's own, and
+/// `unknown` for anything else, which then picks the first
 /// implicitly-coercible overload — the same best-effort resolution
 /// `lower_func_call` itself already performs one step earlier for the oid.
 fn builtin_srf_column_type(name: &str, arg_types: &[PgType]) -> Option<PgType> {
@@ -1655,7 +1707,10 @@ fn build_range_function(
             "multi-argument `unnest(a, b)` in FROM expands to one column per argument and is not yet lowered".into(),
         ));
     }
-    let arg_types: Vec<PgType> = args.iter().map(best_effort_type).collect();
+    let arg_types: Vec<PgType> = args
+        .iter()
+        .map(|a| best_effort_type(a, ctx.columns))
+        .collect();
     let ty = builtin_srf_column_type(fname, &arg_types).ok_or_else(|| {
         LowerError::Unsupported(format!(
             "a set-returning function in FROM with no single-column entry in Basin's builtin catalog (`{fname}` at these argument types) is not yet lowered"
@@ -1896,7 +1951,7 @@ fn build_join_expr(
     let (on, filter, effective_kind) = match je.quals.as_deref() {
         Some(q) => {
             let (on, leftover) = split_equijoin_conjuncts(q, left_len, total_len, &ctx)?;
-            (on, and_together(leftover, res.operators)?, kind)
+            (on, and_together(leftover, &ctx)?, kind)
         }
         None => (
             vec![],
@@ -2041,7 +2096,7 @@ fn apply_where(
             if let Some(f) = existing_filter {
                 leftover.insert(0, f);
             }
-            let filter = and_together(leftover, res.operators)?;
+            let filter = and_together(leftover, &ctx)?;
             // A `Cross` join means "unconditional" by convention; once a
             // `WHERE`-clause equijoin (or leftover filter) attaches to it,
             // it is an `Inner` join in every way that matters downstream
@@ -2079,7 +2134,7 @@ fn apply_where(
                 }
                 exprs.push(e);
             }
-            let predicate = and_together(exprs, res.operators)?
+            let predicate = and_together(exprs, &ctx)?
                 .expect("a present WHERE clause lowers to at least one conjunct");
             Ok((
                 LogicalPlan::Filter {
@@ -2192,17 +2247,19 @@ fn collect_columns(expr: &Expr, out: &mut Vec<usize>) {
 /// the same way `lower::expr::lower_bool_expr` folds a parsed run of `AND`s.
 /// `None` for an empty list — "no leftover conjuncts" is not the same as "a
 /// leftover `TRUE`".
-fn and_together(
-    exprs: Vec<Expr>,
-    operators: &dyn OperatorResolver,
-) -> Result<Option<Expr>, LowerError> {
+fn and_together(exprs: Vec<Expr>, ctx: &LowerCtx) -> Result<Option<Expr>, LowerError> {
     let mut iter = exprs.into_iter();
     let Some(mut acc) = iter.next() else {
         return Ok(None);
     };
     for next in iter {
-        let op = operators
-            .resolve("AND", Some(best_effort_type(&acc)), best_effort_type(&next))
+        let op = ctx
+            .operators
+            .resolve(
+                "AND",
+                Some(best_effort_type(&acc, ctx.columns)),
+                best_effort_type(&next, ctx.columns),
+            )
             .ok_or_else(|| {
                 LowerError::NoMatchingOperator("no boolean AND operator available".into())
             })?;
@@ -2343,20 +2400,22 @@ fn default_alias(expr: &Expr) -> String {
 /// written, before any aggregate/window rewrite touches it) and `scope` (the
 /// real `FROM`-clause schema), so a bare-column entry gets its exact type and
 /// everything else best-effort-falls back to [`PgType::UNKNOWN`] the same way
-/// [`lower_values`]'s own schema does — see [`Scope::flat_type`]'s docs for
+/// [`lower_values`]'s own schema does — see [`Scope::flat_entry`]'s docs for
 /// why this doesn't reuse `crate::schema`'s inference instead.
+///
+/// The bare-column case is no longer spelled out here: `best_effort_type`
+/// asks the [`ColumnResolver`] for a column's type, and a [`ScopeResolver`]
+/// over this same `scope` answers with exactly the lookup this function used
+/// to do inline. `outer` is `None` on purpose — an outer reference's `index`
+/// is not in *this* scope's space, and the resolver's own name cross-check
+/// (see [`ScopeResolver::column_type`]) turns that into `UNKNOWN` instead of
+/// the wrong column's type, which the previous inline lookup did not.
 fn select_output_schema(target: &[(Expr, String)], scope: &Scope) -> Schema {
+    let resolver = ScopeResolver::new(scope, None);
     target
         .iter()
-        .map(|(e, alias)| (alias.clone(), best_effort_column_type(e, scope)))
+        .map(|(e, alias)| (alias.clone(), best_effort_type(e, &resolver)))
         .collect()
-}
-
-fn best_effort_column_type(e: &Expr, scope: &Scope) -> PgType {
-    match e {
-        Expr::Column(cr) => scope.flat_type(cr.index).unwrap_or(PgType::UNKNOWN),
-        _ => best_effort_type(e),
-    }
 }
 
 // ─── WINDOW ─────────────────────────────────────────────────────────────────
@@ -6086,5 +6145,259 @@ mod tests {
             });
         });
         plan.for_each_input(&mut |c| collect_outer_indices(c, out));
+    }
+
+    // --- A column's catalog type reaches overload resolution -----------------
+    //
+    // Two different things are asserted below, and keeping them apart matters:
+    //
+    //   1. **What the seam delivers.** [`SpyFunctions`] records the argument
+    //      types the `FunctionResolver` was actually asked about. That is the
+    //      seam's output and this module's whole responsibility — before
+    //      `ColumnResolver::column_type` existed, every bare column arrived
+    //      there as `unknown`.
+    //   2. **Which overload gets picked**, end to end, against the real
+    //      `pg_proc` (`basin_pgtype::func`) and `pg_operator` tables. That is
+    //      the seam's *consumer*, and it is one step further out: a right
+    //      answer needs both a right input and a resolver that ranks
+    //      candidates the way Postgres does. See
+    //      `date_part_on_a_date_column_now_offers_the_date_type` for the one
+    //      family where the input is now right and the ranking is not.
+    //
+    // A resolver that ignores its argument types (like `MockFunctions` above,
+    // deliberately arg-blind for the plan-shape tests) cannot show either.
+
+    /// `pg_proc` itself, so overload choice is the real one.
+    struct CatalogFunctions;
+
+    impl FunctionResolver for CatalogFunctions {
+        fn resolve(
+            &self,
+            name: &[String],
+            args: &[PgType],
+        ) -> Option<(crate::FuncId, crate::lower::expr::FuncKind)> {
+            use crate::lower::expr::FuncKind;
+            let arg_oids: Vec<Oid> = args.iter().map(|t| t.oid).collect();
+            let sig = basin_pgtype::func::resolve(name.last()?, &arg_oids)?;
+            let kind = match sig.kind {
+                basin_pgtype::func::FuncKind::Scalar => FuncKind::Scalar,
+                basin_pgtype::func::FuncKind::Aggregate => FuncKind::Aggregate,
+                basin_pgtype::func::FuncKind::Window => FuncKind::Window,
+                basin_pgtype::func::FuncKind::SetReturning => FuncKind::SetReturning,
+            };
+            Some((crate::FuncId(sig.oid), kind))
+        }
+    }
+
+    /// A temporal table plus a `bigint` column — the two shapes whose
+    /// overload choice used to be decided by `unknown`.
+    fn typed_tables() -> MockTables {
+        tables().with(
+            "d",
+            300,
+            &[
+                ("id", PgType::INT8),
+                ("day", PgType::DATE),
+                ("ts", PgType::TIMESTAMP),
+                ("tz", PgType::TIMESTAMPTZ),
+            ],
+        )
+    }
+
+    /// Records every `(name, argument types)` the lowering pass asks about,
+    /// then answers exactly as [`CatalogFunctions`] would. This is how a test
+    /// sees the *seam's* output rather than its consumer's verdict.
+    #[derive(Default)]
+    struct SpyFunctions(std::cell::RefCell<Vec<(String, Vec<PgType>)>>);
+
+    impl FunctionResolver for SpyFunctions {
+        fn resolve(
+            &self,
+            name: &[String],
+            args: &[PgType],
+        ) -> Option<(crate::FuncId, crate::lower::expr::FuncKind)> {
+            self.0
+                .borrow_mut()
+                .push((name.last()?.clone(), args.to_vec()));
+            CatalogFunctions.resolve(name, args)
+        }
+    }
+
+    fn lower_with(sql: &str, funcs: &dyn FunctionResolver) -> Result<LogicalPlan, LowerError> {
+        let result = pg_query::parse(sql).expect("parse failed");
+        let raw = result.protobuf.stmts.first().expect("no stmt").clone();
+        let node = *raw.stmt.expect("no stmt node");
+        lower_select(&node, &typed_tables(), &CatalogOperators, funcs)
+    }
+
+    fn lower_typed(sql: &str) -> Result<LogicalPlan, LowerError> {
+        lower_with(sql, &CatalogFunctions)
+    }
+
+    /// The argument types the resolver was asked about for `name`.
+    fn arg_types_seen(sql: &str, name: &str) -> Vec<PgType> {
+        let spy = SpyFunctions::default();
+        lower_with(sql, &spy).expect("should lower");
+        let seen = spy.0.borrow();
+        seen.iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("`{name}` was never resolved while lowering `{sql}`"))
+            .1
+            .clone()
+    }
+
+    /// The first `ScalarFn`/`Aggregate`/`Window` oid reachable in `plan`,
+    /// descending into a subquery's own plan (which `Expr::any` deliberately
+    /// does not — see its docs).
+    fn first_func_oid(plan: &LogicalPlan) -> Option<u32> {
+        fn in_expr(e: &Expr, out: &mut Option<u32>) {
+            match e {
+                Expr::ScalarFn { func, .. }
+                | Expr::Aggregate { func, .. }
+                | Expr::Window { func, .. } => {
+                    out.get_or_insert(func.0 .0);
+                }
+                Expr::Subquery { subplan, .. } => {
+                    if out.is_none() {
+                        *out = first_func_oid(subplan);
+                    }
+                }
+                _ => {}
+            }
+            e.for_each_child(&mut |c| in_expr(c, out));
+        }
+        let mut found = None;
+        plan.for_each_expr(&mut |e| in_expr(e, &mut found));
+        if found.is_none() {
+            plan.for_each_input(&mut |c| {
+                if found.is_none() {
+                    found = first_func_oid(c);
+                }
+            });
+        }
+        found
+    }
+
+    /// **The seam does its job here, and the misresolution survives one step
+    /// further out.**
+    ///
+    /// `day` now reaches `pg_proc` resolution as `date` — that is what this
+    /// module owns, and it is asserted directly. The overload actually
+    /// chosen is still 1171, `date_part(text, timestamptz)`, where a live
+    /// PostgreSQL 18.2 picks 1384, `date_part(text, date)`.
+    ///
+    /// The reason is *not* this seam: it is `basin_pgtype::func::resolve`'s
+    /// documented "first-in-table match wins" rule. `'month'` is a bare
+    /// string literal, so it arrives as `unknown` (Postgres types it that way
+    /// too — `transformAConst`); that makes the all-arguments-exact pass fail
+    /// as a whole, and the implicit-coercion pass then takes whichever row
+    /// comes first, `timestamptz` being ahead of `date` in the table.
+    /// Postgres instead discards candidates with fewer exact matches on the
+    /// arguments whose type IS known (`func_select_candidate`), which leaves
+    /// only `date_part(text, date)`. That preference pass is the remaining
+    /// fix, and it belongs in `basin_pgtype::func::resolve`, not here —
+    /// `resolve`'s own doc comment claims the simplification "is not an
+    /// observable difference" for the tabulated functions, which this case
+    /// disproves.
+    #[test]
+    fn date_part_on_a_date_column_now_offers_the_date_type() {
+        assert_eq!(
+            arg_types_seen("SELECT date_part('month', day) FROM d", "date_part"),
+            vec![PgType::UNKNOWN, PgType::DATE],
+            "the column's catalog type reaches overload resolution; before \
+             `ColumnResolver::column_type` both arguments were `unknown`"
+        );
+    }
+
+    #[test]
+    fn extract_on_a_date_column_now_offers_the_date_type() {
+        assert_eq!(
+            arg_types_seen("SELECT extract(YEAR FROM day) FROM d", "extract"),
+            vec![PgType::UNKNOWN, PgType::DATE],
+        );
+    }
+
+    #[test]
+    fn date_part_on_a_timestamptz_column_still_picks_the_timestamptz_overload() {
+        let plan = lower_typed("SELECT date_part('hour', tz) FROM d").unwrap();
+        assert_eq!(
+            first_func_oid(&plan),
+            Some(1171),
+            "date_part(text, timestamptz) — the one case where the old \
+             `unknown` answer happened to be right, and must stay right"
+        );
+    }
+
+    /// Both arguments are self-typed (a column and an explicit cast), so
+    /// `func::resolve`'s all-exact pass hits and the overload is the one
+    /// PostgreSQL picks. Contrast `date_part_on_a_date_column_now_offers_the_date_type`,
+    /// where one argument is an `unknown` literal.
+    #[test]
+    fn age_of_two_timestamps_picks_the_timestamp_overload() {
+        let plan = lower_typed("SELECT age(ts, '2024-01-01'::timestamp) FROM d").unwrap();
+        assert_eq!(
+            first_func_oid(&plan),
+            Some(2058),
+            "age(timestamp, timestamp); 1199 is the timestamptz pair, which \
+             depends on a session timezone Basin's physical timestamptz has no \
+             room for"
+        );
+    }
+
+    #[test]
+    fn extract_on_a_timestamptz_column_still_picks_the_timestamptz_overload() {
+        let plan = lower_typed("SELECT extract(EPOCH FROM tz) FROM d").unwrap();
+        assert_eq!(first_func_oid(&plan), Some(6203));
+    }
+
+    /// `id ^ 2` — the operator side of the same widening. `^` has exactly one
+    /// `pg_operator` row (`float8 ^ float8`), so the oid cannot move; what
+    /// moves is what the resolver was *told*, and an operand type is not
+    /// separately observable in the plan. Asserted through the function seam
+    /// instead, on the same column: `abs(id)` sees `int8`.
+    #[test]
+    fn a_bigint_column_reaches_resolution_as_int8_not_unknown() {
+        assert_eq!(
+            arg_types_seen("SELECT abs(id) FROM d", "abs"),
+            vec![PgType::INT8]
+        );
+    }
+
+    /// The regression an earlier attempt at this widening measured and
+    /// reverted on: `array_agg`/`lag` were monomorphized at `int4`/`text`
+    /// only, so a `bigint` column resolved *only* while it arrived as
+    /// `unknown` and coerced into the `int4` row. `basin_pgtype::func` now
+    /// carries `int8`/`float8`/`numeric` rows for both — this is the test
+    /// that says so from the planner's side.
+    #[test]
+    fn a_bigint_column_still_resolves_the_polymorphic_aggregates_and_windows() {
+        for sql in [
+            "SELECT array_agg(id) FROM d",
+            "SELECT lag(id) OVER (ORDER BY id) FROM d",
+            "SELECT lead(id) OVER (ORDER BY id) FROM d",
+            "SELECT first_value(id) OVER (ORDER BY id) FROM d",
+            "SELECT last_value(id) OVER (ORDER BY id) FROM d",
+            "SELECT nth_value(id, 2) OVER (ORDER BY id) FROM d",
+        ] {
+            assert!(
+                lower_typed(sql).is_ok(),
+                "{sql} must still resolve now that `id` arrives as int8"
+            );
+        }
+    }
+
+    /// A correlated reference's `index` belongs to the *enclosing* scope, so
+    /// reading it against the inner one would report some unrelated column's
+    /// type. `ScopeResolver::column_type` hands it back to `outer` instead —
+    /// and `t.b` really is `text`, not the `date` sitting at index 1 of `d`.
+    #[test]
+    fn a_correlated_column_gets_the_enclosing_scopes_type_not_the_inner_one() {
+        let plan = lower_typed("SELECT (SELECT upper(t.b) FROM d) FROM t").expect("should lower");
+        assert_eq!(
+            first_func_oid(&plan),
+            Some(871),
+            "upper(text) — resolving `t.b` against `d`'s index 1 would have \
+             typed it `date` and found no `upper` at all"
+        );
     }
 }

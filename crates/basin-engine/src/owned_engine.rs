@@ -1598,14 +1598,37 @@ fn collect_from_item(item: &Node, cte_scope: &HashSet<String>, out: &mut Vec<Vec
 /// Best-effort `arrow_schema::DataType -> basin_pgtype::PgType`, the inverse
 /// of `basin_pgtype::physical`, which no direction of the workspace defines
 /// (`basin_pgtype::physical` only goes `PgType -> DataType`; the catalog
-/// stores only the Arrow-side schema). This is safe to be lossy: a plan's
-/// per-column `PgType` is not consumed by `basin-plan`'s expression lowering
-/// for a bare `Expr::Column` today — `lower::expr::best_effort_type` only
-/// trusts a literal, cast, or parameter's own type (see that function's
-/// docs: "Column types are not available in this increment") — so an
-/// imprecise mapping here narrows nothing a real query depends on yet; it
-/// only feeds `*`-expansion column naming and `EXPLAIN`-shaped tooling.
+/// stores only the Arrow-side schema).
+///
+/// **This is now load-bearing.** It used to be safe to be lossy here, because
+/// a plan's per-column `PgType` reached nothing but `*`-expansion naming:
+/// `lower::expr::best_effort_type` trusted only a literal, cast or
+/// parameter's own type and reported `unknown` for every column. Since
+/// `basin_plan::lower::expr::ColumnResolver::column_type` exists, what this
+/// function returns is what `pg_proc` and `pg_operator` overload resolution
+/// see for a bare column — so a wrong answer here is a wrong overload, and
+/// the arms below must stay faithful rather than merely plausible.
+///
+/// Being *incomplete* is still safe, and deliberately so: a `DataType` with
+/// no arm falls to `PgType::UNKNOWN`, which is exactly the input resolution
+/// received for every column before this seam opened. Arrays, `time`,
+/// `interval` and the composite types are in that group today. Adding an arm
+/// is a coverage decision to be measured, not a formality.
 fn pgtype_of(field: &Field) -> PgType {
+    // A `BASIN_TYPE` marker means the Arrow type is a CARRIER, not the
+    // logical type: `jsonb` and `citext` ride on `Utf8`, `inet`/`cidr`/
+    // `macaddr`/`money`/`xml`/ranges likewise, `uuid` on
+    // `FixedSizeBinary(16)` (see `crate::types` and `crate::ddl`'s
+    // `is_jsonb_sql` / `is_uuid_sql` / `basin_type_marker_for`). Reading the
+    // carrier would type a `jsonb` column `text` and hand overload
+    // resolution a confident wrong answer — precisely the failure this whole
+    // seam exists to remove. `unknown` is the honest answer until
+    // `basin-pgtype` carries those oids and this function can map the marker
+    // itself, and it is also exactly what resolution saw for every column
+    // before the seam opened, so no query loses ground to it.
+    if field.metadata().contains_key(crate::types::BASIN_TYPE_KEY) {
+        return PgType::UNKNOWN;
+    }
     match field.data_type() {
         DataType::Boolean => PgType::BOOL,
         DataType::Int16 | DataType::Int8 | DataType::UInt8 => PgType::INT2,
