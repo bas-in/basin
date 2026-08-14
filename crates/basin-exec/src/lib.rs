@@ -35,6 +35,10 @@ pub mod correlated;
 pub mod cte;
 pub mod dml;
 pub mod eval;
+/// Function hosting: the oid -> implementation registry that replaces
+/// DataFusion's UDF registry. See
+/// `docs/migration/df-removal/27-function-hosting-abi.md`.
+pub mod funcs;
 pub mod join;
 pub mod lateral;
 pub mod limit;

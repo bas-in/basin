@@ -2708,6 +2708,31 @@ fn eval_like(
 /// bounds panic.
 fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
     session: &EvalSession) -> Result<ArrayRef, ExecError> {
+    // Registry first; the `match` below is the fallback. See
+    // `docs/migration/df-removal/27-function-hosting-abi.md` and
+    // `crate::funcs`.
+    //
+    // This ordering is what makes the function tranche parallelisable at all:
+    // moving a function off the `match` is write the impl, register it, delete
+    // its arm — three edits that need no coordination with whoever is moving a
+    // different oid, and every intermediate state runs. While the registry is
+    // empty this branch is never taken and behaviour is bit-identical to
+    // before it existed.
+    //
+    // Arguments are evaluated HERE, once, rather than inside each
+    // implementation. The `&[Expr]` the arms below receive is generality
+    // nothing uses — no PostgreSQL *function* is lazy; `CASE`, `COALESCE` and
+    // short-circuiting `AND`/`OR` are `Expr` variants, not `pg_proc` rows —
+    // and holding unevaluated arguments lets an implementation evaluate one
+    // twice, which is how `now()` can change inside a single statement (#151).
+    if let Some(hosted) = crate::funcs::builtins().scalar(func.0) {
+        let evaluated = args
+            .iter()
+            .map(|e| eval_with(e, batch, session))
+            .collect::<Result<Vec<_>, ExecError>>()?;
+        return hosted.invoke(&evaluated, session);
+    }
+
     let oid = func.0.get();
     let a = |i: usize| -> Result<ArrayRef, ExecError> {
         let e = args.get(i).ok_or_else(|| {
