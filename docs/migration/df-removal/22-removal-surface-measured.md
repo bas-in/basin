@@ -558,3 +558,35 @@ applied.
 4. **Latent** — `union_scan_collapse` is unsound for `UNION ALL`: its guard only
    catches syntactically identical predicates. Overlapping-but-different ones
    give PG 6 rows against 3 collapsed.
+
+---
+
+## `vortex-datafusion` is not a second reader — Basin already has its own
+
+Measured, because it was flagged as possibly keeping DataFusion linked regardless
+of the other four declarations:
+
+    basin-storage/Cargo.toml   vortex-array, vortex-file, vortex-btrblocks,
+                               vortex-session          <- CORE vortex, no DataFusion
+    basin-engine/Cargo.toml    vortex-datafusion = "0.71"
+
+`basin-storage` reads Vortex **directly** — `lib.rs`, `metadata_cache.rs`,
+`page_cache.rs`, `disk_cache.rs`, `vortex_footer_cache.rs` — against the core
+crates only. `vortex_datafusion` is imported by exactly **two** files, both in
+`basin-engine`: `session.rs` (registration) and `vortex_listing_format.rs` (the
+`FileFormat` / `TableProvider` impl).
+
+So it is **purely the adapter that lets DataFusion read Vortex**, not a Vortex
+reader Basin depends on. The owned engine already bypasses it: its scan path is
+`storage_source.rs` → `basin_storage::read_paths_with_schema`, which is the path
+`553f4f8b` rewired when it fixed the owned scan reading superseded files.
+
+**Consequence for the endgame:** `vortex-datafusion` deletes *with* the
+DataFusion read path, not before it and not as separate work. It pulls its own
+`datafusion-*` crates only because the thing it adapts *to* is DataFusion. There
+is no "build our own Vortex reader" task — that task was already done, and it is
+what the owned engine uses today.
+
+The scan-track work that remains is the DataFusion-side table providers (122
+errors) and `ExecutionPlan` nodes (89), which exist to serve the *incumbent*
+path. Those are removals, not ports.
