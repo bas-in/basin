@@ -2751,7 +2751,6 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         // Deleting the arm is step 3 of a port and is not optional: the
         // registry is consulted first, so a left-behind arm is unreachable
         // code that still reads as live.
-        OID_UPPER => text_unary(&a(0)?, str::to_uppercase),
         OID_LENGTH_TEXT | OID_CHAR_LENGTH_TEXT | OID_CHARACTER_LENGTH_TEXT => {
             text_char_length(&a(0)?)
         }
@@ -2800,59 +2799,14 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
             eval_trim_2(&s, &set, TrimSide::Right)
         }
 
-        OID_REPLACE => {
-            let s = a(0)?;
-            let from = a(1)?;
-            let to = a(2)?;
-            eval_replace(&s, &from, &to)
-        }
         // Same implementation, same argument order — see [`OID_POSITION`].
-        OID_STRPOS | OID_POSITION => {
-            let s = a(0)?;
-            let needle = a(1)?;
-            eval_strpos(&s, &needle)
-        }
 
-        OID_INITCAP => text_unary(&a(0)?, pg_initcap),
 
         // The two-argument forms are not separate algorithms: on a live
         // PostgreSQL 18 `lpad(text,int)` is a SQL-language function whose body
         // is `lpad($1, $2, ' ')` (its errors even arrive with `CONTEXT: SQL
         // function "lpad" statement 1`), so `None` here means "the default
         // fill", not "a different code path".
-        OID_LPAD_2 => {
-            let s = a(0)?;
-            let len = a(1)?;
-            eval_pad(&s, &len, None, PadSide::Left)
-        }
-        OID_LPAD_3 => {
-            let s = a(0)?;
-            let len = a(1)?;
-            let fill = a(2)?;
-            eval_pad(&s, &len, Some(&fill), PadSide::Left)
-        }
-        OID_RPAD_2 => {
-            let s = a(0)?;
-            let len = a(1)?;
-            eval_pad(&s, &len, None, PadSide::Right)
-        }
-        OID_RPAD_3 => {
-            let s = a(0)?;
-            let len = a(1)?;
-            let fill = a(2)?;
-            eval_pad(&s, &len, Some(&fill), PadSide::Right)
-        }
-        OID_REPEAT => {
-            let s = a(0)?;
-            let count = a(1)?;
-            eval_repeat(&s, &count)
-        }
-        OID_SPLIT_PART => {
-            let s = a(0)?;
-            let delim = a(1)?;
-            let field = a(2)?;
-            eval_split_part(&s, &delim, &field)
-        }
 
 
 

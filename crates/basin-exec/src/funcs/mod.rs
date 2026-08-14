@@ -181,6 +181,17 @@ pub fn builtins() -> &'static FuncRegistry {
         // Phase 1 slices append their registrations here. Append-only, so two
         // agents porting different oid ranges conflict only on adjacent lines.
         r.register_scalar(Box::new(str_fns::Lower));
+        r.register_scalar(Box::new(str_fns::Upper));
+        r.register_scalar(Box::new(str_fns::Initcap));
+        r.register_scalar(Box::new(str_fns::Lpad2));
+        r.register_scalar(Box::new(str_fns::Lpad3));
+        r.register_scalar(Box::new(str_fns::Rpad2));
+        r.register_scalar(Box::new(str_fns::Rpad3));
+        r.register_scalar(Box::new(str_fns::Repeat));
+        r.register_scalar(Box::new(str_fns::SplitPart));
+        r.register_scalar(Box::new(str_fns::Replace));
+        r.register_scalar(Box::new(str_fns::Strpos));
+        r.register_scalar(Box::new(str_fns::Position));
         // num_fns — ported by the wave-15 numeric slice.
         r.register_scalar(Box::new(num_fns::AbsInt2));
         r.register_scalar(Box::new(num_fns::AbsInt4));
@@ -237,8 +248,8 @@ mod tests {
     fn the_registry_reports_what_is_actually_hosted() {
         assert_eq!(
             builtins().len(),
-            24,
-            "24 hosted: lower, the 12 numeric and the 11 date/time ports. Read \
+            35,
+            "35 hosted: lower, 12 numeric, 11 date/time, 11 more string. Read \
              from the registry, never tracked by hand"
         );
     }
