@@ -116,6 +116,17 @@ pub const PG_NODE_TREE: Oid = Oid(194);
 /// type (`typarray` is 0).
 pub const ANYARRAY: Oid = Oid(2277);
 
+/// `"any"` — the pseudo-type standing for "one argument of any type at all,
+/// passed through untouched". The declared parameter type of `concat`,
+/// `concat_ws`, `format` and `count(x)`.
+///
+/// Distinct from `anyelement` (2283, which this crate does not carry): `"any"`
+/// applies no coercion and imposes no consistency between argument positions,
+/// which is exactly why [`crate::func::resolve`] treats it as an automatic
+/// exact match rather than as a coercion target. Its `pg_type.typcategory` is
+/// `P`, same as every other pseudo-type — see [`crate::category`].
+pub const ANY: Oid = Oid(2276);
+
 /// `"char"` — the internal single-byte enum-like type. Already represented
 /// as [`CHAR`] (OID 18); see its doc comment. Re-noted here because it is
 /// also the declared type of `pg_cast.castcontext`, `pg_constraint.contype`,

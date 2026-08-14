@@ -31,6 +31,7 @@
 //! without touching the running query path.
 
 pub mod cast;
+pub mod category;
 pub mod func;
 pub mod oid;
 pub mod operator;

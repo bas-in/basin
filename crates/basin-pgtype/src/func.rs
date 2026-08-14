@@ -212,6 +212,7 @@
 
 use crate::{
     cast::{cast_kind, CastKind},
+    category::{category, category_and_preferred, is_preferred_type, TypeCategory},
     oid, Oid,
 };
 
@@ -1026,6 +1027,19 @@ pub static FUNCS: &[FuncSig] = &[
     ),
     // `avg(int2)`/`avg(int4)` are deliberately absent — see the module docs.
     FuncSig::new(2100, "avg", &[oid::INT8], oid::NUMERIC, FuncKind::Aggregate),
+    // `avg(int4)` and `avg(int2)` were MISSING, and their absence looked like
+    // a resolution bug rather than a catalog gap. PostgreSQL has a row for
+    // each and picks it EXACTLY — `EXPLAIN VERBOSE SELECT avg(x) FROM (SELECT
+    // 1::int4 AS x) s` shows `avg(1)` with no cast — so nothing here should
+    // ever widen an int4 argument. Without these rows the resolver had to
+    // widen, and which way it widened changed with the resolution stages
+    // (int8 before, float8 after), producing two different wrong answers that
+    // both looked like the stages misbehaving.
+    //
+    // Return types confirmed against pg_proc on 18.2: 2101 integer->numeric,
+    // 2102 smallint->numeric, matching 2100 bigint->numeric.
+    FuncSig::new(2101, "avg", &[oid::INT4], oid::NUMERIC, FuncKind::Aggregate),
+    FuncSig::new(2102, "avg", &[oid::INT2], oid::NUMERIC, FuncKind::Aggregate),
     FuncSig::new(
         2104,
         "avg",
@@ -2556,14 +2570,46 @@ fn exact_match_count(declared: &[Oid], given: &[Oid]) -> usize {
         .count()
 }
 
-/// Resolve a function call to the [`FuncSig`] Postgres would pick.
+/// What [`resolve_detailed`] concluded about a call.
 ///
-/// Three passes, the first two shared with [`crate::operator::resolve`]:
+/// Three outcomes, because Postgres has three: a function, no function, and
+/// *several* functions with no way to choose — which is an error there
+/// (SQLSTATE 42725) and must be an error here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// Exactly one overload survives. Note "one" means one `pg_proc.oid`, not
+    /// one [`FUNCS`] row: the monomorphized polymorphic rows (`array_agg`,
+    /// `unnest`, the `anyelement` window functions — see the module docs)
+    /// legitimately leave several rows standing that are all the same
+    /// function, and that is a resolution, not a tie.
+    Unique(&'static FuncSig),
+    /// Two or more distinct `pg_proc` oids survive every stage. Postgres
+    /// raises:
+    ///
+    /// ```text
+    /// ERROR:  function date_part(unknown, unknown) is not unique
+    /// HINT:  Could not choose a best candidate function. You might need to
+    ///        add explicit type casts.
+    /// ```
+    ///
+    /// The surviving candidates are carried so a caller can print the same
+    /// hint. Verified live: `SELECT date_part('month','2020-01-01')` is that
+    /// error on PostgreSQL 18.2.
+    Ambiguous(Vec<&'static FuncSig>),
+    /// No candidate of that name accepts this argument list, even with
+    /// implicit coercion. Postgres's "function ... does not exist" (42883).
+    NoSuchFunction,
+}
+
+/// Resolve a function call the way Postgres's `ParseFuncOrColumn` does, and
+/// report *why* when it cannot.
+///
+/// # The passes, in Postgres's order
 ///
 /// 1. **Exact.** A candidate every argument matches without coercion (a
 ///    literal type match, or Postgres's `"any"` pseudo-type — see
-///    [`arg_matches_exact`]). Postgres's own fast path, before
-///    `func_select_candidate` is ever reached.
+///    [`arg_matches_exact`]). Postgres's own fast path in `func_get_detail`,
+///    taken before `func_select_candidate` is ever reached.
 /// 2. **Implicit candidates.** Every candidate reachable by *implicit*
 ///    coercion of the given argument types ([`crate::cast::cast_kind`]
 ///    `== Some(CastKind::Implicit)`) — Postgres's `func_match_argtypes`. A
@@ -2572,88 +2618,295 @@ fn exact_match_count(declared: &[Oid], given: &[Oid]) -> usize {
 ///    `lower_text_resolves_but_lower_int4_does_not` below, which pins that
 ///    `int4 -> text` is assignment-only (Postgres's string I/O fallback), not
 ///    implicit.
-/// 3. **Most exact matches on the known arguments** ([`exact_match_count`]),
-///    keeping only the candidates that tie for the best score. This is
-///    **stage 1 of four** in Postgres's `func_select_candidate`.
 ///
-/// # Which stages of `func_select_candidate` are *not* implemented
+/// Then, if more than one oid is still standing, the four stages of
+/// `func_select_candidate` (`src/backend/parser/parse_func.c`), each of which
+/// returns immediately if it gets down to one:
 ///
-/// Postgres runs three further eliminations when stage 1 leaves more than one
-/// candidate. None of them is implemented here:
+/// 3. **Stage 1 — most exact matches on the known arguments**
+///    ([`exact_match_count`]). `unknown` arguments abstain.
+/// 4. **Stage 2 — exact *or preferred-in-the-input's-own-category*.**
+///    Re-scores the known arguments, counting a position when the declared
+///    type is either the input's type or a preferred type *of that input's
+///    category* ([`crate::category::is_preferred_type`]). Cross-category
+///    conversions to a preferred type score nothing — a 7.4-era restriction,
+///    without which `text` would beat `int8` for an `int4` input everywhere.
+/// 5. **Stage 3 — resolving the `unknown` slots by category.** For each
+///    `unknown` position, look at what category the candidates declare there.
+///    `STRING` wins any conflict outright (untyped literals look like
+///    strings); otherwise every candidate must agree or the stage is
+///    abandoned. Then drop candidates declaring the wrong category, and — if
+///    *any* survivor declares a preferred type of that category — drop the
+///    ones that do not. If that rejects everything, keep them all.
+/// 6. **Stage 4 — the "last gasp".** If some arguments are known and all the
+///    known ones are the same type, assume the `unknown` ones are that type
+///    too and take the match if that is now unique.
 ///
-///   * **Stage 2 — preferred type in the *same* category.** Re-scores the
-///     known arguments counting a match when the declared type is either
-///     exact *or* the preferred type of the input's own type category
-///     (`IsPreferredType`; cross-category conversions to a preferred type
-///     score nothing).
-///   * **Stage 3 — resolving the `unknown` slots by category.** For each
-///     `unknown` argument position, take the category of the candidates'
-///     declared types there — `STRING` always wins a conflict, since untyped
-///     literals look like strings; otherwise all candidates must agree or the
-///     stage fails. Then drop the candidates that take the wrong category,
-///     and, if any candidate takes the category's *preferred* type, drop the
-///     ones that do not. This is why `abs('5')` is `double precision` live
-///     and not ambiguous: `float8` is the numeric category's preferred type.
-///   * **Stage 4 — the "last gasp".** If some arguments are known and all the
-///     known ones share one type, assume the `unknown` ones are that type too
-///     and take the match if that is now unique.
+/// **The order is not intuitive and is load-bearing.** Stage 3 runs *after*
+/// stage 2, so a known argument's preference is settled before an unknown
+/// one's category is even looked at; and stage 3's string bias is what makes
+/// `substring('x', 'y')` the two-`text` regex overload (2073) rather than
+/// `substring(text, int4)` (937) — verified live.
 ///
-/// Implementing 2 and 3 needs `pg_type.typcategory` / `typispreferred`, which
-/// this crate does not tabulate today. Where they would run, this function
-/// instead keeps the **first row in [`FUNCS`]** among the stage-1 survivors —
-/// the historical behaviour, and the reason table order is load-bearing (the
-/// module docs' `avg` note, and [`crate::operator`]'s `^` note, both depend
-/// on it). Measured over every argument vector drawable from the table's own
-/// declared types plus `unknown` (1,202 vectors): of the 78 `FUNCS` names
-/// carrying more than one signature, 47 have at least one vector where stage
-/// 1 still leaves two or more oids tied — almost always the all-`unknown`
-/// call. That set is the size of the remaining gap.
+/// # What "one candidate" means here
 ///
-/// # Ambiguity
+/// Postgres tests `ncandidates == 1`. This function tests *one distinct
+/// `pg_proc.oid`*, because the monomorphized polymorphic rows described in
+/// the module docs put several [`FUNCS`] rows behind one oid. Anything else
+/// would report `array_agg(unknown)` as a five-way tie between five copies of
+/// oid 2335.
 ///
-/// When every stage fails, Postgres's `func_select_candidate` returns NULL
-/// and `ParseFuncOrColumn` raises SQLSTATE **42725**:
+/// # Where this still differs from a real server, and why
 ///
-/// ```text
-/// ERROR:  function date_part(unknown, unknown) is not unique
-/// HINT:  Could not choose a best candidate function. You might need to add
-///        explicit type casts.
-/// ```
+/// Every difference below is a *coverage* difference — a `pg_proc` row this
+/// crate does not carry — not an algorithm difference, and each one was found
+/// by running the call against PostgreSQL 18.2 (see
+/// `tests/overload_resolution.rs`, which pins all of them):
 ///
-/// (verified live: `SELECT date_part('month','2020-01-01')` is that error).
-/// This function cannot report it, because a tie *here* is not evidence of a
-/// tie *there* — stages 2 to 4 are missing, and they resolve most ties rather
-/// than failing. Reporting ambiguity at the end of stage 1 would refuse calls
-/// the real server answers, so a residual tie takes the first-in-table row
-/// instead, and a genuinely ambiguous call gets an answer where Postgres
-/// gets an error. That is the one direction in which this is still wrong,
-/// and closing it means implementing stages 2 to 4, not tightening this one.
-pub fn resolve(name: &str, args: &[Oid]) -> Option<&'static FuncSig> {
+///   * `trunc('x')` is ambiguous live, because Postgres also has
+///     `trunc(macaddr)` and `trunc(macaddr8)` in category `U`, which conflicts
+///     with `float8`/`numeric`'s `N` and fails stage 3. This table has only
+///     the two numeric rows (the module docs say so), so stage 3 succeeds and
+///     picks `float8`.
+///   * `array_agg('x')` and `unnest('x')` are ambiguous live, because
+///     Postgres has *two* rows each (`anyarray` and `anynonarray`) and this
+///     table monomorphizes only the one.
+///   * A polymorphic call whose only argument is `unknown` — `cardinality('x')`
+///     — is an outright error live ("could not determine polymorphic type"),
+///     because Postgres cannot instantiate `anyarray` from `unknown`. The
+///     monomorphized rows here answer it.
+pub fn resolve_detailed(name: &str, args: &[Oid]) -> Resolution {
+    // Postgres's fast path: an exact match on every argument wins outright,
+    // and `func_select_candidate` is never entered.
     if let Some(f) = FUNCS
         .iter()
         .find(|f| f.name == name && args_match(f.args, args, arg_matches_exact))
     {
-        return Some(f);
+        return Resolution::Unique(f);
     }
 
-    let implicitly_matches = |f: &&FuncSig| {
-        f.name == name
-            && args_match(f.args, args, |declared, given| {
-                arg_matches_exact(declared, given)
-                    || cast_kind(given, declared) == Some(CastKind::Implicit)
+    // `func_match_argtypes`: everything implicitly reachable.
+    let mut candidates: Vec<&'static FuncSig> = FUNCS
+        .iter()
+        .filter(|f| {
+            f.name == name
+                && args_match(f.args, args, |declared, given| {
+                    arg_matches_exact(declared, given)
+                        || cast_kind(given, declared) == Some(CastKind::Implicit)
+                })
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Resolution::NoSuchFunction;
+    }
+    if let Some(f) = settled(&candidates) {
+        return Resolution::Unique(f);
+    }
+
+    // ─── Stage 1: most exact matches on the known arguments ─────────────────
+    keep_highest_scoring(&mut candidates, |f| exact_match_count(f.args, args));
+    if let Some(f) = settled(&candidates) {
+        return Resolution::Unique(f);
+    }
+
+    // ─── Stage 2: exact, or preferred within the input's own category ───────
+    keep_highest_scoring(&mut candidates, |f| preferred_match_count(f.args, args));
+    if let Some(f) = settled(&candidates) {
+        return Resolution::Unique(f);
+    }
+
+    // Postgres: "If there are no unknown inputs, we have no more heuristics
+    // that apply, and must fail." Stages 3 and 4 both exist only to assign a
+    // type to an `unknown`, so with nothing unknown there is nothing left to
+    // try — the call really is ambiguous.
+    let nunknowns = args.iter().filter(|&&a| a == oid::UNKNOWN).count();
+    if nunknowns == 0 {
+        return Resolution::Ambiguous(candidates);
+    }
+
+    // ─── Stage 3: give each `unknown` slot a category, then strip ───────────
+    if let Some(slots) = unknown_slot_categories(&candidates, args) {
+        let kept: Vec<&'static FuncSig> = candidates
+            .iter()
+            .copied()
+            .filter(|f| {
+                slots.iter().enumerate().all(|(i, slot)| match slot {
+                    None => true, // a known argument; stage 3 ignores it
+                    Some((cat, has_preferred)) => {
+                        let (declared_cat, declared_preferred) =
+                            category_and_preferred(f.args[i]);
+                        declared_cat == *cat && (!has_preferred || declared_preferred)
+                    }
+                })
             })
+            .collect();
+        // "However, if this rule turns out to reject all candidates, keep
+        // them all instead."
+        if !kept.is_empty() {
+            candidates = kept;
+        }
+        if let Some(f) = settled(&candidates) {
+            return Resolution::Unique(f);
+        }
+    }
+
+    // ─── Stage 4: the last gasp ─────────────────────────────────────────────
+    if nunknowns < args.len() {
+        if let Some(known) = sole_known_type(args) {
+            let all_known = vec![known; args.len()];
+            let survivors: Vec<&'static FuncSig> = candidates
+                .iter()
+                .copied()
+                .filter(|f| {
+                    args_match(f.args, &all_known, |declared, given| {
+                        arg_matches_exact(declared, given)
+                            || cast_kind(given, declared) == Some(CastKind::Implicit)
+                    })
+                })
+                .collect();
+            if let Some(f) = settled(&survivors) {
+                return Resolution::Unique(f);
+            }
+        }
+    }
+
+    Resolution::Ambiguous(candidates)
+}
+
+/// Resolve a function call to the [`FuncSig`] Postgres would pick, or `None`
+/// if Postgres would pick none.
+///
+/// The thin form of [`resolve_detailed`], for callers that cannot tell the
+/// user *why*. **An ambiguous call returns `None` here, not an arbitrary
+/// candidate**: picking one would be a silently wrong answer, and a caller
+/// that reports "no such function" is at least reporting an error where
+/// Postgres reports an error. A caller that can distinguish the two should
+/// use [`resolve_detailed`] and raise 42725 for
+/// [`Resolution::Ambiguous`].
+pub fn resolve(name: &str, args: &[Oid]) -> Option<&'static FuncSig> {
+    match resolve_detailed(name, args) {
+        Resolution::Unique(f) => Some(f),
+        Resolution::Ambiguous(_) | Resolution::NoSuchFunction => None,
+    }
+}
+
+/// The single function `candidates` names, if they all name the same one.
+///
+/// Postgres's `ncandidates == 1` test, adjusted for this table's
+/// monomorphized polymorphic rows — see [`resolve_detailed`].
+fn settled(candidates: &[&'static FuncSig]) -> Option<&'static FuncSig> {
+    let first = candidates.first()?;
+    candidates
+        .iter()
+        .all(|f| f.oid == first.oid)
+        .then_some(*first)
+}
+
+/// Keep only the candidates tying for the highest `score`, in table order.
+///
+/// Postgres's elimination loop, which keeps *every* candidate when they all
+/// score zero rather than keeping none — hence `max`, not "score > 0".
+fn keep_highest_scoring(
+    candidates: &mut Vec<&'static FuncSig>,
+    score: impl Fn(&FuncSig) -> usize,
+) {
+    let Some(best) = candidates.iter().map(|f| score(f)).max() else {
+        return;
     };
+    candidates.retain(|f| score(f) == best);
+}
 
-    let best = FUNCS
+/// Stage 2's score: how many *known* argument positions the candidate either
+/// matches exactly or accepts with a preferred type of that input's own
+/// category.
+///
+/// ```c
+/// if (input_base_typeids[i] != UNKNOWNOID)
+/// {
+///     if (current_typeids[i] == input_base_typeids[i] ||
+///         IsPreferredType(slot_category[i], current_typeids[i]))
+///         nmatch++;
+/// }
+/// ```
+///
+/// `slot_category[i]` is the category of the *input*, so a candidate scores
+/// only for a preferred type the input could plausibly become — this is the
+/// restriction that keeps `text` (preferred in `S`) from scoring against an
+/// `int4` input.
+fn preferred_match_count(declared: &[Oid], given: &[Oid]) -> usize {
+    declared
         .iter()
-        .filter(implicitly_matches)
-        .map(|f| exact_match_count(f.args, args))
-        .max()?;
+        .zip(given)
+        .filter(|(&d, &g)| {
+            g != oid::UNKNOWN && (d == g || is_preferred_type(category(g), d))
+        })
+        .count()
+}
 
-    FUNCS
-        .iter()
-        .filter(implicitly_matches)
-        .find(|f| exact_match_count(f.args, args) == best)
+/// Stage 3's first half: the category (and whether any candidate declares a
+/// preferred type of it) for each `unknown` argument position.
+///
+/// `None` for the whole call if some position's candidates disagree on
+/// category with no `STRING` among them — Postgres abandons the stage
+/// entirely in that case, it does not resolve the positions it could.
+/// `None` *within* the returned vector marks a position whose input type was
+/// known, which the stage skips.
+#[allow(clippy::type_complexity)]
+fn unknown_slot_categories(
+    candidates: &[&'static FuncSig],
+    args: &[Oid],
+) -> Option<Vec<Option<(TypeCategory, bool)>>> {
+    let mut slots: Vec<Option<(TypeCategory, bool)>> = vec![None; args.len()];
+    for (i, &given) in args.iter().enumerate() {
+        if given != oid::UNKNOWN {
+            continue;
+        }
+        let mut slot: Option<(TypeCategory, bool)> = None;
+        let mut have_conflict = false;
+        for f in candidates {
+            let (cat, preferred) = category_and_preferred(f.args[i]);
+            match slot {
+                None => slot = Some((cat, preferred)),
+                Some((sc, has_preferred)) if cat == sc => {
+                    slot = Some((sc, has_preferred || preferred));
+                }
+                Some(_) if cat == TypeCategory::String => {
+                    // "STRING always wins if available" — and it resets the
+                    // preferred flag rather than OR-ing into the old one,
+                    // because the old one described a different category.
+                    slot = Some((cat, preferred));
+                }
+                Some(_) => have_conflict = true,
+            }
+        }
+        // A conflict is only fatal if STRING did not turn up to settle it.
+        // Note the conflict may have been recorded *before* the STRING
+        // candidate was seen, which is exactly why Postgres keeps looping
+        // instead of failing on the spot.
+        if have_conflict && slot.map(|(c, _)| c) != Some(TypeCategory::String) {
+            return None;
+        }
+        slots[i] = slot;
+    }
+    Some(slots)
+}
+
+/// Stage 4's precondition: the one type every *known* argument has, or `None`
+/// if the known arguments are not all the same type.
+fn sole_known_type(args: &[Oid]) -> Option<Oid> {
+    let mut known = None;
+    for &a in args {
+        if a == oid::UNKNOWN {
+            continue;
+        }
+        match known {
+            None => known = Some(a),
+            Some(k) if k == a => {}
+            Some(_) => return None,
+        }
+    }
+    known
 }
 
 /// Whether `oid` names a builtin aggregate function (`pg_proc.prokind = 'a'`).
@@ -2756,19 +3009,33 @@ mod tests {
         assert_eq!(resolve("lower", &[oid::INT4]), None);
     }
 
-    /// `avg(int2)`/`avg(int4)` are deliberately not tabulated — see the
-    /// module docs. An `int4` argument must still resolve `avg`, by
-    /// implicitly widening to `int8` and landing on the `avg(int8)` row. This
-    /// is lossless here specifically because `avg(int2)`, `avg(int4)` and
-    /// `avg(int8)` all return `numeric` in real Postgres (confirmed live) —
-    /// unlike `sum`, no return-type information is lost by skipping the
-    /// narrower rows.
+    /// `avg(int4)` resolves EXACTLY, with no widening — because PostgreSQL
+    /// has an `avg(integer)` row and picks it directly:
+    ///
+    /// ```text
+    /// EXPLAIN (VERBOSE) SELECT avg(x) FROM (SELECT 1::int4 AS x) s
+    ///   ->  Aggregate  Output: avg(1)          -- no cast on the argument
+    /// ```
+    ///
+    /// This test previously asserted oid 2100 (`avg(int8)`) and documented
+    /// that `avg(int2)`/`avg(int4)` were "deliberately not tabulated", with
+    /// the widening called lossless and "confirmed live". The catalog rows
+    /// were simply MISSING: pg_proc has 2101 integer->numeric and 2102
+    /// smallint->numeric alongside 2100 bigint->numeric. With the rows absent
+    /// the resolver had to widen, and which way it widened moved with the
+    /// resolution stages — int8 before them, float8 after — so a catalog gap
+    /// presented as a resolution bug twice over.
     #[test]
-    fn int4_arg_resolves_bigint_signature_via_implicit_widening() {
-        let avg = resolve("avg", &[oid::INT4]).expect("avg(int4) must resolve by widening");
-        assert_eq!(avg.oid, Oid(2100), "should land on the avg(int8) row");
-        assert_eq!(avg.args, &[oid::INT8]);
+    fn int4_arg_resolves_its_own_row_without_widening() {
+        let avg = resolve("avg", &[oid::INT4]).expect("avg(int4) must resolve");
+        assert_eq!(avg.oid, Oid(2101), "PostgreSQL picks avg(integer) exactly");
+        assert_eq!(avg.args, &[oid::INT4], "no widening to int8");
         assert_eq!(avg.ret, oid::NUMERIC);
+
+        let avg2 = resolve("avg", &[oid::INT2]).expect("avg(int2) must resolve");
+        assert_eq!(avg2.oid, Oid(2102), "PostgreSQL picks avg(smallint) exactly");
+        assert_eq!(avg2.args, &[oid::INT2]);
+        assert_eq!(avg2.ret, oid::NUMERIC);
     }
 
     /// `generate_series` has distinct two-argument and three-argument
@@ -2918,14 +3185,26 @@ mod tests {
     }
 
     /// **PostgreSQL has no `to_char(date, text)`.** A `date` argument reaches
-    /// `to_char(timestamp, text)` (2049) through the implicit `date ->
-    /// timestamp` cast, which is what a live server does too — inventing a
-    /// `(date, text)` row would report an oid no server has.
+    /// `to_char(timestamptz, text)` — oid **1770**, not 2049 — and the live
+    /// server is explicit about which cast it inserts:
+    ///
+    /// ```text
+    /// EXPLAIN (VERBOSE) SELECT to_char(DATE '2020-01-01','YYYY')
+    ///   Output: to_char(('2020-01-01'::date)::timestamp with time zone, 'YYYY'::text)
+    /// ```
+    ///
+    /// This test previously asserted 2049 (`to_char(timestamp, text)`) and
+    /// claimed that was "what a live server does too". Both `date ->
+    /// timestamp` and `date -> timestamptz` are implicit casts, so the choice
+    /// is decided by the resolution stages rather than by the cast graph, and
+    /// PostgreSQL lands on timestamptz. The old assertion was checked by
+    /// noting that the RESULT TYPE is `text` — which both overloads return,
+    /// so it distinguished nothing.
     #[test]
-    fn to_char_of_a_date_resolves_to_the_timestamp_overload() {
+    fn to_char_of_a_date_resolves_to_the_timestamptz_overload() {
         let by_cast = resolve("to_char", &[oid::DATE, oid::TEXT]).expect("to_char(date, text)");
-        assert_eq!(by_cast.oid, Oid(2049));
-        assert_eq!(by_cast.args, &[oid::TIMESTAMP, oid::TEXT]);
+        assert_eq!(by_cast.oid, Oid(1770));
+        assert_eq!(by_cast.args, &[oid::TIMESTAMPTZ, oid::TEXT]);
         assert_eq!(by_cast.ret, oid::TEXT);
 
         assert!(
@@ -2949,15 +3228,56 @@ mod tests {
     /// `timestamp` column (for a `date` column it picks the `timestamptz`
     /// row, a stage-2 divergence recorded on the table itself).
     #[test]
-    fn unknown_arguments_land_on_the_documented_first_row() {
-        let ex = resolve("extract", &[oid::UNKNOWN, oid::UNKNOWN]).unwrap();
-        let part = resolve("date_part", &[oid::UNKNOWN, oid::UNKNOWN]).unwrap();
-        assert_eq!(ex.args, part.args, "extract follows date_part's first row");
-        assert_eq!(ex.oid, Oid(6203));
-        assert_eq!(part.oid, Oid(1171));
+    fn all_unknown_arguments_are_ambiguous_and_decline() {
+        // This test used to assert that each of these landed on a specific
+        // first-in-table row, which made the row ORDER load-bearing. It is
+        // not load-bearing; it was standing in for the missing resolution
+        // stages. PostgreSQL refuses all three:
+        //
+        //   SELECT date_part('day','2020-01-01')
+        //   SELECT to_char('2020-01-01','YYYY')
+        //     ERROR: could not choose a best candidate function
+        //
+        // Declining is the answer that matches. A resolver that picks a row
+        // here is not "more useful than PostgreSQL" — it silently chooses an
+        // overload the user never asked for, which is the misresolution class
+        // this whole tranche exists to remove.
+        for name in ["extract", "date_part"] {
+            assert!(
+                resolve(name, &[oid::UNKNOWN, oid::UNKNOWN]).is_none(),
+                "{name}(unknown, unknown) is ambiguous in PostgreSQL and must decline"
+            );
+        }
 
-        let tc = resolve("to_char", &[oid::UNKNOWN, oid::UNKNOWN]).unwrap();
-        assert_eq!(tc.oid, Oid(2049));
+        // `to_char` is NOT in that list, and the reason is a catalog gap
+        // rather than a resolver one — recorded here instead of hidden by
+        // dropping the case.
+        //
+        // PostgreSQL has EIGHT `to_char` rows: 1768 interval, 1770
+        // timestamptz, 1772 numeric, 1773 int4, 1774 int8, 1775 float4,
+        // 1776 float8, 2049 timestamp. They span three type categories, so an
+        // all-`unknown` call finds no shared category, nothing discriminates,
+        // and the server raises 42725.
+        //
+        // Basin tabulates only the two datetime rows. Both sit in category D,
+        // so stage 3 legitimately discriminates and returns the category's
+        // preferred type. The resolver is behaving CORRECTLY for the catalog
+        // it was given; the catalog is the incomplete part.
+        //
+        // Adding the six missing rows is real work, not a one-liner: it would
+        // also correct `to_char(int4, text)`, which today cannot reach 1773
+        // and must be misresolving onto a datetime row. Tracked rather than
+        // half-done, because a row with no evaluator becomes an orphan-battery
+        // entry, and that queue should grow deliberately.
+        let tc = resolve("to_char", &[oid::UNKNOWN, oid::UNKNOWN])
+            .expect("resolves today, on the two-row catalog");
+        assert_eq!(
+            tc.oid,
+            Oid(1770),
+            "with only the two datetime rows, category D's preferred type wins — \
+             this assertion should FLIP TO is_none() the moment the six missing \
+             to_char rows land"
+        );
     }
 
     /// `age` has both a two-argument and a one-argument (implicitly compared
@@ -3168,18 +3488,33 @@ mod tests {
     }
 
     /// `sign` has no fixed-width-integer overloads in real Postgres (unlike
-    /// `abs`) — an `int4` argument must reach `sign(numeric)` via implicit
-    /// widening, the same pattern `avg` uses (see the module docs).
+    /// `abs`), so an `int4` argument must widen. It widens to **float8**, not
+    /// to numeric, and the live server settles it directly:
+    ///
+    /// ```text
+    /// SELECT pg_typeof(sign(2::int4))  ->  double precision
+    /// ```
+    ///
+    /// This test previously asserted `sign(numeric)` (1706). Both `int4 ->
+    /// numeric` and `int4 -> float8` are implicit casts, so the cast graph
+    /// does not decide it; the preferred type of the numeric category does,
+    /// and that is float8. That is precisely what `func_select_candidate`'s
+    /// later stages exist to compute — before them the resolver picked
+    /// whichever row it saw first and this assertion pinned that accident.
     #[test]
-    fn sign_has_no_integer_overload_and_widens_via_implicit_cast() {
+    fn sign_has_no_integer_overload_and_widens_to_the_preferred_type() {
         let sign_numeric = resolve("sign", &[oid::NUMERIC]).unwrap();
         let sign_float = resolve("sign", &[oid::FLOAT8]).unwrap();
         assert_eq!(sign_numeric.oid, Oid(1706));
         assert_eq!(sign_float.oid, Oid(2310));
         assert_ne!(sign_numeric.oid, sign_float.oid);
 
-        let from_int4 = resolve("sign", &[oid::INT4]).expect("sign(int4) must widen to numeric");
-        assert_eq!(from_int4.oid, Oid(1706), "should land on sign(numeric)");
+        let from_int4 = resolve("sign", &[oid::INT4]).expect("sign(int4) must widen");
+        assert_eq!(
+            from_int4.oid,
+            Oid(2310),
+            "float8 is the preferred type of category N, so sign(int4) lands there"
+        );
     }
 
     /// `trunc` has a `float8` one-argument form plus `numeric` one- and
@@ -3908,16 +4243,27 @@ mod tests {
     /// stage 3, here it is `abs(int2)` (1398) because that row is first.
     /// Pinned so the divergence is visible rather than latent.
     #[test]
-    fn an_all_unknown_call_ties_and_keeps_the_first_row() {
-        assert_eq!(resolve("avg", &[oid::INT4]).unwrap().oid, Oid(2100));
-        assert_eq!(resolve("abs", &[oid::UNKNOWN]).unwrap().oid, Oid(1398));
-        assert_eq!(
-            resolve("date_part", &[oid::UNKNOWN, oid::UNKNOWN])
-                .unwrap()
-                .oid,
-            Oid(1171),
-            "live this call is ERROR 42725 'function date_part(unknown, unknown) \
-             is not unique'; stages 2-4 are unimplemented, so it still gets an answer"
+    fn an_all_unknown_call_now_matches_postgres() {
+        // Was `Oid(2100)` — a widening that only happened because the
+        // `avg(int4)` row was missing from the table. It is there now.
+        assert_eq!(resolve("avg", &[oid::INT4]).unwrap().oid, Oid(2101));
+
+        // Was pinned at `Oid(1398)` (`abs(int2)`, the first row) as a KNOWN
+        // divergence. Live: `SELECT pg_typeof(abs('5'))` is `double
+        // precision`, i.e. `abs(float8)` = 1395, by stage 3's preferred-type
+        // rule. That stage exists now, so the divergence is gone.
+        assert_eq!(resolve("abs", &[oid::UNKNOWN]).unwrap().oid, Oid(1395));
+
+        // Was pinned at `Oid(1171)` with a comment saying live this is
+        // ERROR 42725 "function date_part(unknown, unknown) is not unique"
+        // and that Basin answered anyway because stages 2-4 were missing.
+        // Confirmed still true of the server:
+        //   SELECT date_part('day','2020-01-01')
+        //     ERROR: could not choose a best candidate function
+        // Declining is the correct answer, so `resolve` must now return None.
+        assert!(
+            resolve("date_part", &[oid::UNKNOWN, oid::UNKNOWN]).is_none(),
+            "an ambiguous call must decline, not pick a row — PostgreSQL raises 42725"
         );
     }
 
