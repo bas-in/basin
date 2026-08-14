@@ -2754,7 +2754,6 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         OID_LENGTH_TEXT | OID_CHAR_LENGTH_TEXT | OID_CHARACTER_LENGTH_TEXT => {
             text_char_length(&a(0)?)
         }
-        OID_ARRAY_LENGTH => eval_array_length(&a(0)?, &a(1)?),
 
         OID_SUBSTR_2 | OID_SUBSTRING_2 => eval_substr(&a(0)?, &a(1)?, None),
         OID_SUBSTR_3 | OID_SUBSTRING_3 => {
@@ -2880,28 +2879,6 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
         //
         // The array family. See its header comment for the three NULLs these
         // functions distinguish and the measured table of every rule.
-        OID_ARRAY_APPEND => {
-            eval_array_add_element(&a(0)?, &a(1)?, false, "array_append")
-        }
-        OID_ARRAY_PREPEND => {
-            // Note the argument order: `array_prepend(element, array)`, the
-            // reverse of `array_append`. `basin_pgtype::func::FUNCS` has a
-            // test asserting `array_prepend(array, element)` does NOT resolve,
-            // for exactly this reason.
-            eval_array_add_element(&a(1)?, &a(0)?, true, "array_prepend")
-        }
-        OID_ARRAY_CAT => eval_array_cat(&a(0)?, &a(1)?),
-        OID_ARRAY_REMOVE => eval_array_remove(&a(0)?, &a(1)?),
-        OID_ARRAY_REPLACE => eval_array_replace(&a(0)?, &a(1)?, &a(2)?),
-        OID_ARRAY_POSITION => eval_array_position(&a(0)?, &a(1)?, None),
-        OID_ARRAY_POSITION_START => {
-            let start = a(2)?;
-            eval_array_position(&a(0)?, &a(1)?, Some(&start))
-        }
-        OID_ARRAY_POSITIONS => eval_array_positions(&a(0)?, &a(1)?),
-        OID_ARRAY_NDIMS => eval_array_ndims(&a(0)?),
-        OID_CARDINALITY => eval_cardinality(&a(0)?),
-        OID_ARRAY_REVERSE => eval_array_reverse(&a(0)?),
         OID_ARRAY_SORT_1 => eval_array_sort(&a(0)?, None, None),
         OID_ARRAY_SORT_2 => {
             let desc = a(1)?;

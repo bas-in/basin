@@ -49,6 +49,7 @@ use basin_pgtype::{Oid, PgType};
 use crate::eval::EvalSession;
 use crate::operator::ExecError;
 
+pub mod arr_fns;
 pub mod dt_fns;
 pub mod num_fns;
 pub mod str_fns;
@@ -192,6 +193,19 @@ pub fn builtins() -> &'static FuncRegistry {
         r.register_scalar(Box::new(str_fns::Replace));
         r.register_scalar(Box::new(str_fns::Strpos));
         r.register_scalar(Box::new(str_fns::Position));
+        // arr_fns — wave-16 array slice.
+        r.register_scalar(Box::new(arr_fns::ArrayAppend));
+        r.register_scalar(Box::new(arr_fns::ArrayCat));
+        r.register_scalar(Box::new(arr_fns::ArrayLength));
+        r.register_scalar(Box::new(arr_fns::ArrayNdims));
+        r.register_scalar(Box::new(arr_fns::ArrayPosition));
+        r.register_scalar(Box::new(arr_fns::ArrayPositions));
+        r.register_scalar(Box::new(arr_fns::ArrayPositionStart));
+        r.register_scalar(Box::new(arr_fns::ArrayPrepend));
+        r.register_scalar(Box::new(arr_fns::ArrayRemove));
+        r.register_scalar(Box::new(arr_fns::ArrayReplace));
+        r.register_scalar(Box::new(arr_fns::ArrayReverse));
+        r.register_scalar(Box::new(arr_fns::Cardinality));
         // num_fns — ported by the wave-15 numeric slice.
         r.register_scalar(Box::new(num_fns::AbsInt2));
         r.register_scalar(Box::new(num_fns::AbsInt4));
@@ -248,9 +262,9 @@ mod tests {
     fn the_registry_reports_what_is_actually_hosted() {
         assert_eq!(
             builtins().len(),
-            35,
-            "35 hosted: lower, 12 numeric, 11 date/time, 11 more string. Read \
-             from the registry, never tracked by hand"
+            47,
+            "47 hosted: 12 string, 12 numeric, 11 date/time, 12 array. Read from \
+             the registry, never tracked by hand"
         );
     }
 
