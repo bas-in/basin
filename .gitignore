@@ -30,3 +30,11 @@ basin-test.toml
 # Machine-specific timing output diffed by CI run-over-run, not source.
 /perf_suite.csv
 /perf_suite_*.csv
+
+# Wave log for the DataFusion-removal program (.wave-log.jsonl).
+# Append-only, one JSON object per wave of agents: what was launched, what
+# landed, what died, and the measured oracle readings either side. Exists so
+# future wave estimates come from recorded throughput rather than from memory —
+# every estimate in this program that came from recall has been wrong.
+# Machine- and session-specific, so it is not source.
+/.wave-log.jsonl
