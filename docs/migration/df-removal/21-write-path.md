@@ -455,6 +455,28 @@ world.
 
 ### 2.2 Why `RowSink` as written is the wrong shape
 
+> **Amended — `dml.rs` is two files, and this document uses the name for both.**
+> Every `dml.rs:NNN` citation in this section is
+> `crates/basin-**exec**/src/dml.rs` — the **owned** engine's sink, which serves
+> no writes today. §7.3a's `dml.rs` citations are
+> `crates/basin-**engine**/src/dml.rs`, the shipping path. Reading them as one
+> file cost a wasted agent brief (see commit `33406d6f`): two bugs this section
+> motivates P2 with were reported as defects in the *shipping* write path, and
+> neither reproduces there — the incumbent's fast path declines any assignment
+> touching the primary key, so a PK rewrite always takes cold copy-on-write and
+> re-derives keys from the post-image. There is no "project the key from the new
+> batch" bug to fix in the code that serves writes today.
+>
+> That does **not** weaken the argument for reshaping `RowSink` — it is still the
+> wrong shape for the owned engine to grow a write path on. It does mean this
+> section is describing a design defect in code that has never run, not a live
+> corruption, and P2 should be scoped from that reading.
+>
+> The live corruption `33406d6f` did find is in the shipping path and is
+> unrelated to `RowSink`: `check_update_pk` was set-based where PostgreSQL is
+> row-at-a-time, so `UPDATE t SET id = id + 1` answered `UPDATE 2` where
+> PostgreSQL raises `23505`.
+
 `RowSink` (`dml.rs:126`) is:
 
 ```rust
