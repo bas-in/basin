@@ -499,3 +499,62 @@ The `#[cfg(test)]` split needs brace matching rather than grep; the script is
   the free sweep. It will rise before it falls, exactly as 1,017 rose to 1,041
   when `BasinParquetFormat` was added — every capability that ships against
   DataFusion before the switchover adds to it.
+
+---
+
+## Tier 2 measured: four of five optimizer rules DIE, none port
+
+Measured in a throwaway worktree from `ab73dff2`, `datafusion` removed from both
+manifests. Before: **802 errors / 65 files**, reproducing this document exactly
+(E0433 782, E0425 18, E0432 1, E0531 1). After cutting the four dead rules:
+**786 / 61**. Delta **−16 errors, −4 files**; the optimizer/analyzer category
+goes 42 → 26.
+
+| Rule | Errors | Compensates for | Verdict |
+|---|---|---|---|
+| `is_distinct_rewrite.rs` | 5 | Vortex won't push `IsDistinctFrom`; beating DF's stock `DISTINCT ON` | **dies** |
+| `nullif_rewrite.rs` | 3 | Vortex won't push `NULLIF` | **dies** |
+| `union_scan_collapse.rs` | 3 | duplicate file reads across UNION branches | **dies** |
+| `any_all_rewrite.rs` | 5 | DF's O(n²) `LeftMark NestedLoopJoin` | **dies** (already near-dead) |
+| `citext_analyzer.rs` | 9 | real PG semantics — case-insensitive compare | **BLOCKED** |
+
+The owned path already has each dead rule's substance natively: `Expr::DistinctFrom`
+as a first-class IR node evaluated by `cmp::distinct`; `DISTINCT ON` lowered to
+`Distinct{on:Some(..)}`; `NULLIF` desugared to a searched CASE over the real `=`
+operator; quantified subqueries as a Kleene fold. The probe corroborates —
+Ordering 12/12 including both `DISTINCT ON` shapes, SetOps 11/11, Subqueries
+15/15, Predicates 25/25.
+
+**`citext` is blocked on two things outside the optimizer:** `basin-pgtype` has
+no CITEXT oid, and `owned_engine::pgtype_of` deliberately returns `UNKNOWN` for
+*every* `BASIN_TYPE`-marked field. Until both change the rule has nowhere in
+`basin-plan` to land.
+
+### The timing this changes
+
+These four cannot be cut *now*. They compensate for DataFusion, so removing them
+while DataFusion is still the fallback **degrades the incumbent** — it drops
+Vortex pushdown for `IS DISTINCT FROM` and `NULLIF`, and restores DF's O(n²)
+set-comparison plan. They are removals that happen *with* the DataFusion cut,
+not before it. A ready patch (6 files, src-only) exists but is deliberately not
+applied.
+
+### Four bugs found while reading
+
+1. **The owned engine answers `citext` CASE-SENSITIVELY** — a wrong answer, not
+   a fallback. `pgtype_of` → `UNKNOWN`, `operator::resolve("=", UNKNOWN, UNKNOWN)`
+   returns oid 91 (`boolean = boolean`) by arbitrary first-row match, but
+   `eval_binary` dispatches on operator *name*, so `cmp::eq` runs a
+   case-sensitive byte compare on the real Utf8 arrays. Reachable: the probe
+   serves `WHERE s = 'héllo'`.
+2. **`pg_operators::rewrite_all_subquery` is wrong for `> ALL`, on the SHIPPING
+   path.** It emits a bare `> (SELECT MAX(...))`. Live-verified: `> ALL` over a
+   non-empty subquery returns `{101}` where PG returns no rows; over an **empty**
+   subquery it returns none where PG returns **all** rows. The owned path's
+   Kleene fold gets both right.
+3. **Latent** — the `IS [NOT] DISTINCT FROM` rewrite returns NULL where PG
+   returns FALSE for `(NULL, NULL)`. Invisible in WHERE/JOIN, wrong in a value
+   position, and no test covers that position.
+4. **Latent** — `union_scan_collapse` is unsound for `UNION ALL`: its guard only
+   catches syntactically identical predicates. Overlapping-but-different ones
+   give PG 6 rows against 3 collapsed.
