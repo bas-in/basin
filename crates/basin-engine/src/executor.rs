@@ -75,8 +75,8 @@ use basin_catalog::{DataFileRef, TableMetadata};
 use basin_common::{BasinError, ChangeEvent, ChangeOp, PartitionKey, Result, TableName};
 use basin_storage::{FileFormat, WriteOptions};
 use sqlparser::ast::{
-    AssignmentTarget, ConflictTarget, Expr, ObjectName, OnConflictAction, OnInsert, SetExpr,
-    Statement,
+    AssignmentTarget, ConflictTarget, Expr, ObjectName, OnConflictAction, OnInsert, SelectItem,
+    SetExpr, Statement,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -6447,7 +6447,7 @@ async fn try_insert_preparse(sess: &ProjectSession, raw_sql: &str) -> Option<Res
 
     // Same execution seam the AST path uses after building its batch.
     // RETURNING is impossible here (gate 9 declines any trailing clause).
-    Some(exec_insert_prebuilt(sess, &table, &meta, batch, false).await)
+    Some(exec_insert_prebuilt(sess, &table, &meta, batch, None).await)
 }
 
 /// Count of INSERT executions served end-to-end by the bind-direct
@@ -6586,7 +6586,7 @@ pub(crate) async fn try_insert_bind_direct(
 
     // Same execution seam as the other INSERT fast paths. RETURNING is
     // impossible here (the plan precompute declines it).
-    Some(exec_insert_prebuilt(sess, &plan.table, &meta, batch, false).await)
+    Some(exec_insert_prebuilt(sess, &plan.table, &meta, batch, None).await)
 }
 
 /// Count of point-SELECT executions served end-to-end by the bind-direct
@@ -6954,6 +6954,13 @@ async fn exec_insert(
                 )
                 .await?;
                 if rows_expanded.is_empty() {
+                    // Every proposed row conflicted and did nothing. PG still
+                    // describes the RETURNING result — it just has no rows
+                    // (rows that did nothing produce nothing). Emit the empty
+                    // rowset with the projected schema rather than a bare tag.
+                    if let Some(items) = ins.returning.as_deref() {
+                        return insert_returning(sess, &meta, items, Vec::new()).await;
+                    }
                     return Ok(ExecResult::Empty {
                         tag: "INSERT 0 0".into(),
                     });
@@ -7095,6 +7102,16 @@ async fn exec_insert(
         dispatch_post_commit(&sess.engine, events);
         refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
         write_insert_audit_rows(sess, meta.schema.as_ref(), &preview_batches).await?;
+        // RETURNING on a partitioned target. Rows come back grouped by
+        // partition key rather than in VALUES order, so a multi-row INSERT
+        // spanning >1 partition can reorder its RETURNING rows relative to
+        // PostgreSQL; single-partition statements (the overwhelmingly common
+        // case) are in insertion order. Returning the rows beats the previous
+        // behaviour, which dropped the RETURNING clause and answered with a
+        // bare command tag.
+        if let Some(items) = ins.returning.as_deref() {
+            return insert_returning(sess, &meta, items, preview_batches).await;
+        }
         return Ok(ExecResult::Empty {
             tag: format!("INSERT 0 {row_count}"),
         });
@@ -7108,7 +7125,7 @@ async fn exec_insert(
         Some(b) => b,
         None => batch_from_rows(schema, rows)?,
     };
-    exec_insert_prebuilt(sess, &table, &meta, batch, ins.returning.is_some()).await
+    exec_insert_prebuilt(sess, &table, &meta, batch, ins.returning.as_deref()).await
 }
 
 /// Post-batch-build INSERT execution: the shared seam for every non-partitioned
@@ -7120,19 +7137,49 @@ async fn exec_insert(
 /// * `try_insert_preparse` — the pre-parse fast path, which never runs the
 ///   whole-statement parsers at all. That caller is restricted (by its own
 ///   gates) to plain auto-commit literal inserts: no ON CONFLICT, no
-///   OVERRIDING, no RETURNING (`has_returning == false`), no partitioned
+///   OVERRIDING, no RETURNING (`returning == None`), no partitioned
 ///   target — so every branch in here behaves exactly as it does when reached
 ///   through `exec_insert`.
 ///
 /// `meta` must be the same `TableMetadata` snapshot used to build `batch`
-/// (schema width/order must match), and `has_returning` mirrors
-/// `ins.returning.is_some()` on the AST path.
+/// (schema width/order must match), and `returning` carries the parsed
+/// RETURNING list (`ins.returning.as_deref()` on the AST path), NOT a bare
+/// "did the user write RETURNING" flag: PostgreSQL projects exactly the
+/// RETURNING list, so this path must keep the items to hand them to
+/// `dml_mutate::project_returning` — the same projector UPDATE and DELETE
+/// already use. Passing only a bool is how this path used to return the whole
+/// row for `RETURNING id`.
+/// Project an INSERT's inserted rows through its RETURNING list.
+///
+/// Single seam for every INSERT arm, delegating to the SAME
+/// `dml_mutate::project_returning` that UPDATE and DELETE use — one semantic,
+/// one implementation. `inputs` must carry the post-write row images at the
+/// DECLARED table width (generated columns and DEFAULT/sequence values
+/// materialised, promoted-JSONB shadow columns NOT appended), because
+/// `RETURNING *` expands to whatever columns the input batch carries and
+/// PostgreSQL expands it to the table's columns only.
+async fn insert_returning(
+    sess: &ProjectSession,
+    meta: &TableMetadata,
+    items: &[SelectItem],
+    inputs: Vec<RecordBatch>,
+) -> Result<ExecResult> {
+    crate::dml_mutate::project_returning(
+        &sess.engine.config().catalog,
+        &sess.project,
+        meta.schema.clone(),
+        inputs,
+        items,
+    )
+    .await
+}
+
 async fn exec_insert_prebuilt(
     sess: &ProjectSession,
     table: &TableName,
     meta: &TableMetadata,
     batch: RecordBatch,
-    has_returning: bool,
+    returning: Option<&[SelectItem]>,
 ) -> Result<ExecResult> {
     let batch = crate::generated_cols::materialise_generated_columns(
         &sess.engine.config().catalog,
@@ -7227,6 +7274,18 @@ async fn exec_insert_prebuilt(
     let row_count = batch.num_rows();
     let part = PartitionKey::default_key();
 
+    // RETURNING input, captured BEFORE promoted-JSONB materialisation: the
+    // shadow columns appended below are engine-internal and are not part of
+    // the declared relation, so `RETURNING *` must not surface them (PG
+    // expands `*` to the table's columns). Generated columns, DEFAULTs and
+    // sequence values are already materialised into `batch` at this point,
+    // which is why `RETURNING id` on a serial/DEFAULT column shows the
+    // GENERATED value rather than the literal the user wrote.
+    let returning_input: Vec<RecordBatch> = match returning {
+        Some(_) => vec![batch.clone()],
+        None => Vec::new(),
+    };
+
     // ADR 0027 Phase 4: materialise promoted JSONB shadow columns into the
     // batch before writing to storage.  No-op when no paths are promoted.
     let batch =
@@ -7283,6 +7342,12 @@ async fn exec_insert_prebuilt(
             sess.state.table_meta_cache.invalidate(&table);
             // SELECT-side handles tail-visibility (Option A: force-compact). Skip
             // the DataFusion ListingTable refresh here; reads will trigger it.
+            // RETURNING is projected from the in-memory post-write image, not
+            // re-read from the shard tail — the rows are durably acked and the
+            // image is exactly what was written.
+            if let Some(items) = returning {
+                return insert_returning(sess, meta, items, returning_input).await;
+            }
             return Ok(ExecResult::Empty {
                 tag: format!("INSERT 0 {row_count}"),
             });
@@ -7342,11 +7407,8 @@ async fn exec_insert_prebuilt(
         // Parquet path exists).  Intra-tx SELECTs fall back to a full scan
         // against the HtapUnionTable provider, which is correct (no index
         // means no GIN/B-tree pruning — same semantics as a fresh table).
-        if has_returning {
-            return Ok(ExecResult::Rows {
-                schema: batch.schema(),
-                batches: vec![batch],
-            });
+        if let Some(items) = returning {
+            return insert_returning(sess, meta, items, returning_input).await;
         }
         return Ok(ExecResult::Empty {
             tag: format!("INSERT 0 {row_count}"),
@@ -7472,12 +7534,11 @@ async fn exec_insert_prebuilt(
     // Phase 5.7 B1: maintain secondary indexes on INSERT (auto-commit path).
     maintain_secondary_indexes_on_insert(sess, &table, &meta, &batch, df.path.as_ref()).await;
 
-    // RETURNING: if the caller asked for RETURNING *, return the inserted batch.
-    if has_returning {
-        return Ok(ExecResult::Rows {
-            schema: batch.schema(),
-            batches: vec![batch],
-        });
+    // RETURNING: project the inserted rows through the user's RETURNING list —
+    // the same `project_returning` UPDATE and DELETE run, so column set, order,
+    // aliases and expression naming match them (and PostgreSQL) exactly.
+    if let Some(items) = returning {
+        return insert_returning(sess, meta, items, returning_input).await;
     }
 
     Ok(ExecResult::Empty {
