@@ -80,11 +80,30 @@
 //!    `ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING` on a partition's first row
 //!    (no rows can possibly be 1-or-2-preceding it, so the frame is empty):
 //!    `sum` is NULL, `count` is 0, `avg` is NULL.
-//! 8. **A NULL `ORDER BY` value collapses a RANGE offset frame to just the
-//!    NULL peer group**, independent of the requested offset — verified with
-//!    `y = NULL,NULL,1,2`: `RANGE BETWEEN 1 PRECEDING AND CURRENT ROW` gives
-//!    both NULL rows the same answer (the sum of the NULL peers only, `3`),
-//!    not NULL (arithmetic against NULL) and not the whole partition.
+//! 8. **A NULL `ORDER BY` value is not unorderable to a RANGE frame — it is
+//!    the extreme value in the direction it sorts.** This is the rule that is
+//!    easy to get half-right, so it is stated as the two halves it decomposes
+//!    into. On a row whose order value is NULL:
+//!    - `CURRENT ROW` and **every** value offset resolve to the NULL peer
+//!      block, the offset making no difference — verified with `y =
+//!      NULL,NULL,1,2`, where `RANGE BETWEEN 1 PRECEDING AND CURRENT ROW`
+//!      gives both NULL rows the sum of the NULL peers only (`3`), not NULL
+//!      (arithmetic against NULL) and not the whole partition.
+//!    - `UNBOUNDED PRECEDING`/`UNBOUNDED FOLLOWING` still reach the
+//!      **partition** edge, which the first half must not be allowed to
+//!      swallow. Verified on `n = 7,8,9,NULL`: `sum(n) OVER (ORDER BY n RANGE
+//!      BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` is `24` on the NULL row
+//!      (a full running total — the NULL peer group sorts last, so every row
+//!      precedes it), and so is `RANGE BETWEEN UNBOUNDED PRECEDING AND
+//!      UNBOUNDED FOLLOWING`. Under `ORDER BY n DESC` the NULLs sort *first*
+//!      and the mirror holds: `UNBOUNDED PRECEDING AND CURRENT ROW` is NULL
+//!      on the NULL row while `CURRENT ROW AND UNBOUNDED FOLLOWING` is `24`.
+//!
+//!    Both halves — and the non-NULL rows of a partition that merely contains
+//!    NULLs, where a `NULLS LAST` block counts as `+inf` for a start bound but
+//!    fails every end bound — fall out of one substitution rather than a
+//!    special case: NULL becomes `+INFINITY` under `NULLS LAST`, `-INFINITY`
+//!    under `NULLS FIRST`. See [`WindowAgg::extract_order_f64_signed`].
 //! 9. **RANGE's PRECEDING/FOLLOWING direction is relative to the `ORDER BY`
 //!    direction, not to ascending value order** — verified with `y =
 //!    10,12,15,20 DESC`: `RANGE BETWEEN 5 PRECEDING AND CURRENT ROW` widens
@@ -189,12 +208,14 @@ fn arrow_err(e: ArrowError) -> ExecError {
 pub struct OrderKey {
     pub column: usize,
     pub descending: bool,
-    /// Carried for symmetry with `sort::SortKey` (whose `nulls_first` the
-    /// upstream `Sort` this operator depends on actually consults) and to
-    /// document the precondition, but not read by this file: every frame
-    /// computation here only needs SQL NULLs to be *contiguous* within a
-    /// partition, which holds for either placement, not which end they sit
-    /// at — see [`null_peer_bounds`].
+    /// Which end of the partition SQL NULLs sit at. **Read by this file**, by
+    /// `RANGE` frame resolution: a NULL `ORDER BY` value is not "unorderable"
+    /// to a RANGE frame, it is the *extreme* value in the direction it sorts,
+    /// so [`WindowAgg::extract_order_f64_signed`] substitutes `+INFINITY` when
+    /// NULLs sort last and `-INFINITY` when they sort first. Module docs item
+    /// 8 records the live-Postgres evidence for that. It must agree with the
+    /// `nulls_first` of the `sort::SortKey` the upstream `Sort` ordered this
+    /// input by, or the substituted infinity will point the wrong way.
     pub nulls_first: bool,
 }
 
@@ -1059,16 +1080,31 @@ impl WindowAgg {
     /// The single `ORDER BY` column's per-row signed value, for `RANGE`
     /// frame arithmetic (module docs item 9: `DESC` flips the sign so the
     /// sequence stays non-decreasing in row-arrival order).
+    ///
+    /// SQL NULL becomes an **infinity pointing the way NULLs sort** (module
+    /// docs item 8): `-INFINITY` when the key is `NULLS FIRST`, `+INFINITY`
+    /// when it is `NULLS LAST`. The choice is read off `nulls_first` alone,
+    /// *not* off `descending`, because it describes where the NULLs physically
+    /// land — which is exactly what the signed sequence has to reflect to stay
+    /// non-decreasing. This is what makes every RANGE bound fall out of one
+    /// comparison rule instead of needing a NULL special case: `UNBOUNDED`
+    /// still reaches the partition edge, while `CURRENT ROW` and every value
+    /// offset saturate onto the NULL block (`INFINITY - k == INFINITY`).
     fn extract_order_f64_signed(
         &self,
         batch: &RecordBatch,
         part: &Partition,
-    ) -> Result<Vec<Option<f64>>, ExecError> {
+    ) -> Result<Vec<f64>, ExecError> {
         let key = &self.order_by[0];
         let col = batch.column(key.column);
         let sign = if key.descending { -1.0 } else { 1.0 };
+        let null_sv = if key.nulls_first {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
         (part.start..part.end)
-            .map(|i| Ok(extract_order_f64(col, i)?.map(|v| v * sign)))
+            .map(|i| Ok(extract_order_f64(col, i)?.map_or(null_sv, |v| v * sign)))
             .collect()
     }
 
@@ -1173,7 +1209,7 @@ fn compute_window_for_partition(
     batch: &RecordBatch,
     part: &Partition,
     peer: &PeerGroups,
-    order_f64: Option<&[Option<f64>]>,
+    order_f64: Option<&[f64]>,
     rw: &ResolvedWindow,
     out: &mut [Option<Cell>],
 ) -> Result<(), ExecError> {
@@ -1435,7 +1471,7 @@ fn frame_offset_count(off: &FrameOffset) -> Result<u64, ExecError> {
 fn resolve_frame(
     part: &Partition,
     peer: &PeerGroups,
-    order_f64: Option<&[Option<f64>]>,
+    order_f64: Option<&[f64]>,
     frame: &WindowFrame,
     i: usize,
 ) -> Result<Option<(usize, usize)>, ExecError> {
@@ -1490,28 +1526,23 @@ fn resolve_frame(
 /// `RANGE` frame resolution for the exactly-one-`ORDER BY`-column case.
 /// `vals` holds each partition row's *signed* order value (module docs item
 /// 9) — monotonically non-decreasing in row-arrival order regardless of
-/// `ASC`/`DESC`, with `None` for SQL NULL.
+/// `ASC`/`DESC`, with SQL NULL already substituted by the infinity pointing
+/// the way NULLs sort (see [`WindowAgg::extract_order_f64_signed`]).
 ///
-/// A NULL current-row value collapses the frame to just the contiguous NULL
-/// peer block, independent of the bound kind (module docs item 8) — verified
-/// against Postgres 18 with:
-/// ```sql
-/// select y,x, sum(x) over (order by y range between 1 preceding and current row) as s
-/// from tn order by y nulls first, x;  -- y = NULL,NULL,1,2 (window's own order: 1,2,NULL,NULL)
-/// ```
-/// which gives both NULL rows the same sum (the NULL peers only), not NULL
-/// (propagated from undefined `NULL ± offset` arithmetic) and not the whole
-/// partition.
+/// That substitution is the whole of the NULL handling: there is deliberately
+/// no `if current row is NULL` branch here. A NULL current row gets threshold
+/// `±INFINITY` for `CURRENT ROW` and, because `INFINITY - k == INFINITY`, the
+/// same threshold for every value offset — so both saturate onto the NULL
+/// block, while an `UNBOUNDED` bound still reaches the partition edge it is
+/// supposed to reach. Module docs item 8 lists the live-Postgres row values
+/// this reproduces.
 fn resolve_range_frame_single_key(
     part: &Partition,
-    vals: &[Option<f64>],
+    vals: &[f64],
     frame: &WindowFrame,
     i: usize,
 ) -> Result<Option<(usize, usize)>, ExecError> {
-    let rel = i - part.start;
-    let Some(cur) = vals[rel] else {
-        return Ok(Some(null_peer_bounds(part, vals, rel)));
-    };
+    let cur = vals[i - part.start];
 
     let threshold = |bound: &FrameBound| -> Result<f64, ExecError> {
         match bound {
@@ -1543,41 +1574,23 @@ fn resolve_range_frame_single_key(
     })
 }
 
-fn find_first_sv_ge(part: &Partition, vals: &[Option<f64>], threshold: f64) -> Option<usize> {
-    for (rel, v) in vals.iter().enumerate() {
-        if let Some(v) = v {
-            if *v >= threshold {
-                return Some(part.start + rel);
-            }
-        }
-    }
-    None
+/// First row whose signed order value is at or past `threshold`, or `None`
+/// when no row is — an empty frame. NULL rows participate here as the
+/// infinity they were substituted by, which is why `RANGE BETWEEN 5 FOLLOWING
+/// AND UNBOUNDED FOLLOWING` past the largest real value still finds the
+/// trailing `NULLS LAST` block rather than reporting an empty frame.
+fn find_first_sv_ge(part: &Partition, vals: &[f64], threshold: f64) -> Option<usize> {
+    vals.iter()
+        .position(|v| *v >= threshold)
+        .map(|rel| part.start + rel)
 }
 
-fn find_last_sv_le(part: &Partition, vals: &[Option<f64>], threshold: f64) -> Option<usize> {
-    for (rel, v) in vals.iter().enumerate().rev() {
-        if let Some(v) = v {
-            if *v <= threshold {
-                return Some(part.start + rel);
-            }
-        }
-    }
-    None
-}
-
-/// The contiguous block of NULL order values containing `rel` (relative to
-/// `part.start`). NULLs are always contiguous here because the input is
-/// pre-sorted by a single key with one NULL placement.
-fn null_peer_bounds(part: &Partition, vals: &[Option<f64>], rel: usize) -> (usize, usize) {
-    let mut lo = rel;
-    while lo > 0 && vals[lo - 1].is_none() {
-        lo -= 1;
-    }
-    let mut hi = rel;
-    while hi + 1 < vals.len() && vals[hi + 1].is_none() {
-        hi += 1;
-    }
-    (part.start + lo, part.start + hi)
+/// Last row whose signed order value is at or before `threshold`, or `None`
+/// for an empty frame. The mirror of [`find_first_sv_ge`].
+fn find_last_sv_le(part: &Partition, vals: &[f64], threshold: f64) -> Option<usize> {
+    vals.iter()
+        .rposition(|v| *v <= threshold)
+        .map(|rel| part.start + rel)
 }
 
 fn apply_frame_func(
@@ -1725,11 +1738,22 @@ mod tests {
         }
     }
 
+    /// An `ORDER BY` key with **PostgreSQL's default NULL placement**: `ASC`
+    /// puts NULLs last, `DESC` puts them first, i.e. `nulls_first ==
+    /// descending` (confirmed live, and the same defaulting
+    /// `basin_plan::lower::expr` applies to `SortByNulls::Default`).
+    ///
+    /// This read `!descending` until the RANGE-frame fix below, which was
+    /// harmless only for as long as nothing in this file consulted
+    /// `nulls_first` — every fixture here lays its rows out in the window's
+    /// physical order by hand, so an inverted flag changed no test's input.
+    /// It is load-bearing now: it tells RANGE resolution which way the NULL
+    /// block sorts.
     fn oc(column: usize, descending: bool) -> OrderKey {
         OrderKey {
             column,
             descending,
-            nulls_first: !descending,
+            nulls_first: descending,
         }
     }
 
@@ -2447,6 +2471,718 @@ mod tests {
             "both NULL rows must sum exactly their NULL peer group (1+2=3), not NULL \
              (from undefined NULL-offset arithmetic) and not the whole partition"
         );
+    }
+
+    // ── Item 8's other half: UNBOUNDED must still reach the PARTITION edge
+    // from a NULL row ───────────────────────────────────────────────────────
+    //
+    // Every expected vector below was read off PostgreSQL 18.2 by row, over
+    // two fixtures fed in the window's own physical order:
+    //
+    //   w: (10,10,20,20,20,30,NULL,NULL) — ties in three sizes plus a
+    //      two-row NULL peer group, so RANGE, ROWS and GROUPS can disagree
+    //   v: (10,10,20,30,30)              — the same shape with no NULLs at
+    //      all, so the NULL handling cannot quietly change the ordinary path
+    //
+    // The bug these pin down: RANGE frame resolution collapsed *every* bound
+    // to the NULL peer block on a NULL row, including UNBOUNDED ones, so
+    // `sum(n) OVER (ORDER BY n RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+    // ROW)` returned NULL on the NULL row where PostgreSQL returns a full
+    // running total.
+
+    fn okey(descending: bool, nulls_first: bool) -> OrderKey {
+        OrderKey {
+            column: 0,
+            descending,
+            nulls_first,
+        }
+    }
+
+    /// Feed one partition in its window-physical order and read back both
+    /// `sum(n)` and `count(*)` over `frame`. `count(*)` is what actually pins
+    /// the frame *bounds* down: `sum` alone cannot tell "the frame is the two
+    /// NULL rows" from "the frame is the whole partition", because NULL rows
+    /// contribute nothing to a sum either way.
+    fn frame_sum_and_count(
+        ns: Vec<Option<i64>>,
+        key: OrderKey,
+        units: FrameUnits,
+        start: FrameBound,
+        end: FrameBound,
+    ) -> (Vec<Option<i64>>, Vec<Option<i64>>) {
+        let schema = Arc::new(Schema::new(vec![i64_col("n")]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ns))]).unwrap();
+        let child = Feed::boxed(schema, batch);
+        let frame = simple_frame(units, start, end);
+        let windows = vec![
+            sum_spec("s", 0, Some(frame)),
+            WindowSpec {
+                func: WindowFunc::CountStar,
+                arg_col: None,
+                offset_col: None,
+                default_col: None,
+                nth_col: None,
+                frame: Some(frame),
+                alias: "c".into(),
+            },
+        ];
+        let mut op = WindowAgg::new(child, vec![], vec![key], windows, usize::MAX).unwrap();
+        let out = run_all(&mut op);
+        (col_i64(&out, "s"), col_i64(&out, "c"))
+    }
+
+    /// w in ASC order, Postgres's default NULLS LAST placement.
+    fn w_asc_nulls_last() -> Vec<Option<i64>> {
+        vec![
+            Some(10),
+            Some(10),
+            Some(20),
+            Some(20),
+            Some(20),
+            Some(30),
+            None,
+            None,
+        ]
+    }
+
+    // THE REGRESSION. Live: on w,
+    //   sum   -> 20,20,80,80,80,110,110,110
+    //   count -> 2,2,5,5,5,6,8,8
+    // and on the golden corpus's own fixture n=(7,8,9,NULL), sum -> 7,15,24,24.
+    #[test]
+    fn range_unbounded_preceding_reaches_the_partition_start_from_a_null_row() {
+        let (s, c) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(20),
+                Some(20),
+                Some(80),
+                Some(80),
+                Some(80),
+                Some(110),
+                Some(110),
+                Some(110)
+            ],
+            "the NULL peer group sorts last under ASC, so UNBOUNDED PRECEDING reaches \
+             every earlier row and the running total continues through it"
+        );
+        assert_eq!(
+            c,
+            vec![
+                Some(2),
+                Some(2),
+                Some(5),
+                Some(5),
+                Some(5),
+                Some(6),
+                Some(8),
+                Some(8)
+            ],
+            "the NULL rows' frame is the whole partition (8 rows), not the NULL block (2)"
+        );
+
+        // The exact shape both oracles flagged: 7+8+9 = 24 on the NULL row.
+        let (s, c) = frame_sum_and_count(
+            vec![Some(7), Some(8), Some(9), None],
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(
+            s,
+            vec![Some(7), Some(15), Some(24), Some(24)],
+            "the NULL row must report the full running total 24, not NULL"
+        );
+        assert_eq!(c, vec![Some(1), Some(2), Some(3), Some(4)]);
+    }
+
+    // Live on w: sum -> 110,110,90,90,90,30,NULL,NULL / count -> 8,8,6,6,6,3,2,2.
+    // Here the NULL row's answer genuinely IS NULL — its frame is the trailing
+    // NULL block — which is why the count vector is the load-bearing half.
+    #[test]
+    fn range_current_row_to_unbounded_following_stops_at_the_null_peer_group() {
+        let (s, c) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::CurrentRow,
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(110),
+                Some(110),
+                Some(90),
+                Some(90),
+                Some(90),
+                Some(30),
+                None,
+                None
+            ]
+        );
+        assert_eq!(
+            c,
+            vec![
+                Some(8),
+                Some(8),
+                Some(6),
+                Some(6),
+                Some(6),
+                Some(3),
+                Some(2),
+                Some(2)
+            ],
+            "CURRENT ROW starts at the NULL peer group's first row, so the NULL rows \
+             see 2 rows — correctly NULL, unlike the UNBOUNDED PRECEDING case"
+        );
+    }
+
+    // Live on w: sum -> 110 for every row, count -> 8 for every row. This one
+    // is the clearest statement of the bug: even a frame with no CURRENT ROW
+    // in it at all was being truncated to the NULL block.
+    #[test]
+    fn range_unbounded_to_unbounded_is_the_whole_partition_including_null_rows() {
+        let (s, c) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(s, vec![Some(110); 8]);
+        assert_eq!(c, vec![Some(8); 8]);
+    }
+
+    // Live on w: sum -> 20,20,60,60,60,30,NULL,NULL / count -> 2,2,3,3,3,1,2,2.
+    // RANGE CURRENT ROW means "this peer group", which is why the two 10s see
+    // each other and the three 20s see each other.
+    #[test]
+    fn range_current_row_to_current_row_is_the_peer_group() {
+        let (s, c) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::CurrentRow,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(20),
+                Some(20),
+                Some(60),
+                Some(60),
+                Some(60),
+                Some(30),
+                None,
+                None
+            ]
+        );
+        assert_eq!(
+            c,
+            vec![
+                Some(2),
+                Some(2),
+                Some(3),
+                Some(3),
+                Some(3),
+                Some(1),
+                Some(2),
+                Some(2)
+            ]
+        );
+    }
+
+    // Under DESC, Postgres sorts NULLs FIRST, so the two bounds swap roles.
+    // Live on w ORDER BY n DESC (physical N,N,30,20,20,20,10,10):
+    //   UNBOUNDED PRECEDING..CURRENT ROW -> NULL,NULL,30,90,90,90,110,110
+    //                             count  -> 2,2,3,6,6,6,8,8
+    //   CURRENT ROW..UNBOUNDED FOLLOWING -> 110,110,110,80,80,80,20,20
+    //                             count  -> 8,8,6,5,5,5,2,2
+    #[test]
+    fn range_under_desc_sorts_nulls_first_and_mirrors_both_bounds() {
+        let w_desc = || {
+            vec![
+                None,
+                None,
+                Some(30),
+                Some(20),
+                Some(20),
+                Some(20),
+                Some(10),
+                Some(10),
+            ]
+        };
+        let (s, c) = frame_sum_and_count(
+            w_desc(),
+            okey(true, true),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(
+            s,
+            vec![
+                None,
+                None,
+                Some(30),
+                Some(90),
+                Some(90),
+                Some(90),
+                Some(110),
+                Some(110)
+            ],
+            "NULLs lead under DESC, so the NULL rows' running total is genuinely NULL \
+             here — the mirror image of the ASC case"
+        );
+        assert_eq!(
+            c,
+            vec![
+                Some(2),
+                Some(2),
+                Some(3),
+                Some(6),
+                Some(6),
+                Some(6),
+                Some(8),
+                Some(8)
+            ]
+        );
+
+        let (s, c) = frame_sum_and_count(
+            w_desc(),
+            okey(true, true),
+            FrameUnits::Range,
+            FrameBound::CurrentRow,
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(110),
+                Some(110),
+                Some(110),
+                Some(80),
+                Some(80),
+                Some(80),
+                Some(20),
+                Some(20)
+            ],
+            "under DESC it is this direction that must reach past the NULL block"
+        );
+        assert_eq!(
+            c,
+            vec![
+                Some(8),
+                Some(8),
+                Some(6),
+                Some(5),
+                Some(5),
+                Some(5),
+                Some(2),
+                Some(2)
+            ]
+        );
+    }
+
+    // Explicit NULLS FIRST / NULLS LAST, against the direction's default.
+    // Live on w:
+    //   ORDER BY n ASC NULLS FIRST  (N,N,10,10,20,20,20,30)
+    //     UP..CR -> NULL,NULL,20,20,80,80,80,110
+    //     CR..UF -> 110,110,110,110,90,90,90,30
+    //   ORDER BY n DESC NULLS LAST  (30,20,20,20,10,10,N,N)
+    //     UP..CR -> 30,90,90,90,110,110,110,110
+    //     CR..UF -> 110,80,80,80,20,20,NULL,NULL
+    #[test]
+    fn range_honours_explicit_nulls_first_and_nulls_last() {
+        let asc_nf = || {
+            vec![
+                None,
+                None,
+                Some(10),
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(20),
+                Some(30),
+            ]
+        };
+        let (s, _) = frame_sum_and_count(
+            asc_nf(),
+            okey(false, true),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(
+            s,
+            vec![
+                None,
+                None,
+                Some(20),
+                Some(20),
+                Some(80),
+                Some(80),
+                Some(80),
+                Some(110)
+            ]
+        );
+        let (s, _) = frame_sum_and_count(
+            asc_nf(),
+            okey(false, true),
+            FrameUnits::Range,
+            FrameBound::CurrentRow,
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(110),
+                Some(110),
+                Some(110),
+                Some(110),
+                Some(90),
+                Some(90),
+                Some(90),
+                Some(30)
+            ]
+        );
+
+        let desc_nl = || {
+            vec![
+                Some(30),
+                Some(20),
+                Some(20),
+                Some(20),
+                Some(10),
+                Some(10),
+                None,
+                None,
+            ]
+        };
+        let (s, _) = frame_sum_and_count(
+            desc_nl(),
+            okey(true, false),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(30),
+                Some(90),
+                Some(90),
+                Some(90),
+                Some(110),
+                Some(110),
+                Some(110),
+                Some(110)
+            ]
+        );
+        let (s, _) = frame_sum_and_count(
+            desc_nl(),
+            okey(true, false),
+            FrameUnits::Range,
+            FrameBound::CurrentRow,
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(110),
+                Some(80),
+                Some(80),
+                Some(80),
+                Some(20),
+                Some(20),
+                None,
+                None
+            ]
+        );
+    }
+
+    // The point of RANGE: under ties it must not behave like ROWS. Live on w,
+    // UNBOUNDED PRECEDING..CURRENT ROW:
+    //   RANGE  -> 20,20,80,80,80,110,110,110
+    //   ROWS   -> 10,20,40,60,80,110,110,110
+    //   GROUPS -> 20,20,80,80,80,110,110,110  (agrees with RANGE by definition)
+    #[test]
+    fn range_groups_and_rows_diverge_under_ties_and_agree_where_they_must() {
+        let bounds = (FrameBound::UnboundedPreceding, FrameBound::CurrentRow);
+        let (range_s, range_c) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            bounds.0,
+            bounds.1,
+        );
+        let (rows_s, _) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Rows,
+            bounds.0,
+            bounds.1,
+        );
+        let (groups_s, groups_c) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Groups,
+            bounds.0,
+            bounds.1,
+        );
+        assert_eq!(
+            rows_s,
+            vec![
+                Some(10),
+                Some(20),
+                Some(40),
+                Some(60),
+                Some(80),
+                Some(110),
+                Some(110),
+                Some(110)
+            ],
+            "ROWS steps one physical row at a time and splits every tie"
+        );
+        assert_eq!(
+            range_s,
+            vec![
+                Some(20),
+                Some(20),
+                Some(80),
+                Some(80),
+                Some(80),
+                Some(110),
+                Some(110),
+                Some(110)
+            ],
+            "RANGE steps whole peer groups, so tied rows share an answer"
+        );
+        assert_ne!(
+            range_s, rows_s,
+            "if RANGE and ROWS agreed on this fixture the test would prove nothing"
+        );
+        assert_eq!(
+            groups_s, range_s,
+            "GROUPS and RANGE are both defined on peer groups and must agree when \
+             the bounds carry no offset"
+        );
+        assert_eq!(groups_c, range_c);
+    }
+
+    // A partition that is nothing but NULLs: one peer group, so every one of
+    // the three unbounded shapes is the whole partition. Live (fixture z,
+    // partition p=1 of three NULL rows): sum NULL and count 3 for all three.
+    #[test]
+    fn range_over_a_partition_of_only_nulls_is_the_whole_partition() {
+        for (start, end) in [
+            (FrameBound::UnboundedPreceding, FrameBound::CurrentRow),
+            (FrameBound::CurrentRow, FrameBound::UnboundedFollowing),
+            (
+                FrameBound::UnboundedPreceding,
+                FrameBound::UnboundedFollowing,
+            ),
+        ] {
+            let (s, c) = frame_sum_and_count(
+                vec![None, None, None],
+                okey(false, false),
+                FrameUnits::Range,
+                start,
+                end,
+            );
+            assert_eq!(s, vec![None; 3], "sum over three NULLs is NULL either way");
+            assert_eq!(
+                c,
+                vec![Some(3); 3],
+                "but the frame is all three rows, which is what sum alone cannot show"
+            );
+        }
+    }
+
+    // NULL is sometimes the right answer, and this separates the two reasons.
+    // Live on w, RANGE BETWEEN 100 PRECEDING AND 50 PRECEDING:
+    //   sum   -> NULL for every row
+    //   count -> 0,0,0,0,0,0,2,2
+    // The non-NULL rows have a genuinely EMPTY frame (count 0). The NULL rows
+    // do not: their frame is the 2-row NULL block, which sums to NULL because
+    // its values are NULL. Same answer from sum, opposite frames.
+    #[test]
+    fn an_empty_range_frame_and_an_all_null_range_frame_are_both_null_for_different_reasons() {
+        let (s, c) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::Preceding(FrameOffset::Range(100.0)),
+            FrameBound::Preceding(FrameOffset::Range(50.0)),
+        );
+        assert_eq!(s, vec![None; 8]);
+        assert_eq!(
+            c,
+            vec![
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(2),
+                Some(2)
+            ],
+            "count 0 is an empty frame; count 2 is a NULL-valued frame"
+        );
+    }
+
+    // Value offsets on the rows that are NOT NULL, in a partition that
+    // contains NULLs — the case where a NULLS LAST block behaves as +inf for a
+    // start bound and fails every end bound. Live on w:
+    //   RANGE 5 FOLLOWING..UNBOUNDED FOLLOWING
+    //     sum   -> 90,90,30,30,30,NULL,NULL,NULL
+    //     count -> 6,6,3,3,3,2,2,2
+    //   RANGE UNBOUNDED PRECEDING..5 FOLLOWING -> 20,20,80,80,80,110,110,110
+    //   RANGE 5 PRECEDING..UNBOUNDED FOLLOWING -> 110,110,90,90,90,30,NULL,NULL
+    #[test]
+    fn a_range_offset_bound_treats_nulls_as_the_extreme_they_sort_as() {
+        let (s, c) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::Following(FrameOffset::Range(5.0)),
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(90),
+                Some(90),
+                Some(30),
+                Some(30),
+                Some(30),
+                None,
+                None,
+                None
+            ]
+        );
+        assert_eq!(
+            c,
+            vec![
+                Some(6),
+                Some(6),
+                Some(3),
+                Some(3),
+                Some(3),
+                Some(2),
+                Some(2),
+                Some(2)
+            ],
+            "on the n=30 row no real value is >= 35, yet the frame is the 2 trailing \
+             NULL rows rather than empty — NULLS LAST sorts after every value"
+        );
+
+        let (s, _) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::Following(FrameOffset::Range(5.0)),
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(20),
+                Some(20),
+                Some(80),
+                Some(80),
+                Some(80),
+                Some(110),
+                Some(110),
+                Some(110)
+            ],
+            "an end bound, by contrast, never admits a NULLS LAST row"
+        );
+
+        let (s, _) = frame_sum_and_count(
+            w_asc_nulls_last(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::Preceding(FrameOffset::Range(5.0)),
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(
+            s,
+            vec![
+                Some(110),
+                Some(110),
+                Some(90),
+                Some(90),
+                Some(90),
+                Some(30),
+                None,
+                None
+            ]
+        );
+    }
+
+    // The no-NULL path, so the NULL handling cannot change it by accident.
+    // Live on v = (10,10,20,30,30):
+    //   ASC  UP..CR -> 20,20,40,100,100   ROWS UP..CR -> 10,20,40,70,100
+    //   ASC  CR..UF -> 100,100,80,60,60
+    //   DESC UP..CR -> 60,60,80,100,100   DESC CR..UF -> 100,100,40,20,20
+    #[test]
+    fn range_without_any_nulls_is_unaffected() {
+        let asc = || vec![Some(10), Some(10), Some(20), Some(30), Some(30)];
+        let (s, _) = frame_sum_and_count(
+            asc(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(s, vec![Some(20), Some(20), Some(40), Some(100), Some(100)]);
+        let (s, _) = frame_sum_and_count(
+            asc(),
+            okey(false, false),
+            FrameUnits::Rows,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(s, vec![Some(10), Some(20), Some(40), Some(70), Some(100)]);
+        let (s, _) = frame_sum_and_count(
+            asc(),
+            okey(false, false),
+            FrameUnits::Range,
+            FrameBound::CurrentRow,
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(s, vec![Some(100), Some(100), Some(80), Some(60), Some(60)]);
+
+        let desc = || vec![Some(30), Some(30), Some(20), Some(10), Some(10)];
+        let (s, _) = frame_sum_and_count(
+            desc(),
+            okey(true, false),
+            FrameUnits::Range,
+            FrameBound::UnboundedPreceding,
+            FrameBound::CurrentRow,
+        );
+        assert_eq!(s, vec![Some(60), Some(60), Some(80), Some(100), Some(100)]);
+        let (s, _) = frame_sum_and_count(
+            desc(),
+            okey(true, false),
+            FrameUnits::Range,
+            FrameBound::CurrentRow,
+            FrameBound::UnboundedFollowing,
+        );
+        assert_eq!(s, vec![Some(100), Some(100), Some(40), Some(20), Some(20)]);
     }
 
     // ── Item 9 (module docs): RANGE PRECEDING/FOLLOWING is relative to the
