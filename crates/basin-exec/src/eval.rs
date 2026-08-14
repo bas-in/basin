@@ -221,9 +221,13 @@ use arrow::compute::kernels::{
 };
 use arrow_array::{
     new_null_array,
-    types::{Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type},
+    types::{
+        Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        IntervalMonthDayNano, IntervalMonthDayNanoType,
+    },
     Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::{ArrowError, DataType};
 
@@ -319,6 +323,53 @@ const OID_STRPOS: u32 = 868; // strpos(text, text)
 // in functional notation reads "backwards" relative to the syntax —
 // `pg_catalog.position('b', 'abc')` is `0`, not `2` (verified live).
 const OID_POSITION: u32 = 849; // position(text, text)
+
+// ─── String — case-folding, padding, repetition, splitting ─────────────────
+//
+// Every oid below was re-read from the live PostgreSQL 18 `pg_proc` with the
+// query at the top of this block, not carried over from a note: `lpad` and
+// `rpad` in particular have their two- and three-argument overloads numbered
+// in the opposite order to each other's intuition (`lpad(text,int)` is 879
+// but `lpad(text,int,text)` is the *lower* 873), which is exactly the kind of
+// transposition that would resolve to the wrong function silently.
+const OID_INITCAP: u32 = 872; // initcap(text)
+const OID_LPAD_2: u32 = 879; // lpad(text, integer)
+const OID_LPAD_3: u32 = 873; // lpad(text, integer, text)
+const OID_RPAD_2: u32 = 880; // rpad(text, integer)
+const OID_RPAD_3: u32 = 874; // rpad(text, integer, text)
+const OID_REPEAT: u32 = 1622; // repeat(text, integer)
+const OID_SPLIT_PART: u32 = 2088; // split_part(text, text, integer)
+
+// ─── Date/time ──────────────────────────────────────────────────────────────
+//
+// `age(timestamp, timestamp)` is the ONLY one of `age`'s four `pg_proc` rows
+// implemented here, and the other three are left to fall through to the
+// `other =>` arm deliberately — each of them needs session state `eval()` does
+// not have:
+//
+//   * `age(timestamptz)` (1386) and `age(timestamp)` (2059) are the
+//     one-argument forms, which are defined as `age(current_date, $1)`.
+//     `current_date` is a property of the session's clock and timezone.
+//   * `age(timestamptz, timestamptz)` (1199) takes two absolute instants but
+//     computes the *symbolic* difference between their renderings in the
+//     session timezone, so the answer genuinely depends on that zone.
+//     Verified on a live PostgreSQL 18 — the same two instants, differing
+//     only in the session's `TimeZone`:
+//
+//     ```text
+//     SET TimeZone='UTC';               age(...) = 1 mon 25 days 21:30:00
+//     SET TimeZone='America/New_York';  age(...) = 1 mon 25 days 22:30:00
+//     ```
+//
+//     (the pair straddles the 2024-03-10 US DST transition, which UTC does
+//     not have). Basin's physical `timestamptz` is UTC micros with no
+//     rendering zone, so answering this one would mean inventing a zone —
+//     exactly the silent-wrong-answer shape this file exists to avoid.
+//
+// `age(timestamp, timestamp)` has no such dependency: both arguments are
+// already civil wall-clock readings, and the result is a pure function of
+// them.
+const OID_AGE_TIMESTAMP: u32 = 2058; // age(timestamp, timestamp)
 
 // ─── Math — trig/log/exp/power (see docs/migration/df-removal/19-expires-at-removal.md
 // entry 1: these OIDs already existed in `basin_pgtype::func::FUNCS` as
@@ -1327,6 +1378,53 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
             eval_strpos(&s, &needle)
         }
 
+        OID_INITCAP => text_unary(&a(0)?, pg_initcap),
+
+        // The two-argument forms are not separate algorithms: on a live
+        // PostgreSQL 18 `lpad(text,int)` is a SQL-language function whose body
+        // is `lpad($1, $2, ' ')` (its errors even arrive with `CONTEXT: SQL
+        // function "lpad" statement 1`), so `None` here means "the default
+        // fill", not "a different code path".
+        OID_LPAD_2 => {
+            let s = a(0)?;
+            let len = a(1)?;
+            eval_pad(&s, &len, None, PadSide::Left)
+        }
+        OID_LPAD_3 => {
+            let s = a(0)?;
+            let len = a(1)?;
+            let fill = a(2)?;
+            eval_pad(&s, &len, Some(&fill), PadSide::Left)
+        }
+        OID_RPAD_2 => {
+            let s = a(0)?;
+            let len = a(1)?;
+            eval_pad(&s, &len, None, PadSide::Right)
+        }
+        OID_RPAD_3 => {
+            let s = a(0)?;
+            let len = a(1)?;
+            let fill = a(2)?;
+            eval_pad(&s, &len, Some(&fill), PadSide::Right)
+        }
+        OID_REPEAT => {
+            let s = a(0)?;
+            let count = a(1)?;
+            eval_repeat(&s, &count)
+        }
+        OID_SPLIT_PART => {
+            let s = a(0)?;
+            let delim = a(1)?;
+            let field = a(2)?;
+            eval_split_part(&s, &delim, &field)
+        }
+
+        OID_AGE_TIMESTAMP => {
+            let lhs = a(0)?;
+            let rhs = a(1)?;
+            eval_age(&lhs, &rhs)
+        }
+
         OID_SQRT_FLOAT8 => float8_unary_checked(&a(0)?, pg_sqrt_f64),
         OID_CBRT_FLOAT8 => Ok(Arc::new(arity::unary::<Float64Type, _, Float64Type>(
             downcast_array::<Float64Array>(&a(0)?, "double precision")?,
@@ -1687,6 +1785,463 @@ fn pg_strpos(s: &str, needle: &str) -> i32 {
     match s.find(needle) {
         Some(byte_idx) => s[..byte_idx].chars().count() as i32 + 1,
         None => 0,
+    }
+}
+
+/// `initcap(text)`: uppercase the first character of each "word", lowercase
+/// everything else. The rule is not "after whitespace" — Postgres starts a
+/// new word after ANY non-alphanumeric character, and it lowercases every
+/// character that follows an alphanumeric one. Verified against a live
+/// PostgreSQL 18:
+///
+/// ```text
+/// initcap('hELLo-woRLD foo_bar')  = 'Hello-World Foo_Bar'  -- '-' and '_' both split
+/// initcap('a''b c.d')             = 'A'B C.D'              -- so do quote and dot
+/// initcap('3abc a2b')             = '3abc A2b'             -- digits are alphanumeric,
+///                                                          -- so they do NOT split
+/// initcap('世界abc')              = '世界abc'              -- nor do CJK letters
+/// initcap('привет МИР')           = 'Привет Мир'
+/// ```
+///
+/// **A known, narrow divergence, stated rather than hidden.** Postgres calls
+/// the C library's `iswalnum` under the database's `lc_ctype` (`en_US.UTF-8`
+/// here), which counts only Unicode category `Nd` as a digit. Rust's
+/// [`char::is_alphanumeric`] is `Alphabetic | Nd | Nl | No`, so the two
+/// disagree for the "other number" and "letter number" categories:
+/// `initcap('½abc')` is `'½Abc'` on the live server (`½` does not split a
+/// word for glibc, so `a` begins one) but `'½abc'` here. Confirmed live for
+/// `½`, `¹`, `²`, `①` (all `No`) and `Ⅷ` (`Nl`); `٣` (Arabic-Indic three,
+/// `Nd`) agrees. std exposes no `Nd`-only predicate, and pulling in a Unicode
+/// property table for five glyph classes is not a trade this crate should
+/// make — see the module docs on staying lean. Nothing in the corpora that
+/// diff this file against Postgres contains such a character.
+///
+/// The case mapping itself is Rust's full (possibly multi-character) mapping,
+/// matching what [`text_unary`]-based `upper`/`lower` already do in this same
+/// file rather than introducing a second, inconsistent notion of case here.
+fn pg_initcap(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_alnum = false;
+    for c in s.chars() {
+        if prev_alnum {
+            out.extend(c.to_lowercase());
+        } else {
+            out.extend(c.to_uppercase());
+        }
+        prev_alnum = c.is_alphanumeric();
+    }
+    out
+}
+
+/// Which end [`pg_pad`] adds fill characters to.
+#[derive(Clone, Copy)]
+enum PadSide {
+    Left,
+    Right,
+}
+
+/// The fill the two-argument `lpad`/`rpad` use: a single ASCII space, taken
+/// from the SQL body of Postgres's own two-argument wrapper.
+const PAD_DEFAULT_FILL: &str = " ";
+
+/// Postgres's `MaxAllocSize` (`0x3fffffff`), the ceiling `palloc` enforces.
+const PG_MAX_ALLOC_SIZE: i64 = 0x3fff_ffff;
+
+/// The 4-byte varlena header every `text` datum carries, which counts against
+/// [`PG_MAX_ALLOC_SIZE`].
+const PG_VARHDRSZ: i64 = 4;
+
+/// The largest `len` `lpad`/`rpad` will accept before raising `requested
+/// length too large`: `(MaxAllocSize - VARHDRSZ) / 4`, where 4 is UTF-8's
+/// maximum bytes per character. The boundary was confirmed from both sides on
+/// a live PostgreSQL 18 — `lpad('hello', 268435455)` raises the error, while
+/// `lpad('hello', 268435454)` does not (it runs on until a `statement_timeout`
+/// cuts it off, which is Postgres genuinely building a gigabyte of padding).
+const PAD_MAX_LEN: i32 = ((PG_MAX_ALLOC_SIZE - PG_VARHDRSZ) / 4) as i32;
+
+/// `lpad(text, int [, text])` / `rpad(text, int [, text])`. `fill` is `None`
+/// for the two-argument forms, meaning [`PAD_DEFAULT_FILL`].
+///
+/// Strict in all three arguments, and that strictness is load-bearing for the
+/// length check: `lpad(NULL, 2147483647)` is NULL on the live server, NOT the
+/// `requested length too large` error, because a strict function is never
+/// entered when an argument is NULL. That is why the ceiling is tested per
+/// row inside [`pg_pad`] rather than swept over the whole `len` array up
+/// front the way [`eval_substr`] checks its negative length — a whole-array
+/// pre-check would turn that NULL into an error.
+fn eval_pad(
+    text: &ArrayRef,
+    len: &ArrayRef,
+    fill: Option<&ArrayRef>,
+    side: PadSide,
+) -> Result<ArrayRef, ExecError> {
+    let t = downcast_array::<StringArray>(text, "text")?;
+    let l = downcast_array::<Int32Array>(len, "integer")?;
+    let f = fill
+        .map(|f| downcast_array::<StringArray>(f, "text"))
+        .transpose()?;
+
+    let n = t.len();
+    let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let fill_null = f.map(|f| f.is_null(i)).unwrap_or(false);
+        if t.is_null(i) || l.is_null(i) || fill_null {
+            out.push(None);
+            continue;
+        }
+        let fill = f.map(|f| f.value(i)).unwrap_or(PAD_DEFAULT_FILL);
+        out.push(Some(pg_pad(t.value(i), l.value(i), fill, side)?));
+    }
+    Ok(Arc::new(StringArray::from(out)))
+}
+
+/// Postgres's `text_pad`, on already-unwrapped values. `len` is a count of
+/// *characters*, not bytes (`lpad('héllo', 8, 'é') = 'éééhéllo'` — verified
+/// live), so this walks `chars()` rather than indexing the byte slice.
+///
+/// The order of the three steps is what makes the awkward cases fall out, and
+/// every one was verified against a live PostgreSQL 18:
+///
+/// 1. **Truncate first.** `len` shorter than the input is a truncation, not a
+///    no-op: `lpad('hello', 3) = 'hel'`. A negative `len` clamps to zero, so
+///    `lpad('hello', -3) = ''` — not an error and not `'hello'`.
+/// 2. **Then check the fill.** An empty fill cannot pad, so the *already
+///    truncated* string is returned as-is: `lpad('hello', 10, '') = 'hello'`
+///    (untouched, because there was nothing to truncate) but
+///    `lpad('hello', 3, '') = 'hel'` (truncated, then not padded). Reading
+///    the empty-fill rule as "return the input unchanged" would get the
+///    second of those wrong.
+/// 3. **Then pad, cycling the fill character by character** — not by
+///    repeating the whole fill string and trimming. `lpad('a', 6, 'xyz')` is
+///    `'xyzxya'`: the pad is five characters long, so the fill wraps around
+///    mid-string.
+fn pg_pad(s: &str, len: i32, fill: &str, side: PadSide) -> Result<String, ExecError> {
+    if len > PAD_MAX_LEN {
+        return Err(ExecError::TypeMismatch(
+            "requested length too large".to_string(),
+        ));
+    }
+    let len = len.max(0) as usize;
+
+    let chars: Vec<char> = s.chars().collect();
+    let keep = chars.len().min(len);
+    let body: String = chars[..keep].iter().collect();
+
+    let fill: Vec<char> = fill.chars().collect();
+    if fill.is_empty() {
+        return Ok(body);
+    }
+
+    let pad: String = (0..len - keep).map(|i| fill[i % fill.len()]).collect();
+    Ok(match side {
+        PadSide::Left => pad + &body,
+        PadSide::Right => body + &pad,
+    })
+}
+
+/// `repeat(text, int)`. Strict, and — like [`eval_pad`] — checked per row
+/// rather than over the whole array, so a NULL argument stays NULL instead of
+/// being turned into a size error.
+fn eval_repeat(s: &ArrayRef, count: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let s = downcast_array::<StringArray>(s, "text")?;
+    let c = downcast_array::<Int32Array>(count, "integer")?;
+    let n = s.len();
+    let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+    for i in 0..n {
+        if s.is_null(i) || c.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        out.push(Some(pg_repeat(s.value(i), c.value(i))?));
+    }
+    Ok(Arc::new(StringArray::from(out)))
+}
+
+/// Postgres's `repeat`, on already-unwrapped values.
+///
+/// The count is clamped to zero *before* the size check, and the order
+/// matters: a negative count is not an error, it is an empty string.
+/// Verified live that `repeat('ab', -3)`, `repeat('ab', 0)` and even
+/// `repeat('ab', -2147483648)` all return `''` rather than raising anything.
+///
+/// The size check itself is on *bytes* (Postgres measures the datum, not its
+/// character count) and the boundary was confirmed from both sides on a live
+/// PostgreSQL 18: `repeat('a', 1073741820)` raises `requested length too
+/// large` because `1 * 1073741820 + 4` exceeds `MaxAllocSize`, while
+/// `repeat('a', 1073741819)` lands exactly on it and is accepted. A 3-byte
+/// character moves the boundary by the same factor, as the byte-based reading
+/// predicts (`repeat('世', 536870910)` errors).
+///
+/// Doing the arithmetic in `i64` rather than `i32` is deliberate. Postgres
+/// reaches the same verdict by *detecting* `int32` overflow in the multiply
+/// and the add; widening first cannot overflow at all, and any product that
+/// would have wrapped a signed 32-bit int is necessarily already past
+/// [`PG_MAX_ALLOC_SIZE`], so the two agree on every input while this one has
+/// no wrapping to reason about.
+fn pg_repeat(s: &str, count: i32) -> Result<String, ExecError> {
+    let count = i64::from(count.max(0));
+    if s.len() as i64 * count + PG_VARHDRSZ > PG_MAX_ALLOC_SIZE {
+        return Err(ExecError::TypeMismatch(
+            "requested length too large".to_string(),
+        ));
+    }
+    Ok(s.repeat(count as usize))
+}
+
+/// `split_part(text, text, int)`: split on `delim` and return one field.
+///
+/// Strict, and the zero-field error is raised per row *after* the NULL check
+/// for the same reason [`eval_pad`]'s size check is: `split_part(NULL, ',', 0)`
+/// is NULL on the live server, not `field position must not be zero`, because
+/// a strict function never runs on a NULL argument.
+fn eval_split_part(
+    s: &ArrayRef,
+    delim: &ArrayRef,
+    field: &ArrayRef,
+) -> Result<ArrayRef, ExecError> {
+    let s = downcast_array::<StringArray>(s, "text")?;
+    let d = downcast_array::<StringArray>(delim, "text")?;
+    let f = downcast_array::<Int32Array>(field, "integer")?;
+    let n = s.len();
+    let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+    for i in 0..n {
+        if s.is_null(i) || d.is_null(i) || f.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        out.push(Some(pg_split_part(s.value(i), d.value(i), f.value(i))?));
+    }
+    Ok(Arc::new(StringArray::from(out)))
+}
+
+/// Postgres's `split_part`, on already-unwrapped values. Verified against a
+/// live PostgreSQL 18 on every branch below:
+///
+/// ```text
+/// split_part('a,b,c', ',',  0) -- ERROR: field position must not be zero
+/// split_part('a,b,c', ',',  1) = 'a'
+/// split_part('a,b,c', ',',  4) = ''       -- past the end is empty, not an error
+/// split_part('a,b,c', ',', -1) = 'c'      -- negative counts from the right (PG 14+)
+/// split_part('a,b,c', ',', -3) = 'a'
+/// split_part('a,b,c', ',', -4) = ''
+/// split_part('a,b,c', '',   1) = 'a,b,c'  -- an empty delimiter makes ONE field,
+/// split_part('a,b,c', '',  -1) = 'a,b,c'  -- reachable from either end,
+/// split_part('a,b,c', '',   2) = ''       -- and nothing else
+/// ```
+///
+/// A field position of zero is the one input that errors, and it errors for
+/// both signs of "out of range" being legal — without it, `0` would have to
+/// mean either the first or the last field and neither reading is safe.
+///
+/// The index arithmetic is done in `i64`. `field` reaches this function as a
+/// full `i32`, so a negative field of `i32::MIN` would overflow a 32-bit
+/// negation; widening first makes it fall out of range and return `''`, which
+/// is what the live server does (`split_part('a,b,c', ',', -2147483648)` is
+/// `''`, not an error).
+fn pg_split_part(s: &str, delim: &str, field: i32) -> Result<String, ExecError> {
+    if field == 0 {
+        return Err(ExecError::TypeMismatch(
+            "field position must not be zero".to_string(),
+        ));
+    }
+    if delim.is_empty() {
+        return Ok(if field == 1 || field == -1 {
+            s.to_string()
+        } else {
+            String::new()
+        });
+    }
+
+    let parts: Vec<&str> = s.split(delim).collect();
+    let field = i64::from(field);
+    let index = if field > 0 {
+        field - 1
+    } else {
+        parts.len() as i64 + field
+    };
+    Ok(usize::try_from(index)
+        .ok()
+        .and_then(|i| parts.get(i))
+        .map(|p| (*p).to_string())
+        .unwrap_or_default())
+}
+
+/// `age(timestamp, timestamp)`. Strict in both arguments.
+///
+/// This is the first function in this file to *produce* an interval, so the
+/// output is an `IntervalMonthDayNanoArray` — the physical layout
+/// `basin_pgtype` maps `oid::INTERVAL` onto. Postgres's own interval is a
+/// `(months, days, microseconds)` triple; Arrow's is `(months, days,
+/// nanoseconds)`, so only the last component is rescaled, and the month and
+/// day components are carried across untouched rather than being normalised
+/// into some canonical duration. That matters: `age` deliberately returns a
+/// *symbolic* difference, and "1 mon 1 day" is not interchangeable with any
+/// fixed number of nanoseconds.
+fn eval_age(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let l = downcast_array::<TimestampMicrosecondArray>(lhs, "timestamp")?;
+    let r = downcast_array::<TimestampMicrosecondArray>(rhs, "timestamp")?;
+    let n = l.len();
+    let mut out: Vec<Option<IntervalMonthDayNano>> = Vec::with_capacity(n);
+    for i in 0..n {
+        if l.is_null(i) || r.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        out.push(Some(pg_age(l.value(i), r.value(i))));
+    }
+    Ok(Arc::new(IntervalMonthDayNanoArray::from(out)))
+}
+
+/// Postgres's `timestamp_age`, on microseconds since the Unix epoch.
+///
+/// `age` is **not** a duration. It is the *symbolic* difference between two
+/// broken-down calendar readings: subtract field by field (year from year,
+/// month from month, day from day, …), then carry each negative field into
+/// the next larger one. That is why `age` can answer in months at all, and
+/// why its answer is not a function of the elapsed microseconds alone:
+///
+/// ```text
+/// age('2024-03-31', '2024-01-31') = 2 mons        -- 60 days elapsed
+/// age('2024-03-01', '2024-01-31') = 1 mon 1 day   -- 30 days elapsed
+/// ```
+///
+/// **The borrow uses the EARLIER timestamp's month, never the later one's,
+/// and never the month the borrow lands in.** This is the detail worth
+/// pinning, because two plausible alternative readings give the same answer
+/// on most inputs. Verified live:
+///
+/// ```text
+/// age('2000-03-01', '2000-01-31') = 1 mon 1 day
+/// age('1900-03-01', '1900-01-31') = 1 mon 1 day
+/// ```
+///
+/// 2000 is a leap year and 1900 is not, so if the borrow took its day count
+/// from *February* — the month between the two, and the one a "how many days
+/// in the intervening month" reading would pick — those two answers would
+/// differ by a day. They do not: both borrow 31 days from **January**, the
+/// month the earlier argument is in.
+///
+/// The sign handling mirrors Postgres's: flip the raw field differences up
+/// front when `dt1 < dt2`, carry on non-negative numbers, then flip back. The
+/// result is `-1 years -1 mons -25 days -21:30:00`-style — every component
+/// negative — rather than a mixed-sign interval, which is why the sign is
+/// applied to the assembled components at the end.
+fn pg_age(dt1: i64, dt2: i64) -> IntervalMonthDayNano {
+    let (y1, mo1, d1, h1, mi1, s1, us1) = civil_from_micros(dt1);
+    let (y2, mo2, d2, h2, mi2, s2, us2) = civil_from_micros(dt2);
+
+    // `sign` folds Postgres's two negations (once before the carries, once
+    // after) into one multiplication: carrying always runs on the larger-minus-
+    // smaller ordering, so every field below is driven non-negative.
+    let sign = if dt1 < dt2 { -1 } else { 1 };
+    let mut usec = (us1 - us2) * sign;
+    let mut sec = (s1 - s2) * sign;
+    let mut min = (mi1 - mi2) * sign;
+    let mut hour = (h1 - h2) * sign;
+    let mut mday = (d1 - d2) * sign;
+    let mut mon = (mo1 - mo2) * sign;
+    let mut year = (y1 - y2) * sign;
+
+    // The month to borrow days from: the earlier argument's. `sign` already
+    // encodes which that is.
+    let (borrow_year, borrow_mon) = if sign < 0 { (y1, mo1) } else { (y2, mo2) };
+
+    while usec < 0 {
+        usec += 1_000_000;
+        sec -= 1;
+    }
+    while sec < 0 {
+        sec += 60;
+        min -= 1;
+    }
+    while min < 0 {
+        min += 60;
+        hour -= 1;
+    }
+    while hour < 0 {
+        hour += 24;
+        mday -= 1;
+    }
+    while mday < 0 {
+        mday += days_in_month(borrow_year, borrow_mon);
+        mon -= 1;
+    }
+    while mon < 0 {
+        mon += 12;
+        year -= 1;
+    }
+
+    let micros = ((hour * 60 + min) * 60 + sec) * 1_000_000 + usec;
+    IntervalMonthDayNanoType::make_value(
+        ((year * 12 + mon) * sign) as i32,
+        (mday * sign) as i32,
+        micros * sign * 1_000,
+    )
+}
+
+/// Break microseconds since the Unix epoch into a civil `(year, month, day,
+/// hour, minute, second, microsecond)` reading, with no timezone involved —
+/// the input is a `timestamp without time zone`, which is already a wall-clock
+/// reading rather than an instant.
+///
+/// `div_euclid`/`rem_euclid` rather than `/` and `%` because timestamps before
+/// 1970 are negative, and truncating division would put the time-of-day of
+/// every pre-epoch instant on the wrong day.
+fn civil_from_micros(micros: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
+    const USECS_PER_DAY: i64 = 86_400_000_000;
+    let days = micros.div_euclid(USECS_PER_DAY);
+    let time_of_day = micros.rem_euclid(USECS_PER_DAY);
+    let (year, month, day) = civil_from_days(days);
+    let (secs, usec) = (time_of_day / 1_000_000, time_of_day % 1_000_000);
+    (
+        year,
+        month,
+        day,
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60,
+        usec,
+    )
+}
+
+/// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`.
+///
+/// This is Howard Hinnant's `civil_from_days`, which works by shifting the
+/// epoch to 0000-03-01 so that the leap day lands at the end of the year and
+/// the 400-year cycle ("era") becomes exact integer arithmetic with no
+/// special cases. The unexplained-looking constants are all consequences of
+/// that shift: 719468 is the day offset between the two epochs, 146097 is the
+/// number of days in 400 Gregorian years, and 36524/1460 are the 100- and
+/// 4-year cycle lengths used to undo the leap-day compression.
+///
+/// The `if z >= 0` guard on `era` is a floor-division fixup: Rust's `/`
+/// truncates toward zero, which is wrong for the negative day numbers that
+/// pre-1970 timestamps produce.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365], from March 1
+    let mp = (5 * doy + 2) / 153; // month shifted so March is 0
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Proleptic Gregorian: every fourth year is a leap year, except centuries,
+/// except every fourth century. Matches Postgres's `isleap` macro exactly.
+fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        _ => 28,
     }
 }
 
@@ -4313,6 +4868,581 @@ mod tests {
         let expr = sf(OID_STRPOS, vec![lit_text("hello"), lit_text("xyz")]);
         let result = eval(&expr, &one_row()).unwrap();
         assert_eq!(i32_array(&result).value(0), 0);
+    }
+
+    // ─── initcap (oid 872) ──────────────────────────────────────────────
+
+    /// Every expectation below was read off a live PostgreSQL 18. The point
+    /// of the table is that "capitalise each word" is not the rule: a word
+    /// begins after ANY non-alphanumeric character, so `-`, `_`, `'` and `.`
+    /// all start one — and a digit does NOT, which is the case an
+    /// implementation written around `char::is_whitespace` gets wrong.
+    #[test]
+    fn initcap_starts_a_word_after_any_non_alphanumeric_not_just_whitespace() {
+        for (input, expected) in [
+            ("hello world", "Hello World"),
+            ("hELLo-woRLD foo_bar 3abc a2b", "Hello-World Foo_Bar 3abc A2b"),
+            ("a'b c.d e1f", "A'B C.D E1f"),
+            ("The quick brown fox", "The Quick Brown Fox"),
+            ("hELLo WoRLD", "Hello World"),
+            ("", ""),
+            ("   ", "   "),
+            ("a", "A"),
+        ] {
+            let expr = sf(OID_INITCAP, vec![lit_text(input)]);
+            assert_eq!(
+                str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+                expected,
+                "initcap({input:?})"
+            );
+        }
+    }
+
+    /// Non-ASCII letters are alphanumeric, so they neither start a word nor
+    /// resist case folding. All four verified live:
+    /// `initcap('éclair ÉCLAIR') = 'Éclair Éclair'`,
+    /// `initcap('привет МИР') = 'Привет Мир'`,
+    /// `initcap('世界abc') = '世界abc'` (CJK letters are alphanumeric, so the
+    /// `a` is mid-word and stays lowercase) and `initcap('İSTANBUL') =
+    /// 'İstanbul'`.
+    #[test]
+    fn initcap_treats_non_ascii_letters_as_alphanumeric() {
+        for (input, expected) in [
+            ("éclair ÉCLAIR", "Éclair Éclair"),
+            ("привет МИР", "Привет Мир"),
+            ("世界abc", "世界abc"),
+            ("héllo世界", "Héllo世界"),
+            ("İSTANBUL", "İstanbul"),
+        ] {
+            let expr = sf(OID_INITCAP, vec![lit_text(input)]);
+            assert_eq!(
+                str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+                expected,
+                "initcap({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn initcap_of_null_is_null() {
+        let expr = sf(OID_INITCAP, vec![lit_text_null()]);
+        assert!(eval(&expr, &one_row()).unwrap().is_null(0));
+    }
+
+    // ─── lpad / rpad (oids 879/873, 880/874) ────────────────────────────
+
+    /// The three-step order — truncate, then check the fill, then pad —
+    /// spelled out as a table of live-server answers. `lpad('hello', 10, '')`
+    /// and `lpad('hello', 3, '')` are the pair that pins step 2: an empty
+    /// fill does not mean "return the input unchanged", it means "skip the
+    /// padding", and the truncation has already happened by then.
+    #[test]
+    fn lpad_truncates_before_it_checks_whether_the_fill_can_pad() {
+        for (len, fill, expected) in [
+            (10i32, None, "     hello"),
+            (3, None, "hel"),
+            (0, None, ""),
+            (-3, None, ""),
+            (5, Some("xy"), "hello"),
+            (11, Some("xy"), "xyxyxyhello"),
+            (10, Some(""), "hello"),
+            (3, Some(""), "hel"),
+        ] {
+            let mut args = vec![lit_text("hello"), lit_i32(len)];
+            if let Some(f) = fill {
+                args.push(lit_text(f));
+            }
+            let expr = sf(
+                if fill.is_some() { OID_LPAD_3 } else { OID_LPAD_2 },
+                args,
+            );
+            assert_eq!(
+                str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+                expected,
+                "lpad('hello', {len}, {fill:?})"
+            );
+        }
+    }
+
+    /// `rpad`'s counterpart. Note that the truncating and empty-fill rows are
+    /// *identical* to `lpad`'s — the two differ only in where the padding
+    /// goes, so a test that only checked the padded rows would not notice an
+    /// implementation that truncated from the wrong end.
+    #[test]
+    fn rpad_pads_on_the_right_but_truncates_from_the_same_end_as_lpad() {
+        for (len, fill, expected) in [
+            (10i32, None, "hello     "),
+            (3, None, "hel"),
+            (-3, None, ""),
+            (11, Some("xy"), "helloxyxyxy"),
+            (10, Some(""), "hello"),
+            (3, Some(""), "hel"),
+        ] {
+            let mut args = vec![lit_text("hello"), lit_i32(len)];
+            if let Some(f) = fill {
+                args.push(lit_text(f));
+            }
+            let expr = sf(
+                if fill.is_some() { OID_RPAD_3 } else { OID_RPAD_2 },
+                args,
+            );
+            assert_eq!(
+                str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+                expected,
+                "rpad('hello', {len}, {fill:?})"
+            );
+        }
+    }
+
+    /// The fill cycles character by character rather than being repeated
+    /// whole and trimmed. Verified live: `lpad('a', 6, 'xyz') = 'xyzxya'` and
+    /// `rpad('a', 6, 'xyz') = 'axyzxy'`. Repeating `'xyz'` twice and taking
+    /// the first five characters happens to give the same answer here, but
+    /// the character-wise reading is the one Postgres implements and the two
+    /// part company as soon as the fill is padded from the far end.
+    #[test]
+    fn pad_fill_wraps_around_mid_string() {
+        let l = sf(OID_LPAD_3, vec![lit_text("a"), lit_i32(6), lit_text("xyz")]);
+        assert_eq!(str_array(&eval(&l, &one_row()).unwrap()).value(0), "xyzxya");
+        let r = sf(OID_RPAD_3, vec![lit_text("a"), lit_i32(6), lit_text("xyz")]);
+        assert_eq!(str_array(&eval(&r, &one_row()).unwrap()).value(0), "axyzxy");
+    }
+
+    /// `len` counts characters, not bytes. Verified live:
+    /// `lpad('héllo', 8, 'é') = 'éééhéllo'` — eight characters, twelve bytes.
+    /// A byte-based implementation would produce five pad characters here
+    /// instead of three.
+    #[test]
+    fn pad_length_is_in_characters_not_bytes() {
+        let expr = sf(
+            OID_LPAD_3,
+            vec![lit_text("héllo"), lit_i32(8), lit_text("é")],
+        );
+        let out = eval(&expr, &one_row()).unwrap();
+        assert_eq!(str_array(&out).value(0), "éééhéllo");
+        assert_eq!(str_array(&out).value(0).chars().count(), 8);
+
+        let trunc = sf(OID_LPAD_2, vec![lit_text("héllo"), lit_i32(2)]);
+        assert_eq!(str_array(&eval(&trunc, &one_row()).unwrap()).value(0), "hé");
+    }
+
+    /// Past `(MaxAllocSize - VARHDRSZ) / 4` Postgres refuses rather than
+    /// allocating. Both sides of the boundary were checked live; only the
+    /// erroring side is asserted here, because the accepted side would have
+    /// this test build a gigabyte of padding.
+    #[test]
+    fn pad_beyond_the_allocation_ceiling_errors_instead_of_allocating() {
+        assert_eq!(PAD_MAX_LEN, 268_435_454);
+        let expr = sf(OID_LPAD_2, vec![lit_text("hello"), lit_i32(i32::MAX)]);
+        let err = eval(&expr, &one_row()).unwrap_err();
+        assert!(
+            format!("{err}").contains("requested length too large"),
+            "got {err}"
+        );
+    }
+
+    /// **Strictness beats the size check.** `lpad(NULL, 2147483647)` is NULL
+    /// on the live server, not an error: a strict function is never entered
+    /// when an argument is NULL, so the length it would have rejected is
+    /// never looked at. A whole-array pre-check of `len` — the shape
+    /// [`eval_substr`] uses for its negative-length rejection — would get
+    /// this wrong, which is why the ceiling is tested per row.
+    #[test]
+    fn pad_of_null_is_null_even_at_a_length_that_would_error() {
+        let expr = sf(OID_LPAD_2, vec![lit_text_null(), lit_i32(i32::MAX)]);
+        assert!(eval(&expr, &one_row()).unwrap().is_null(0));
+
+        let null_fill = sf(
+            OID_LPAD_3,
+            vec![lit_text("a"), lit_i32(5), Expr::Literal(Datum::Null, PgType::TEXT)],
+        );
+        assert!(eval(&null_fill, &one_row()).unwrap().is_null(0));
+    }
+
+    // ─── repeat (oid 1622) ──────────────────────────────────────────────
+
+    /// A non-positive count is an empty string, not an error and not the
+    /// input. `i32::MIN` is included because clamping via negation would
+    /// overflow there; verified live that `repeat('ab', -2147483648) = ''`.
+    #[test]
+    fn repeat_with_a_non_positive_count_is_the_empty_string() {
+        for (count, expected) in [
+            (3i32, "ababab"),
+            (1, "ab"),
+            (0, ""),
+            (-3, ""),
+            (i32::MIN, ""),
+        ] {
+            let expr = sf(OID_REPEAT, vec![lit_text("ab"), lit_i32(count)]);
+            assert_eq!(
+                str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+                expected,
+                "repeat('ab', {count})"
+            );
+        }
+    }
+
+    /// The size ceiling is measured in bytes, and the boundary was confirmed
+    /// from both sides live: `repeat('a', 1073741820)` errors while
+    /// `repeat('a', 1073741819)` does not. Only the erroring side is asserted
+    /// — the accepted side is a gigabyte.
+    ///
+    /// The empty-string row is the one that shows the check is a *product*
+    /// and not a bound on the count alone: `repeat('', 2147483647)` succeeds
+    /// (the live server returns `''`, slowly) because zero bytes repeated any
+    /// number of times still fits.
+    #[test]
+    fn repeat_checks_bytes_times_count_not_the_count_alone() {
+        let too_big = sf(OID_REPEAT, vec![lit_text("a"), lit_i32(1_073_741_820)]);
+        let err = eval(&too_big, &one_row()).unwrap_err();
+        assert!(
+            format!("{err}").contains("requested length too large"),
+            "got {err}"
+        );
+
+        let empty = sf(OID_REPEAT, vec![lit_text(""), lit_i32(i32::MAX)]);
+        assert_eq!(str_array(&eval(&empty, &one_row()).unwrap()).value(0), "");
+    }
+
+    #[test]
+    fn repeat_of_null_is_null() {
+        let expr = sf(OID_REPEAT, vec![lit_text_null(), lit_i32(3)]);
+        assert!(eval(&expr, &one_row()).unwrap().is_null(0));
+    }
+
+    // ─── split_part (oid 2088) ──────────────────────────────────────────
+
+    /// The full live-verified table, including the negative indices Postgres
+    /// grew in version 14. Out of range in *either* direction is an empty
+    /// string, not an error — only a field position of zero errors, and that
+    /// is covered separately below.
+    #[test]
+    fn split_part_indexes_from_either_end_and_runs_off_quietly() {
+        for (field, expected) in [
+            (1i32, "a"),
+            (2, "b"),
+            (3, "c"),
+            (4, ""),
+            (i32::MAX, ""),
+            (-1, "c"),
+            (-2, "b"),
+            (-3, "a"),
+            (-4, ""),
+            (i32::MIN, ""),
+        ] {
+            let expr = sf(
+                OID_SPLIT_PART,
+                vec![lit_text("a,b,c"), lit_text(","), lit_i32(field)],
+            );
+            assert_eq!(
+                str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+                expected,
+                "split_part('a,b,c', ',', {field})"
+            );
+        }
+    }
+
+    /// Zero is the one field position that errors — `ERROR: field position
+    /// must not be zero` on the live server — because it is the one value
+    /// with no non-arbitrary reading once negative positions count from the
+    /// right.
+    #[test]
+    fn split_part_field_zero_errors() {
+        let expr = sf(
+            OID_SPLIT_PART,
+            vec![lit_text("a,b,c"), lit_text(","), lit_i32(0)],
+        );
+        let err = eval(&expr, &one_row()).unwrap_err();
+        assert!(
+            format!("{err}").contains("field position must not be zero"),
+            "got {err}"
+        );
+    }
+
+    /// **Strictness beats the zero-field error**, exactly as it beats the
+    /// size check in [`pad_of_null_is_null_even_at_a_length_that_would_error`]:
+    /// `split_part(NULL, ',', 0)` is NULL on the live server, not an error.
+    #[test]
+    fn split_part_of_null_is_null_even_at_the_field_position_that_errors() {
+        let expr = sf(
+            OID_SPLIT_PART,
+            vec![lit_text_null(), lit_text(","), lit_i32(0)],
+        );
+        assert!(eval(&expr, &one_row()).unwrap().is_null(0));
+    }
+
+    /// An empty delimiter does not split at every character boundary the way
+    /// Rust's `str::split("")` would — Postgres treats the whole subject as a
+    /// single field, reachable as field `1` or `-1` and nowhere else. Rust's
+    /// own behaviour here would yield `''` for field 1 (its leading empty
+    /// match), so this is a genuine divergence that has to be special-cased,
+    /// not an accident that works out.
+    #[test]
+    fn split_part_with_an_empty_delimiter_makes_exactly_one_field() {
+        for (field, expected) in [(1i32, "a,b,c"), (-1, "a,b,c"), (2, ""), (-2, "")] {
+            let expr = sf(
+                OID_SPLIT_PART,
+                vec![lit_text("a,b,c"), lit_text(""), lit_i32(field)],
+            );
+            assert_eq!(
+                str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+                expected,
+                "split_part('a,b,c', '', {field})"
+            );
+        }
+    }
+
+    /// A multi-character delimiter is matched as a unit, and matching is on
+    /// characters not bytes. Verified live: `split_part('axxbxxc', 'xx', 2) =
+    /// 'b'` and `split_part('a世b世c', '世', 2) = 'b'`.
+    #[test]
+    fn split_part_delimiter_can_be_multi_character_and_multi_byte() {
+        let ascii = sf(
+            OID_SPLIT_PART,
+            vec![lit_text("axxbxxc"), lit_text("xx"), lit_i32(2)],
+        );
+        assert_eq!(str_array(&eval(&ascii, &one_row()).unwrap()).value(0), "b");
+
+        let utf8 = sf(
+            OID_SPLIT_PART,
+            vec![lit_text("a世b世c"), lit_text("世"), lit_i32(2)],
+        );
+        assert_eq!(str_array(&eval(&utf8, &one_row()).unwrap()).value(0), "b");
+    }
+
+    /// A trailing delimiter makes a trailing EMPTY field, not one fewer
+    /// field. Verified live that both `split_part('a,b,', ',', 3)` and
+    /// `split_part('a,b,', ',', -1)` are `''` — the third field exists and is
+    /// empty, so counting from the right lands on it rather than on `'b'`.
+    #[test]
+    fn split_part_counts_the_empty_field_a_trailing_delimiter_creates() {
+        for field in [3i32, -1] {
+            let expr = sf(
+                OID_SPLIT_PART,
+                vec![lit_text("a,b,"), lit_text(","), lit_i32(field)],
+            );
+            assert_eq!(
+                str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+                "",
+                "split_part('a,b,', ',', {field})"
+            );
+        }
+
+        let second = sf(
+            OID_SPLIT_PART,
+            vec![lit_text("a,b,"), lit_text(","), lit_i32(-2)],
+        );
+        assert_eq!(str_array(&eval(&second, &one_row()).unwrap()).value(0), "b");
+    }
+
+    // ─── age (oid 2058) ─────────────────────────────────────────────────
+
+    /// A one-row batch of two `timestamp` columns, in microseconds since the
+    /// Unix epoch — the physical layout `basin_pgtype` maps `oid::TIMESTAMP`
+    /// onto.
+    fn batch_ts2(a: Option<i64>, b: Option<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "a",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "b",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![a])),
+                Arc::new(TimestampMicrosecondArray::from(vec![b])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn age_of(a: i64, b: i64) -> (i32, i32, i64) {
+        let expr = sf(OID_AGE_TIMESTAMP, vec![col(0, "a"), col(1, "b")]);
+        let out = eval(&expr, &batch_ts2(Some(a), Some(b))).unwrap();
+        let arr = out
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .expect("age must produce an interval");
+        let v = arr.value(0);
+        (v.months, v.days, v.nanoseconds / 1_000)
+    }
+
+    /// The whole battery below was read off a live PostgreSQL 18 in one
+    /// query, as `(months, days, microseconds)` triples — the components
+    /// Postgres's own interval is made of, rather than a rendered string,
+    /// so the comparison does not depend on `IntervalStyle`.
+    ///
+    /// The randomly-generated rows (dates from 1948 to 2030, both signs, all
+    /// with sub-second parts) are there to catch an arithmetic slip that a
+    /// hand-picked table would miss; the named rows underneath them each pin
+    /// one specific rule.
+    #[test]
+    fn age_matches_postgres_on_a_live_generated_battery() {
+        // (dt1_micros, dt2_micros, months, days, microseconds)
+        for (a, b, months, days, micros) in [
+            (294133569060641i64, 1649464880103772i64, -515i32, -10i32, -60911043131i64),
+            (1196480441821458, -297619335288745, 568, 4, 70977110203),
+            (986860800000000, -396144000000000, 525, 27, 0),
+            (1710496800000000, 1674217800000000, 13, 25, 77400000000),
+            (1674217800000000, 1710496800000000, -13, -25, -77400000000),
+            (-679436915203395, 1106406793005636, -679, -1, -42108209031),
+            (1591011357052563, -389228188903659, 753, 0, 37945956222),
+            (728458469454512, -128433918397942, 325, 24, 63587852454),
+            (-283367683917185, -180557464851359, -39, -3, -80619065826),
+            (-614266883503917, 828173074396397, -548, -14, -78357900314),
+        ] {
+            assert_eq!(
+                age_of(a, b),
+                (months, days, micros),
+                "age({a}, {b}) as (months, days, microseconds)"
+            );
+        }
+    }
+
+    /// **The borrow takes its day count from the earlier argument's month.**
+    /// These two rows are the discriminating pair: 2000 is a leap year and
+    /// 1900 is not, so a borrow that counted the days of the intervening
+    /// *February* would answer `1 mon 1 day` for one and `1 mon 2 days` for
+    /// the other. The live server answers `1 mon 1 day` for both — it borrows
+    /// 31 days from January either way.
+    #[test]
+    fn age_borrows_days_from_the_earlier_arguments_month_not_the_month_between() {
+        // 2000-03-01 vs 2000-01-31, then 1900-03-01 vs 1900-01-31.
+        assert_eq!(age_of(951868800000000, 949276800000000), (1, 1, 0));
+        assert_eq!(age_of(-2203891200000000, -2206396800000000), (1, 1, 0));
+    }
+
+    /// `age` is a symbolic difference, not an elapsed duration: these two
+    /// pairs are 60 and 30 days apart respectively, and the answers are
+    /// `2 mons` and `1 mon 1 day`. Any implementation that divided a
+    /// microsecond count by an average month length would get both wrong.
+    #[test]
+    fn age_is_symbolic_not_an_elapsed_duration() {
+        // 2024-03-31 vs 2024-01-31 (60 days apart) is a whole 2 months.
+        assert_eq!(age_of(1711843200000000, 1706659200000000), (2, 0, 0));
+        // 2024-03-01 vs 2024-01-31 (30 days apart) is NOT 1 month.
+        assert_eq!(age_of(1709251200000000, 1706659200000000), (1, 1, 0));
+    }
+
+    /// Reversing the arguments negates every component — Postgres does not
+    /// return a mixed-sign interval. Verified live:
+    /// `age('2023-01-20 12:30','2024-03-15 10:00')` is
+    /// `-1 years -1 mons -25 days -21:30:00`.
+    #[test]
+    fn age_reversed_negates_every_component() {
+        let forwards = age_of(1710496800000000, 1674217800000000);
+        let backwards = age_of(1674217800000000, 1710496800000000);
+        assert_eq!(forwards, (13, 25, 77400000000));
+        assert_eq!(
+            backwards,
+            (-forwards.0, -forwards.1, -forwards.2),
+            "every component flips sign together"
+        );
+    }
+
+    /// Equal arguments are a zero interval, and a sub-second difference is
+    /// carried all the way down without disturbing the date fields.
+    /// `age('2020-03-01', '2020-02-29 23:59:59.999999')` is one microsecond
+    /// on the live server — across a leap day, in a leap year.
+    #[test]
+    fn age_of_equal_timestamps_is_zero_and_a_microsecond_survives() {
+        assert_eq!(age_of(1710460800000000, 1710460800000000), (0, 0, 0));
+        assert_eq!(age_of(1583020800000000, 1583020799999999), (0, 0, 1));
+    }
+
+    #[test]
+    fn age_is_strict_in_both_arguments() {
+        let expr = sf(OID_AGE_TIMESTAMP, vec![col(0, "a"), col(1, "b")]);
+        for (a, b) in [(None, Some(0i64)), (Some(0i64), None), (None, None)] {
+            let out = eval(&expr, &batch_ts2(a, b)).unwrap();
+            assert!(out.is_null(0), "age({a:?}, {b:?}) must be NULL");
+        }
+    }
+
+    /// The three `age` overloads that need session state must NOT resolve
+    /// here — falling through to the "not implemented" arm is the intended
+    /// outcome, not an oversight. `age(timestamptz, timestamptz)` is the
+    /// dangerous one: it looks like a pure function of two instants but its
+    /// answer depends on the session timezone (verified live across the US
+    /// DST boundary), so a plausible-looking implementation here would return
+    /// a confidently wrong answer instead of falling back.
+    #[test]
+    fn the_session_dependent_age_overloads_are_left_unimplemented() {
+        for oid_val in [1199u32, 1386, 2059] {
+            let expr = sf(oid_val, vec![col(0, "a"), col(1, "b")]);
+            let err = eval(&expr, &batch_ts2(Some(0), Some(0))).unwrap_err();
+            assert!(
+                format!("{err}").contains("is not implemented in eval yet"),
+                "oid {oid_val} must fall through, got {err}"
+            );
+        }
+    }
+
+    /// The calendar decomposition `age` is built on, checked directly at the
+    /// boundaries most likely to be off by one: the epoch itself, the day
+    /// before it (a negative day number, where truncating division would put
+    /// the time of day on the wrong date), and both century leap rules.
+    #[test]
+    fn civil_from_micros_handles_pre_epoch_and_the_century_leap_rules() {
+        assert_eq!(civil_from_micros(0), (1970, 1, 1, 0, 0, 0, 0));
+        assert_eq!(civil_from_micros(-1), (1969, 12, 31, 23, 59, 59, 999_999));
+        assert_eq!(
+            civil_from_micros(-86_400_000_000),
+            (1969, 12, 31, 0, 0, 0, 0)
+        );
+        assert!(is_leap_year(2000), "divisible by 400");
+        assert!(!is_leap_year(1900), "divisible by 100 but not 400");
+        assert!(is_leap_year(2024));
+        assert_eq!(days_in_month(2000, 2), 29);
+        assert_eq!(days_in_month(1900, 2), 28);
+    }
+
+    /// The new string functions are per-row over real columns, not just
+    /// literals, and each keeps NULL rows NULL without disturbing the
+    /// alignment of the rows around them.
+    #[test]
+    fn the_new_string_functions_are_row_wise_over_a_column() {
+        let batch = batch_str1("s", vec![Some("hello"), None, Some("ab")]);
+        for (oid_val, args, expected) in [
+            (
+                OID_INITCAP,
+                vec![col(0, "s")],
+                vec![Some("Hello"), None, Some("Ab")],
+            ),
+            (
+                OID_LPAD_3,
+                vec![col(0, "s"), lit_i32(6), lit_text("*")],
+                vec![Some("*hello"), None, Some("****ab")],
+            ),
+            (
+                OID_RPAD_3,
+                vec![col(0, "s"), lit_i32(6), lit_text("*")],
+                vec![Some("hello*"), None, Some("ab****")],
+            ),
+            (
+                OID_REPEAT,
+                vec![col(0, "s"), lit_i32(2)],
+                vec![Some("hellohello"), None, Some("abab")],
+            ),
+        ] {
+            let expr = sf(oid_val, args);
+            let out = eval(&expr, &batch).unwrap();
+            let arr = str_array(&out);
+            assert_eq!(arr.len(), 3);
+            for (i, want) in expected.iter().enumerate() {
+                match want {
+                    Some(w) => assert_eq!(arr.value(i), *w, "oid {oid_val} row {i}"),
+                    None => assert!(arr.is_null(i), "oid {oid_val} row {i} must be NULL"),
+                }
+            }
+        }
     }
 
     // ─── position (oid 849) ─────────────────────────────────────────────
