@@ -403,6 +403,80 @@ impl Operator for Distinct {
 // SetOp
 // ============================================================================
 
+/// Combine both sides' schemas into one, taking the left side's column names,
+/// types and metadata but computing each column's nullability with `merge`.
+///
+/// A set operation reports the LEFT side's column names — that part matches
+/// Postgres, which names a `UNION`'s output after its first branch. Taking
+/// the left side's *nullability* along with them was a bug: a set operation
+/// puts rows from both sides into one batch under one declared schema, and
+/// `RecordBatch::try_new` rejects a `NOT NULL` field holding a NULL. With
+/// `t.id BIGINT NOT NULL` and `u.tid BIGINT`, `SELECT id FROM t UNION ALL
+/// SELECT tid FROM u` failed exactly there. The wrong rule had been here all
+/// along, invisible while `project.rs` declared every column nullable and so
+/// never handed this a `NOT NULL` left side to over-claim from.
+///
+/// The caller is responsible for having checked arity first; the `zip` here
+/// would otherwise silently truncate to the shorter side.
+fn merge_schemas(
+    left: &SchemaRef,
+    right: &SchemaRef,
+    merge: impl Fn(bool, bool) -> bool,
+) -> SchemaRef {
+    let fields: Vec<Field> = left
+        .fields()
+        .iter()
+        .zip(right.fields().iter())
+        .map(|(l, r)| {
+            l.as_ref()
+                .clone()
+                .with_nullable(merge(l.is_nullable(), r.is_nullable()))
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, left.metadata().clone()))
+}
+
+/// Whether an output column of `op` can hold a NULL, given whether each side's
+/// corresponding column can. Per operator, because the three differ and the
+/// difference is worth having — see the three arms.
+///
+/// Verified against live Postgres 18.2 two ways, since Postgres exposes no
+/// nullability for a set operation on the wire:
+///
+///   - **By value.** `SELECT id FROM t UNION ALL SELECT tid FROM u` returns a
+///     NULL row: a `NOT NULL` left branch does not stop a nullable right
+///     branch contributing NULLs. The `INTERSECT` and `EXCEPT ALL` forms of
+///     the same pair return no NULL at all.
+///
+///   - **By the planner**, the sharper instrument. `EXPLAIN (COSTS OFF)
+///     SELECT * FROM (SELECT id AS v FROM t UNION ALL SELECT uid FROM u) s
+///     WHERE v IS NOT NULL` — both branches `NOT NULL` — DELETES the
+///     `IS NOT NULL` filter, having proven it cannot fail. Swap `uid` for the
+///     nullable `tid` and the filter SURVIVES on that branch.
+///
+/// Postgres's planner does not go on to prove the `INTERSECT`/`EXCEPT` cases
+/// below (it keeps the filter for both), but that is a missing optimisation
+/// on its part, not a disagreement: no query shape can observe a NULL where
+/// these arms say there is none, and the arguments are given per arm.
+fn setop_column_is_nullable(op: SetOpKind, left: bool, right: bool) -> bool {
+    match op {
+        // A UNION emits rows from both sides, so either side's NULL reaches
+        // the output. This is the arm the regression was about.
+        SetOpKind::Union => left || right,
+        // A row survives an INTERSECT only by appearing on BOTH sides, so a
+        // NULL in the output needs that same NULL-bearing row present on both
+        // — impossible if either side's column cannot hold one. (NULL matches
+        // NULL here, per this module's header: the row encoding gives every
+        // NULL the same key bytes. That is what makes the match possible at
+        // all, and it still requires a NULL on each side.)
+        SetOpKind::Intersect => left && right,
+        // An EXCEPT emits a subset of the LEFT side's rows and never a right
+        // side row, so the right side cannot contribute a NULL no matter what
+        // it holds — it can only ever remove rows.
+        SetOpKind::Except => left,
+    }
+}
+
 /// `UNION` / `INTERSECT` / `EXCEPT`, each with and without `ALL`.
 ///
 /// # Blocking
@@ -428,11 +502,27 @@ impl Operator for Distinct {
 ///
 /// # Output schema
 ///
-/// The output adopts the left side's schema (names and declared nullability)
-/// — matching Postgres, which reports the left side's column names for a
-/// `UNION`. See `output_schema_uses_the_left_sides_column_names` below. Which
-/// side's copy of a row becomes the "representative" when a key appears on
-/// both sides is an internal bookkeeping detail (arrival order — the two
+/// The output takes the left side's column *names and types* — matching
+/// Postgres, which reports the left side's column names for a `UNION`. See
+/// `output_schema_uses_the_left_sides_column_names` below.
+///
+/// Nullability is the one thing it does NOT take from the left alone; it is
+/// merged across both sides by [`setop_column_is_nullable`], which see for
+/// the rule and the live-Postgres evidence behind it.
+///
+/// That produces TWO schemas, because a set operation's *intermediate* batch
+/// is more permissive than its output. Both sides are concatenated before any
+/// row is eliminated, so that intermediate carries whatever either side holds
+/// and is declared under `working_schema` (nullable if either side is). The
+/// surviving rows are then re-declared under `schema`, which is what
+/// [`Operator::schema`] reports: for `UNION` the two are identical, but
+/// `INTERSECT` and `EXCEPT` can eliminate every NULL a side contributed and
+/// so declare `NOT NULL` where the intermediate could not. Doing this in one
+/// schema would force a choice between rejecting the intermediate and
+/// under-reporting the output.
+///
+/// Which side's copy of a row becomes the "representative" when a key appears
+/// on both sides is an internal bookkeeping detail (arrival order — the two
 /// sides are concatenated left-then-right before keys are computed, so the
 /// left side's occurrence is always seen first), not an observable one: the
 /// key IS the whole row for `SetOp` (unlike `Distinct ON`, which keys on a
@@ -444,7 +534,13 @@ pub struct SetOp {
     op: SetOpKind,
     all: bool,
     budget: usize,
+    /// What [`Operator::schema`] reports and the surviving rows are declared
+    /// under — nullability per [`setop_column_is_nullable`].
     schema: SchemaRef,
+    /// What the concatenation of both sides is declared under, before any row
+    /// is eliminated: nullable wherever either side is. Never narrower than
+    /// `schema`.
+    working_schema: SchemaRef,
     row_converter: RowConverter,
     bytes_used: usize,
     done: bool,
@@ -468,7 +564,15 @@ impl SetOp {
             )));
         }
 
-        let key_fields: Vec<SortField> = left_schema
+        // Both schemas are built here, before anything else reads either —
+        // see the struct doc's "Output schema". The arity check above has
+        // already established the two field lists zip evenly.
+        let schema = merge_schemas(&left_schema, &right_schema, |l, r| {
+            setop_column_is_nullable(op, l, r)
+        });
+        let working_schema = merge_schemas(&left_schema, &right_schema, |l, r| l || r);
+
+        let key_fields: Vec<SortField> = schema
             .fields()
             .iter()
             .map(|f| SortField::new(f.data_type().clone()))
@@ -482,7 +586,8 @@ impl SetOp {
             op,
             all,
             budget: memory_budget,
-            schema: left_schema,
+            schema,
+            working_schema,
             row_converter,
             bytes_used: 0,
             done: false,
@@ -517,6 +622,27 @@ impl SetOp {
         };
         Ok((combined, bytes))
     }
+
+    /// Re-declare `batch` — built under the permissive `working_schema` — as
+    /// the operator's actual output schema. The two differ only in
+    /// nullability, and only for `INTERSECT`/`EXCEPT`, so the column data is
+    /// reused untouched; this is a relabelling, not a conversion. (The same
+    /// shape `recursive.rs`'s anchor-schema wrapper uses, and for the same
+    /// reason: [`Operator::schema`] promises every batch carries exactly the
+    /// schema it reports.)
+    ///
+    /// It can fail, and that is the point. `INTERSECT`'s and `EXCEPT`'s
+    /// narrower declarations rest on an argument about which rows can survive
+    /// (see [`setop_column_is_nullable`]); if that argument were ever wrong,
+    /// `RecordBatch::try_new` rejects a `NOT NULL` field holding a NULL right
+    /// here, rather than letting a wrong `RowDescription` reach the client.
+    fn declare_output(&self, batch: RecordBatch) -> Result<RecordBatch, ExecError> {
+        if batch.schema_ref() == &self.schema {
+            return Ok(batch);
+        }
+        RecordBatch::try_new(Arc::clone(&self.schema), batch.columns().to_vec())
+            .map_err(arrow_err)
+    }
 }
 
 impl Operator for SetOp {
@@ -536,8 +662,11 @@ impl Operator for SetOp {
         self.bytes_used = bytes_total;
 
         let num_left = left_batch.num_rows();
+        // Under `working_schema`, not `schema`: nothing has been eliminated
+        // yet, so this batch still holds every NULL either side contributed —
+        // including, for `INTERSECT`/`EXCEPT`, ones that will not survive.
         let combined =
-            concat_batches(&self.schema, [&left_batch, &right_batch]).map_err(arrow_err)?;
+            concat_batches(&self.working_schema, [&left_batch, &right_batch]).map_err(arrow_err)?;
         let total_rows = combined.num_rows();
         if total_rows == 0 {
             return Ok(None);
@@ -546,7 +675,7 @@ impl Operator for SetOp {
         // `UNION ALL` is a plain concatenation — every row from both sides,
         // no deduplication, no row-key bookkeeping needed at all.
         if self.op == SetOpKind::Union && self.all {
-            return Ok(Some(combined));
+            return self.declare_output(combined).map(Some);
         }
 
         let rows = self
@@ -622,7 +751,8 @@ impl Operator for SetOp {
         if idx.is_empty() {
             return Ok(None);
         }
-        take_batch(&combined, &UInt32Array::from(idx)).map(Some)
+        let survivors = take_batch(&combined, &UInt32Array::from(idx))?;
+        self.declare_output(survivors).map(Some)
     }
 
     fn memory_used(&self) -> usize {
@@ -1114,6 +1244,266 @@ mod tests {
         let r = Feed::boxed(right_schema, vec![]);
         let op = SetOp::new(l, r, SetOpKind::Union, false, 1 << 30).unwrap();
         assert_eq!(op.schema().field(0).name(), "left_name");
+    }
+
+    // ── Output schema: nullability ──────────────────────────────────────
+    //
+    // The regression these guard against: `SetOp` used to adopt the left
+    // side's schema WHOLE, nullability included. That was invisible for as
+    // long as `project.rs` declared every column nullable, and became a live
+    // error the moment it started inferring — `SELECT id FROM t UNION ALL
+    // SELECT tid FROM u` (`t.id BIGINT NOT NULL`, `u.tid BIGINT`) failed at
+    // `RecordBatch::try_new`, because the combined batch carries the right
+    // side's NULLs under the left side's `NOT NULL` field.
+    //
+    // A schema-only assertion would not have caught it (nothing checks a
+    // declared schema against reality until data arrives), and a data-only
+    // assertion would not have said why. So both, on the same operators.
+
+    /// A one-column `Int32` schema declared `NOT NULL` — the left side of
+    /// every test below, standing in for a `BIGINT NOT NULL` table column.
+    fn schema_1i32_notnull(name: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]))
+    }
+
+    // The exact shape that regressed, with the value assertion that says the
+    // NULL is not merely tolerated but RETURNED — live Postgres 18.2 answers
+    // `1, 2, NULL` for `SELECT id FROM t UNION ALL SELECT tid FROM u` reduced
+    // to this data.
+    #[test]
+    fn union_all_of_a_notnull_left_and_a_nullable_right_keeps_the_right_sides_null() {
+        let left_schema = schema_1i32_notnull("id");
+        let right_schema = schema_1i32("tid");
+        let l = Feed::boxed(
+            left_schema.clone(),
+            vec![batch_i32(&left_schema, vec![Some(1)])],
+        );
+        let r = Feed::boxed(
+            right_schema.clone(),
+            vec![batch_i32(&right_schema, vec![Some(2), None])],
+        );
+        let mut op = SetOp::new(l, r, SetOpKind::Union, true, 1 << 30).unwrap();
+
+        assert!(
+            op.schema().field(0).is_nullable(),
+            "a NULL arrives from the right side, so the output column is nullable"
+        );
+        let out = op
+            .next_batch()
+            .expect("a nullable output column accepts the right side's NULL")
+            .expect("three rows");
+        assert_eq!(col_i32(&out, 0), vec![Some(1), Some(2), None]);
+    }
+
+    // The sweep, and the test that would have caught the regression before it
+    // was committed. Every kind, with and without ALL, concatenates both sides
+    // before any kind-specific logic runs, so a left-only nullability rule
+    // breaks all six — including the ones whose final answer contains no NULL
+    // at all. Testing only the shape that happened to get reported would have
+    // left five equally broken paths behind.
+    //
+    // The declared nullability is checked against `setop_column_is_nullable`
+    // rather than a literal, so this stays a statement about the operator
+    // agreeing with the rule; the rule itself is pinned separately by
+    // `the_nullability_rule_differs_per_operator` below.
+    #[test]
+    fn a_nullable_right_side_never_makes_the_output_reject_its_nulls() {
+        for kind in [SetOpKind::Union, SetOpKind::Intersect, SetOpKind::Except] {
+            for all in [false, true] {
+                let left_schema = schema_1i32_notnull("id");
+                let right_schema = schema_1i32("tid");
+                let l = Feed::boxed(
+                    left_schema.clone(),
+                    vec![batch_i32(&left_schema, vec![Some(1), Some(2)])],
+                );
+                let r = Feed::boxed(
+                    right_schema.clone(),
+                    vec![batch_i32(&right_schema, vec![Some(2), None])],
+                );
+                let mut op = SetOp::new(l, r, kind, all, 1 << 30).unwrap();
+                assert_eq!(
+                    op.schema().field(0).is_nullable(),
+                    setop_column_is_nullable(kind, false, true),
+                    "{kind:?} all={all}: declared nullability disagrees with the rule"
+                );
+                // The regression signal: this errored for all six.
+                op.next_batch().unwrap_or_else(|e| {
+                    panic!("{kind:?} all={all} rejected the right side's NULL: {e}")
+                });
+            }
+        }
+    }
+
+    // The rule itself, as a truth table, so the three operators cannot quietly
+    // collapse into one. Each `false` is an argument about which rows survive,
+    // not a measurement — see `setop_column_is_nullable`.
+    #[test]
+    fn the_nullability_rule_differs_per_operator() {
+        use SetOpKind::{Except, Intersect, Union};
+        // A UNION emits both sides' rows: either side's NULL reaches the
+        // output.
+        assert!(!setop_column_is_nullable(Union, false, false));
+        assert!(setop_column_is_nullable(Union, false, true));
+        assert!(setop_column_is_nullable(Union, true, false));
+        assert!(setop_column_is_nullable(Union, true, true));
+        // An INTERSECT needs the NULL-bearing row on BOTH sides.
+        assert!(!setop_column_is_nullable(Intersect, false, false));
+        assert!(!setop_column_is_nullable(Intersect, false, true));
+        assert!(!setop_column_is_nullable(Intersect, true, false));
+        assert!(setop_column_is_nullable(Intersect, true, true));
+        // An EXCEPT emits only left-side rows; the right side can remove rows
+        // but never contribute one.
+        assert!(!setop_column_is_nullable(Except, false, false));
+        assert!(!setop_column_is_nullable(Except, false, true));
+        assert!(setop_column_is_nullable(Except, true, false));
+        assert!(setop_column_is_nullable(Except, true, true));
+    }
+
+    // `INTERSECT` against a `NOT NULL` side, with the data that proves the
+    // narrower declaration honest: the right side's NULL is present in the
+    // materialized concatenation and eliminated by the intersection, so the
+    // output really does hold no NULL. Live Postgres 18.2 agrees by value —
+    // `SELECT id FROM t INTERSECT SELECT tid FROM u` returns `1, 2` and no
+    // NULL row.
+    #[test]
+    fn intersect_with_one_notnull_side_reports_notnull_and_drops_the_null() {
+        let left_schema = schema_1i32_notnull("id");
+        let right_schema = schema_1i32("tid");
+        let l = Feed::boxed(
+            left_schema.clone(),
+            vec![batch_i32(&left_schema, vec![Some(1), Some(2)])],
+        );
+        let r = Feed::boxed(
+            right_schema.clone(),
+            vec![batch_i32(&right_schema, vec![Some(2), None])],
+        );
+        let mut op = SetOp::new(l, r, SetOpKind::Intersect, false, 1 << 30).unwrap();
+
+        assert!(
+            !op.schema().field(0).is_nullable(),
+            "a NULL cannot survive an INTERSECT unless both sides can hold one"
+        );
+        let out = op.next_batch().unwrap().expect("one row");
+        assert_eq!(col_i32(&out, 0), vec![Some(2)]);
+    }
+
+    // Two nullable sides is the case where `INTERSECT` really can emit a NULL
+    // — the other half of `left && right`, and the reason it is not simply
+    // `false`. Live Postgres: `SELECT tid FROM u INTERSECT SELECT tid FROM u`
+    // keeps the NULL row.
+    #[test]
+    fn intersect_of_two_nullable_sides_keeps_the_null() {
+        let schema = schema_1i32("tid");
+        let l = Feed::boxed(
+            schema.clone(),
+            vec![batch_i32(&schema, vec![Some(1), None])],
+        );
+        let r = Feed::boxed(
+            schema.clone(),
+            vec![batch_i32(&schema, vec![Some(1), None])],
+        );
+        let mut op = SetOp::new(l, r, SetOpKind::Intersect, false, 1 << 30).unwrap();
+
+        assert!(op.schema().field(0).is_nullable());
+        let out = op.next_batch().unwrap().expect("two rows");
+        assert_eq!(col_i32(&out, 0), vec![Some(1), None]);
+    }
+
+    // `EXCEPT` ignores the right side's nullability entirely: its output is a
+    // subset of the LEFT side's rows. Live Postgres 18.2: `SELECT id FROM t
+    // EXCEPT ALL SELECT tid FROM u` returns no NULL row even though `u.tid`
+    // holds one.
+    #[test]
+    fn except_takes_its_nullability_from_the_left_side_alone() {
+        let left_schema = schema_1i32_notnull("id");
+        let right_schema = schema_1i32("tid");
+        let l = Feed::boxed(
+            left_schema.clone(),
+            vec![batch_i32(&left_schema, vec![Some(1), Some(3)])],
+        );
+        let r = Feed::boxed(
+            right_schema.clone(),
+            vec![batch_i32(&right_schema, vec![Some(1), None])],
+        );
+        let mut op = SetOp::new(l, r, SetOpKind::Except, true, 1 << 30).unwrap();
+
+        assert!(
+            !op.schema().field(0).is_nullable(),
+            "the right side's NULL can only remove rows, never appear in them"
+        );
+        let out = op.next_batch().unwrap().expect("one row");
+        assert_eq!(col_i32(&out, 0), vec![Some(3)]);
+    }
+
+    // Nullability is merged, not inherited from whichever side happens to be
+    // second: a nullable LEFT and a `NOT NULL` right is nullable too, and the
+    // left's own NULL survives.
+    #[test]
+    fn a_nullable_left_side_makes_the_output_nullable_too() {
+        let left_schema = schema_1i32("tid");
+        let right_schema = schema_1i32_notnull("id");
+        let l = Feed::boxed(
+            left_schema.clone(),
+            vec![batch_i32(&left_schema, vec![Some(1), None])],
+        );
+        let r = Feed::boxed(
+            right_schema.clone(),
+            vec![batch_i32(&right_schema, vec![Some(2)])],
+        );
+        let mut op = SetOp::new(l, r, SetOpKind::Union, true, 1 << 30).unwrap();
+
+        assert!(op.schema().field(0).is_nullable());
+        let out = op.next_batch().unwrap().expect("three rows");
+        assert_eq!(col_i32(&out, 0), vec![Some(1), None, Some(2)]);
+    }
+
+    // The other half of the rule, and the reason it is `||` rather than a
+    // blanket `true`: two `NOT NULL` sides still report `NOT NULL`. Postgres
+    // agrees — `EXPLAIN (COSTS OFF)` over a `UNION ALL` of two `NOT NULL`
+    // columns DELETES an `IS NOT NULL` filter above it, having proven it
+    // cannot fail. Widening everything back to nullable here would fix the
+    // error by giving up the inference that motivated it.
+    #[test]
+    fn two_notnull_sides_stay_notnull() {
+        let left_schema = schema_1i32_notnull("id");
+        let right_schema = schema_1i32_notnull("uid");
+        let l = Feed::boxed(
+            left_schema.clone(),
+            vec![batch_i32(&left_schema, vec![Some(1)])],
+        );
+        let r = Feed::boxed(
+            right_schema.clone(),
+            vec![batch_i32(&right_schema, vec![Some(2)])],
+        );
+        let mut op = SetOp::new(l, r, SetOpKind::Union, true, 1 << 30).unwrap();
+
+        assert!(
+            !op.schema().field(0).is_nullable(),
+            "neither side can produce a NULL, so the output column keeps NOT NULL"
+        );
+        let out = op.next_batch().unwrap().expect("two rows");
+        assert_eq!(col_i32(&out, 0), vec![Some(1), Some(2)]);
+    }
+
+    // Per column, not per operator: a two-column set operation merges each
+    // position independently, so one nullable column does not drag the other
+    // along with it.
+    #[test]
+    fn nullability_is_merged_column_by_column() {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("c", DataType::Int32, false),
+            Field::new("d", DataType::Int32, true),
+        ]));
+        let l = Feed::boxed(left_schema, vec![]);
+        let r = Feed::boxed(right_schema, vec![]);
+        let op = SetOp::new(l, r, SetOpKind::Union, false, 1 << 30).unwrap();
+
+        assert!(!op.schema().field(0).is_nullable(), "NOT NULL on both sides");
+        assert!(op.schema().field(1).is_nullable(), "nullable on the right");
     }
 
     // Multi-batch input on both sides: the whole point of materializing
