@@ -221,15 +221,21 @@ use arrow::compute::kernels::{
 };
 use arrow_array::{
     new_null_array,
+    timezone::Tz,
     types::{
         Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
         IntervalMonthDayNano, IntervalMonthDayNanoType,
     },
-    Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float32Array, Float64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array,
     Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
 use arrow_schema::{ArrowError, DataType};
+use chrono::{
+    offset::MappedLocalTime, DateTime, Datelike, NaiveDate, NaiveDateTime, Offset, TimeDelta,
+    TimeZone as _, Timelike,
+};
 
 use basin_pgtype::{physical, Oid, PgType};
 use basin_plan::{BoolTest, ColumnRef, Datum as PlanDatum, Expr, FuncId, OpId};
@@ -371,6 +377,16 @@ const OID_SPLIT_PART: u32 = 2088; // split_part(text, text, integer)
 // them.
 const OID_AGE_TIMESTAMP: u32 = 2058; // age(timestamp, timestamp)
 
+// `date_trunc` / `date_part`. The three `timestamptz` overloads read the
+// session's `TimeZone` out of [`EvalSession`]; the `timestamp`, `date` and
+// `interval` ones do not, and are pure functions of their arguments.
+const OID_DATE_TRUNC_TIMESTAMPTZ: u32 = 1217; // date_trunc(text, timestamptz)
+const OID_DATE_TRUNC_TIMESTAMP: u32 = 2020; // date_trunc(text, timestamp)
+const OID_DATE_TRUNC_INTERVAL: u32 = 1218; // date_trunc(text, interval)
+const OID_DATE_PART_TIMESTAMPTZ: u32 = 1171; // date_part(text, timestamptz)
+const OID_DATE_PART_TIMESTAMP: u32 = 2021; // date_part(text, timestamp)
+const OID_DATE_PART_DATE: u32 = 1384; // date_part(text, date)
+
 // ─── Math — trig/log/exp/power (see docs/migration/df-removal/19-expires-at-removal.md
 // entry 1: these OIDs already existed in `basin_pgtype::func::FUNCS` as
 // planner-resolution groundwork, unbacked here. Every OID below was read from
@@ -406,44 +422,250 @@ const OID_COS_FLOAT8: u32 = 1605; // cos(double precision)
 const OID_SIN_FLOAT8: u32 = 1604; // sin(double precision)
 const OID_TAN_FLOAT8: u32 = 1606; // tan(double precision)
 
+// ─── Session context ────────────────────────────────────────────────────────
+
+/// The session state a scalar expression is evaluated *against*.
+///
+/// # Why this type exists
+///
+/// A surprising number of Postgres's scalar functions are not functions of
+/// their arguments alone. `date_trunc('day', tstz)` truncates in the
+/// **session** timezone; `date_part('hour', tstz)` reads the hour off the
+/// **session**-local rendering; `now()` is the **transaction**'s timestamp,
+/// not the clock's; `CURRENT_DATE` is today's date **in the session zone**,
+/// which near midnight is a different date from today-in-UTC. Every one of
+/// those was previously left unimplemented in this file with the note
+/// "`eval()` has no session context" — correctly, because answering them
+/// against a hard-coded UTC would be a silent wrong answer for every session
+/// that is not UTC, which is the failure mode this file exists to refuse.
+///
+/// `EvalSession` is that missing context, and it is deliberately a *value*:
+/// it is snapshotted once per statement and read (never written) during
+/// evaluation, so it needs no interior mutability and can be shared by
+/// reference across every operator in a plan.
+///
+/// # What it carries, and what it does not
+///
+/// Only the state some scalar function actually consumes today:
+///
+/// * [`time_zone`](Self::time_zone) — the `TimeZone` GUC.
+/// * [`transaction_timestamp`](Self::transaction_timestamp) — what `now()`,
+///   `transaction_timestamp()` and `CURRENT_TIMESTAMP` return.
+/// * [`statement_timestamp`](Self::statement_timestamp) — what
+///   `statement_timestamp()` returns. Distinct from the above: Postgres
+///   advances it per statement while `now()` stays pinned for the whole
+///   transaction (verified live — see the two timestamps' own docs).
+///
+/// Postgres has plenty more session state that a later function will want —
+/// `DateStyle` and `IntervalStyle` (output rendering), `search_path`,
+/// `current_user`/`session_user`/`current_database`, `extra_float_digits`,
+/// `lc_time` (month names in `to_char`) — and each belongs here when the
+/// function that reads it lands. None are guessed at in advance: a field no
+/// caller populates is a field that will be populated wrongly.
+///
+/// # Where it enters, and how it reaches `eval`
+///
+/// The real source is the pgwire session: the `TimeZone` GUC and the
+/// transaction's start timestamp both live in `basin-engine`'s session state,
+/// which is where a `EvalSession` should be built once per statement and
+/// handed down with the plan. That wiring is **not** done here — see the
+/// "Not yet wired" note below — so this file provides the shape and two
+/// entry points rather than pretending the plumbing exists:
+///
+/// * [`eval_with`] is the real entry point. It takes the session explicitly,
+///   threads it through every recursive step, and is what an operator should
+///   call once it holds one.
+/// * [`eval`] is the two-argument form every existing call site already
+///   uses. It evaluates against [`EvalSession::DEFAULT`] — UTC, with **no**
+///   transaction timestamp — and keeps working unchanged.
+///
+/// There is deliberately no thread-local "ambient session". It would let
+/// every existing call site pick up a real zone with no signature change,
+/// which is exactly why it is tempting — and it would silently fall back to
+/// UTC the moment an operator ran on a worker thread that had not installed
+/// one. A wrong answer that depends on which thread ran the batch is worse
+/// than a signature change.
+///
+/// # Not yet wired
+///
+/// `EvalSession::DEFAULT` is UTC because UTC is the only zone that is right
+/// by construction when nobody has said otherwise — not because UTC is a
+/// good guess. Until `basin-engine` builds a session from the live GUC and
+/// `basin-exec`'s operators carry it, `date_trunc`/`date_part` on
+/// `timestamptz` answer as if the session were UTC. That is the same answer
+/// they gave before this type existed; what is new is that the answer is now
+/// a *parameter* rather than an assumption, and `eval_with` already produces
+/// the correct answer for any zone the caller supplies (proved by this
+/// file's tests, against live PostgreSQL values, in three zones across both
+/// 2024 DST transitions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalSession {
+    /// The session's `TimeZone` GUC, as its IANA name.
+    ///
+    /// Kept as the name rather than only the resolved [`Tz`] because the name
+    /// is what `SHOW TimeZone` must echo back and what an error message must
+    /// quote. The resolved zone is derived on demand by [`Self::time_zone`].
+    time_zone: String,
+    /// Microseconds since the Unix epoch, UTC, captured when the transaction
+    /// began. `None` means "this evaluation has no transaction" — see
+    /// [`Self::transaction_timestamp`].
+    transaction_timestamp: Option<i64>,
+    /// Microseconds since the Unix epoch, UTC, captured when the current
+    /// statement began.
+    statement_timestamp: Option<i64>,
+}
+
+impl EvalSession {
+    /// The session an evaluation runs against when the caller supplies none:
+    /// UTC, and no clock at all.
+    ///
+    /// The absent clock is the important half. A session with no transaction
+    /// timestamp makes `now()` **error** rather than return a fresh
+    /// `Utc::now()` per call — because a `now()` that changes between two
+    /// rows of the same query is not `now()`, it is `clock_timestamp()`
+    /// wearing its name, and Postgres's `now()` is stable for the whole
+    /// transaction (verified live: two `now()` calls in one `BEGIN` block
+    /// return the identical value while `clock_timestamp()` advances between
+    /// them). Refusing is honest; guessing is not.
+    pub const DEFAULT: EvalSession = EvalSession {
+        time_zone: String::new(),
+        transaction_timestamp: None,
+        statement_timestamp: None,
+    };
+
+    /// A session in `time_zone`, with no clock.
+    ///
+    /// The zone is **not** validated here — an unknown name is reported by
+    /// the function that needs it, with Postgres's own message, rather than
+    /// at construction time, so that a session carrying a bad `TimeZone` can
+    /// still run every query that does not read the clock.
+    pub fn with_time_zone(time_zone: impl Into<String>) -> Self {
+        EvalSession {
+            time_zone: time_zone.into(),
+            ..EvalSession::DEFAULT
+        }
+    }
+
+    /// Pin this session's transaction and statement timestamps, both in
+    /// microseconds since the Unix epoch, UTC.
+    ///
+    /// Both are supplied together because Postgres always has both, and a
+    /// session that knew one but not the other could answer `now()` while
+    /// refusing `statement_timestamp()`, which no real session ever does.
+    pub fn at(mut self, transaction_timestamp: i64, statement_timestamp: i64) -> Self {
+        self.transaction_timestamp = Some(transaction_timestamp);
+        self.statement_timestamp = Some(statement_timestamp);
+        self
+    }
+
+    /// The session's `TimeZone`, resolved against the IANA database.
+    ///
+    /// `""` (the [`DEFAULT`](Self::DEFAULT) session's zone) resolves to UTC.
+    /// An unrecognised name is Postgres's `invalid_parameter_value`, with its
+    /// message text.
+    pub fn time_zone(&self) -> Result<Tz, ExecError> {
+        if self.time_zone.is_empty() {
+            // `Tz` has no `UTC` constant; the name is parsed like any
+            // other, and "UTC" is always present in the IANA database.
+            return "UTC"
+                .parse::<Tz>()
+                .map_err(|e| ExecError::Internal(format!("the IANA zone \"UTC\" did not parse: {e}")));
+        }
+        self.time_zone.parse::<Tz>().map_err(|_| {
+            ExecError::TypeMismatch(format!(
+                "invalid value for parameter \"TimeZone\": \"{}\"",
+                self.time_zone
+            ))
+        })
+    }
+
+    /// The session's `TimeZone` GUC as written.
+    pub fn time_zone_name(&self) -> &str {
+        &self.time_zone
+    }
+
+    /// What `now()` / `transaction_timestamp()` / `CURRENT_TIMESTAMP` return,
+    /// in microseconds since the Unix epoch.
+    ///
+    /// `None` when this evaluation has no transaction — see
+    /// [`EvalSession::DEFAULT`] for why that is refused rather than faked.
+    pub fn transaction_timestamp(&self) -> Option<i64> {
+        self.transaction_timestamp
+    }
+
+    /// What `statement_timestamp()` returns, in microseconds since the Unix
+    /// epoch. `None` under the same conditions as
+    /// [`Self::transaction_timestamp`].
+    pub fn statement_timestamp(&self) -> Option<i64> {
+        self.statement_timestamp
+    }
+}
+
+impl Default for EvalSession {
+    fn default() -> Self {
+        EvalSession::DEFAULT
+    }
+}
+
 /// Evaluate a scalar expression against every row of `batch`, producing one
 /// Arrow array of length `batch.num_rows()`.
+///
+/// Evaluates against [`EvalSession::DEFAULT`] — UTC, no clock. Use
+/// [`eval_with`] to supply a real session; see [`EvalSession`] for why this
+/// two-argument form still exists and what it is safe for.
 pub fn eval(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
+    eval_with(expr, batch, &EvalSession::DEFAULT)
+}
+
+/// Evaluate a scalar expression against every row of `batch`, in `session`.
+///
+/// The session-dependent functions — `date_trunc`/`date_part` on
+/// `timestamptz`, and the clock functions — read `session`; everything else
+/// ignores it. It is threaded through *every* recursive step rather than only
+/// the arms that consume it, because a session-dependent call can sit
+/// arbitrarily deep inside one that is not (`CASE WHEN x THEN date_trunc(…)
+/// END`), and a partially-threaded context is a context that is wrong exactly
+/// where it is hardest to notice.
+pub fn eval_with(
+    expr: &Expr,
+    batch: &RecordBatch,
+    session: &EvalSession,
+) -> Result<ArrayRef, ExecError> {
     match expr {
         Expr::Column(col) => eval_column(col, batch),
         Expr::Literal(datum, ty) => eval_literal(datum, *ty, batch.num_rows()),
-        Expr::Unary { op, arg } => eval_unary(*op, arg, batch),
-        Expr::Binary { op, lhs, rhs } => eval_binary(*op, lhs, rhs, batch),
-        Expr::Cast { arg, to, .. } => eval_cast(arg, *to, batch),
+        Expr::Unary { op, arg } => eval_unary(*op, arg, batch, session),
+        Expr::Binary { op, lhs, rhs } => eval_binary(*op, lhs, rhs, batch, session),
+        Expr::Cast { arg, to, .. } => eval_cast(arg, *to, batch, session),
         Expr::Case {
             operand,
             whens,
             else_,
-        } => eval_case(operand, whens, else_, batch),
-        Expr::Coalesce(exprs) => eval_coalesce(exprs, batch),
-        Expr::IsNull { arg, negated } => eval_is_null(arg, *negated, batch),
+        } => eval_case(operand, whens, else_, batch, session),
+        Expr::Coalesce(exprs) => eval_coalesce(exprs, batch, session),
+        Expr::IsNull { arg, negated } => eval_is_null(arg, *negated, batch, session),
         Expr::BoolTest { arg, test } => {
-            let a = eval(arg, batch)?;
+            let a = eval_with(arg, batch, session)?;
             let a = require_bool(&a)?;
             Ok(Arc::new(eval_bool_test(a, *test)))
         }
-        Expr::ScalarFn { func, args } => eval_scalar_fn(*func, args, batch),
-        Expr::DistinctFrom { lhs, rhs, negated } => eval_distinct_from(lhs, rhs, *negated, batch),
-        Expr::InList { arg, list, negated } => eval_in_list(arg, list, *negated, batch),
+        Expr::ScalarFn { func, args } => eval_scalar_fn(*func, args, batch, session),
+        Expr::DistinctFrom { lhs, rhs, negated } => eval_distinct_from(lhs, rhs, *negated, batch, session),
+        Expr::InList { arg, list, negated } => eval_in_list(arg, list, *negated, batch, session),
         Expr::Between {
             arg,
             low,
             high,
             symmetric,
             negated,
-        } => eval_between(arg, low, high, *symmetric, *negated, batch),
+        } => eval_between(arg, low, high, *symmetric, *negated, batch, session),
         Expr::Like {
             arg,
             pattern,
             escape,
             case_insensitive,
             negated,
-        } => eval_like(arg, pattern, escape, *case_insensitive, *negated, batch),
+        } => eval_like(arg, pattern, escape, *case_insensitive, *negated, batch, session),
 
         // Operator-level, not scalar — see the module docs.
         Expr::Aggregate { .. } => Err(ExecError::Internal(
@@ -614,8 +836,9 @@ fn eval_literal(datum: &PlanDatum, ty: PgType, len: usize) -> Result<ArrayRef, E
     Ok(array)
 }
 
-fn eval_unary(op: OpId, arg: &Expr, batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
-    let v = eval(arg, batch)?;
+fn eval_unary(op: OpId, arg: &Expr, batch: &RecordBatch,
+    session: &EvalSession) -> Result<ArrayRef, ExecError> {
+    let v = eval_with(arg, batch, session)?;
     // NOT is a sentinel, exactly like AND_OP/OR_OP in eval_binary — it has no
     // pg_operator row, so it must be checked before catalog_op_name, which
     // would otherwise report it as an unknown oid. `boolean::not` already
@@ -648,10 +871,11 @@ fn eval_binary(
     lhs: &Expr,
     rhs: &Expr,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<ArrayRef, ExecError> {
     if op == AND_OP {
-        let l = eval(lhs, batch)?;
-        let r = eval(rhs, batch)?;
+        let l = eval_with(lhs, batch, session)?;
+        let r = eval_with(rhs, batch, session)?;
         let l = require_bool(&l)?;
         let r = require_bool(&r)?;
         // Kleene, not the plain kernel: `NULL AND FALSE` must be FALSE, not
@@ -661,8 +885,8 @@ fn eval_binary(
         ));
     }
     if op == OR_OP {
-        let l = eval(lhs, batch)?;
-        let r = eval(rhs, batch)?;
+        let l = eval_with(lhs, batch, session)?;
+        let r = eval_with(rhs, batch, session)?;
         let l = require_bool(&l)?;
         let r = require_bool(&r)?;
         return Ok(Arc::new(
@@ -677,7 +901,7 @@ fn eval_binary(
         ))
     })?;
 
-    let (l, r) = eval_operand_pair(lhs, rhs, batch)?;
+    let (l, r) = eval_operand_pair(lhs, rhs, batch, session)?;
 
     match name {
         "=" => Ok(Arc::new(cmp::eq(&l, &r).map_err(|e| map_arrow(e, "="))?)),
@@ -732,6 +956,7 @@ fn eval_operand_pair(
     lhs: &Expr,
     rhs: &Expr,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<(ArrayRef, ArrayRef), ExecError> {
     // Postgres resolves an UNTYPED literal from the other operand: in
     // `SELECT 'x' = col`, the literal is `unknown` until the column types it.
@@ -741,12 +966,12 @@ fn eval_operand_pair(
     // evaluate the typed side first, then materialise the literal at its type.
     let (l, r) = match (is_unknown_literal(lhs), is_unknown_literal(rhs)) {
         (true, false) => {
-            let r = eval(rhs, batch)?;
+            let r = eval_with(rhs, batch, session)?;
             let l = eval_untyped_literal(lhs, r.data_type(), batch.num_rows())?;
             (l, r)
         }
         (false, true) => {
-            let l = eval(lhs, batch)?;
+            let l = eval_with(lhs, batch, session)?;
             let r = eval_untyped_literal(rhs, l.data_type(), batch.num_rows())?;
             (l, r)
         }
@@ -755,7 +980,7 @@ fn eval_operand_pair(
             eval_untyped_literal(lhs, &arrow_schema::DataType::Utf8, batch.num_rows())?,
             eval_untyped_literal(rhs, &arrow_schema::DataType::Utf8, batch.num_rows())?,
         ),
-        (false, false) => (eval(lhs, batch)?, eval(rhs, batch)?),
+        (false, false) => (eval_with(lhs, batch, session)?, eval_with(rhs, batch, session)?),
     };
     // Arrow's comparison and arithmetic kernels require both sides to have the
     // SAME type; Postgres does not. `bigint_col > 2` is ordinary SQL — the
@@ -778,11 +1003,12 @@ fn eval_operand_against(
     lhs: ArrayRef,
     rhs: &Expr,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<(ArrayRef, ArrayRef), ExecError> {
     let r = if is_unknown_literal(rhs) {
         eval_untyped_literal(rhs, lhs.data_type(), batch.num_rows())?
     } else {
-        eval(rhs, batch)?
+        eval_with(rhs, batch, session)?
     };
     unify_numeric(lhs, r)
 }
@@ -877,8 +1103,9 @@ fn reject_float_zero_divisor(r: &ArrayRef) -> Result<(), ExecError> {
     Ok(())
 }
 
-fn eval_cast(arg: &Expr, to: PgType, batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
-    let v = eval(arg, batch)?;
+fn eval_cast(arg: &Expr, to: PgType, batch: &RecordBatch,
+    session: &EvalSession) -> Result<ArrayRef, ExecError> {
+    let v = eval_with(arg, batch, session)?;
     let target = physical(to).map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
     // `kind` (implicit/assignment/explicit) governs whether a cast is
     // *legal* at a given syntactic position — a planning-time question,
@@ -913,10 +1140,11 @@ fn eval_case(
     whens: &[(Expr, Expr)],
     else_: &Option<Box<Expr>>,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<ArrayRef, ExecError> {
     if whens.is_empty() {
         return match else_ {
-            Some(e) => eval(e, batch),
+            Some(e) => eval_with(e, batch, session),
             None => Err(ExecError::Internal(
                 "CASE with no WHEN and no ELSE — a planner bug, not user error".to_string(),
             )),
@@ -926,7 +1154,7 @@ fn eval_case(
     // `CASE operand WHEN v THEN …` is Postgres sugar for
     // `CASE WHEN operand = v THEN …`; evaluate `operand` once up front.
     let operand_arr = match operand {
-        Some(o) => Some(eval(o, batch)?),
+        Some(o) => Some(eval_with(o, batch, session)?),
         None => None,
     };
 
@@ -938,7 +1166,7 @@ fn eval_case(
     if let Some(e) = else_.as_deref() {
         branch_exprs.push(e);
     }
-    let mut branch_arrays = eval_branches_unified(&branch_exprs, batch)?;
+    let mut branch_arrays = eval_branches_unified(&branch_exprs, batch, session)?;
     let mut acc: Option<ArrayRef> = if else_.is_some() {
         branch_arrays.pop()
     } else {
@@ -957,11 +1185,11 @@ fn eval_case(
     {
         let cond_arr: BooleanArray = match &operand_arr {
             Some(o) => {
-                let v = eval(cond_expr, batch)?;
+                let v = eval_with(cond_expr, batch, session)?;
                 cmp::eq(o, &v).map_err(|e| map_arrow(e, "CASE"))?
             }
             None => {
-                let c = eval(cond_expr, batch)?;
+                let c = eval_with(cond_expr, batch, session)?;
                 require_bool(&c)?.clone()
             }
         };
@@ -1006,7 +1234,8 @@ fn eval_case(
 /// valid SQL produces for a well-typed CASE/COALESCE) is left as the first
 /// one seen; the `cast` kernel reporting that mismatch below is an honest
 /// answer, not a guess.
-fn eval_branches_unified(exprs: &[&Expr], batch: &RecordBatch) -> Result<Vec<ArrayRef>, ExecError> {
+fn eval_branches_unified(exprs: &[&Expr], batch: &RecordBatch,
+    session: &EvalSession) -> Result<Vec<ArrayRef>, ExecError> {
     let len = batch.num_rows();
 
     let mut typed: Vec<Option<ArrayRef>> = Vec::with_capacity(exprs.len());
@@ -1014,7 +1243,7 @@ fn eval_branches_unified(exprs: &[&Expr], batch: &RecordBatch) -> Result<Vec<Arr
         typed.push(if is_unknown_literal(e) {
             None
         } else {
-            Some(eval(e, batch)?)
+            Some(eval_with(e, batch, session)?)
         });
     }
 
@@ -1049,7 +1278,8 @@ fn eval_branches_unified(exprs: &[&Expr], batch: &RecordBatch) -> Result<Vec<Arr
 /// `is_not_null` + `zip`, folded right to left: start from the last
 /// expression, then for each earlier one, take it where it is not null and
 /// fall back to the accumulator otherwise.
-fn eval_coalesce(exprs: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
+fn eval_coalesce(exprs: &[Expr], batch: &RecordBatch,
+    session: &EvalSession) -> Result<ArrayRef, ExecError> {
     if exprs.is_empty() {
         return Err(ExecError::Internal(
             "COALESCE with no arguments — a planner bug, not user error".to_string(),
@@ -1061,7 +1291,7 @@ fn eval_coalesce(exprs: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecEr
     // `COALESCE(name, 'none')` (a column and an `unknown`-typed literal) both
     // widen/resolve correctly regardless of which argument is written first.
     let arg_refs: Vec<&Expr> = exprs.iter().collect();
-    let arrays = eval_branches_unified(&arg_refs, batch)?;
+    let arrays = eval_branches_unified(&arg_refs, batch, session)?;
     let (last, rest) = arrays
         .split_last()
         .expect("checked exprs non-empty above, and arrays has the same length");
@@ -1073,8 +1303,9 @@ fn eval_coalesce(exprs: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecEr
     Ok(acc)
 }
 
-fn eval_is_null(arg: &Expr, negated: bool, batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
-    let a = eval(arg, batch)?;
+fn eval_is_null(arg: &Expr, negated: bool, batch: &RecordBatch,
+    session: &EvalSession) -> Result<ArrayRef, ExecError> {
+    let a = eval_with(arg, batch, session)?;
     let result = if negated {
         boolean::is_not_null(&a)
     } else {
@@ -1120,8 +1351,9 @@ fn eval_distinct_from(
     rhs: &Expr,
     negated: bool,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<ArrayRef, ExecError> {
-    let (l, r) = eval_operand_pair(lhs, rhs, batch)?;
+    let (l, r) = eval_operand_pair(lhs, rhs, batch, session)?;
     let result = if negated {
         cmp::not_distinct(&l, &r)
     } else {
@@ -1144,6 +1376,7 @@ fn eval_in_list(
     list: &[Expr],
     negated: bool,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<ArrayRef, ExecError> {
     let Some((first, rest)) = list.split_first() else {
         return Err(ExecError::Internal(
@@ -1161,17 +1394,17 @@ fn eval_in_list(
     // literals, and only in the rare case where the left side is untyped.
     let x = if is_unknown_literal(arg) {
         let target = match list.iter().find(|e| !is_unknown_literal(e)) {
-            Some(typed) => eval(typed, batch)?.data_type().clone(),
+            Some(typed) => eval_with(typed, batch, session)?.data_type().clone(),
             None => arrow_schema::DataType::Utf8,
         };
         eval_untyped_literal(arg, &target, batch.num_rows())?
     } else {
-        eval(arg, batch)?
+        eval_with(arg, batch, session)?
     };
 
-    let mut acc = eval_in_list_test(&x, first, negated, batch)?;
+    let mut acc = eval_in_list_test(&x, first, negated, batch, session)?;
     for item in rest {
-        let test = eval_in_list_test(&x, item, negated, batch)?;
+        let test = eval_in_list_test(&x, item, negated, batch, session)?;
         acc = if negated {
             boolean::and_kleene(&acc, &test)
         } else {
@@ -1187,11 +1420,12 @@ fn eval_in_list_test(
     item: &Expr,
     negated: bool,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<BooleanArray, ExecError> {
     // Resolved per element rather than once for the list: `x IN (1, 'a')` is a
     // type error in Postgres, but `x IN (1, 2)` where x is bigint is not, and
     // each element widens against x independently.
-    let (x, v) = eval_operand_against(Arc::clone(x), item, batch)?;
+    let (x, v) = eval_operand_against(Arc::clone(x), item, batch, session)?;
     if negated {
         cmp::neq(&x, &v)
     } else {
@@ -1217,10 +1451,11 @@ fn eval_between(
     symmetric: bool,
     negated: bool,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<ArrayRef, ExecError> {
-    let x = eval(arg, batch)?;
-    let low_v = eval(low, batch)?;
-    let high_v = eval(high, batch)?;
+    let x = eval_with(arg, batch, session)?;
+    let low_v = eval_with(low, batch, session)?;
+    let high_v = eval_with(high, batch, session)?;
 
     let ge_low = cmp::gt_eq(&x, &low_v).map_err(|e| map_arrow(e, "BETWEEN"))?;
     let le_high = cmp::lt_eq(&x, &high_v).map_err(|e| map_arrow(e, "BETWEEN"))?;
@@ -1254,6 +1489,7 @@ fn eval_like(
     case_insensitive: bool,
     negated: bool,
     batch: &RecordBatch,
+    session: &EvalSession,
 ) -> Result<ArrayRef, ExecError> {
     if escape.is_some() {
         return Err(ExecError::Internal(
@@ -1266,7 +1502,7 @@ fn eval_like(
     // arrives untyped and arrow's kernel — which demands both sides be the same
     // string type — refused it. `col LIKE 'a%'` is about as ordinary as SQL
     // gets, and it fell back on every single query.
-    let (a, p) = eval_operand_pair(arg, pattern, batch)?;
+    let (a, p) = eval_operand_pair(arg, pattern, batch, session)?;
     let base = if case_insensitive {
         comparison::ilike(&a, &p)
     } else {
@@ -1289,7 +1525,8 @@ fn eval_like(
 /// evaluating every argument up front, so a call with the wrong arity fails
 /// with a clear "too few arguments" `Internal` error instead of an out-of-
 /// bounds panic.
-fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
+fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch,
+    session: &EvalSession) -> Result<ArrayRef, ExecError> {
     let oid = func.0.get();
     let a = |i: usize| -> Result<ArrayRef, ExecError> {
         let e = args.get(i).ok_or_else(|| {
@@ -1299,7 +1536,7 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
                 args.len()
             ))
         })?;
-        eval(e, batch)
+        eval_with(e, batch, session)
     };
 
     match oid {
@@ -1343,8 +1580,8 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
             f64::floor,
         ))),
 
-        OID_CONCAT => eval_concat(args, batch),
-        OID_CONCAT_WS => eval_concat_ws(args, batch),
+        OID_CONCAT => eval_concat(args, batch, session),
+        OID_CONCAT_WS => eval_concat_ws(args, batch, session),
 
         OID_BTRIM_1 => eval_trim_1(&a(0)?, TrimSide::Both),
         OID_BTRIM_2 => {
@@ -1423,6 +1660,37 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
             let lhs = a(0)?;
             let rhs = a(1)?;
             eval_age(&lhs, &rhs)
+        }
+
+        OID_DATE_TRUNC_TIMESTAMP => {
+            let unit = a(0)?;
+            let value = a(1)?;
+            eval_date_trunc_timestamp(&unit, &value)
+        }
+        OID_DATE_TRUNC_TIMESTAMPTZ => {
+            let unit = a(0)?;
+            let value = a(1)?;
+            eval_date_trunc_timestamptz(&unit, &value, session)
+        }
+        OID_DATE_TRUNC_INTERVAL => {
+            let unit = a(0)?;
+            let value = a(1)?;
+            eval_date_trunc_interval(&unit, &value)
+        }
+        OID_DATE_PART_TIMESTAMP => {
+            let field = a(0)?;
+            let value = a(1)?;
+            eval_date_part_timestamp(&field, &value)
+        }
+        OID_DATE_PART_TIMESTAMPTZ => {
+            let field = a(0)?;
+            let value = a(1)?;
+            eval_date_part_timestamptz(&field, &value, session)
+        }
+        OID_DATE_PART_DATE => {
+            let field = a(0)?;
+            let value = a(1)?;
+            eval_date_part_date(&field, &value)
         }
 
         OID_SQRT_FLOAT8 => float8_unary_checked(&a(0)?, pg_sqrt_f64),
@@ -2245,6 +2513,634 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
+// ─── date_trunc / date_part ─────────────────────────────────────────────────
+//
+// The first functions in this file that are not functions of their arguments
+// alone: the `timestamptz` overloads read the session's `TimeZone` out of
+// [`EvalSession`]. See that type's docs for why that context exists at all.
+//
+// Everything below — the unit vocabulary, the truncation rules, the
+// re-determination rule, the ambiguity/gap rules, and every error string —
+// was read off a live PostgreSQL 18.2 rather than recalled. Where the answer
+// was surprising it is quoted at the definition that implements it.
+
+/// A `date_trunc`/`date_part` unit, after alias resolution.
+///
+/// The two functions share Postgres's one unit vocabulary (`deltatktbl` in
+/// `datetime.c`), which is why this is one enum: `date_trunc('dow', …)` and
+/// `date_part('dow', …)` do not fail the same way. `dow` is *recognized* by
+/// both — `date_trunc` rejects it with "not recognized" only because the
+/// truncation switch has no arm for it, while `timezone` is rejected with a
+/// different message ("not supported") by both. Those two message strings are
+/// Postgres's own, and the distinction between them is preserved below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DateUnit {
+    Microsecond,
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+    Decade,
+    Century,
+    Millennium,
+    Dow,
+    IsoDow,
+    Doy,
+    IsoYear,
+    Julian,
+    Epoch,
+    Timezone,
+    TimezoneHour,
+    TimezoneMinute,
+}
+
+/// Resolve a unit name the way Postgres does: lowercase it, then look it up
+/// exactly. No trimming — `date_trunc(' day ', …)` is an error on a live
+/// PostgreSQL 18 (`unit " day " not recognized`), which is exactly the case a
+/// `trim()` here would silently "fix" into a wrong success.
+///
+/// The alias set is not guessed at. Every spelling below was accepted by a
+/// live PostgreSQL 18.2 for both `date_trunc` and `date_part`; the near
+/// misses that were tried and *rejected* are recorded too, because they are
+/// what a plausible-looking alias table gets wrong:
+/// `quarters`, `dayofweek`, `dayofyear`, `yday`, `tz` are all "not
+/// recognized" even though `quarter`, `dow`, `doy` and `timezone` are.
+fn parse_date_unit(raw: &str) -> Option<DateUnit> {
+    let lowered = raw.to_lowercase();
+    Some(match lowered.as_str() {
+        "us" | "usec" | "usecs" | "microsecond" | "microseconds" => DateUnit::Microsecond,
+        "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => DateUnit::Millisecond,
+        "s" | "sec" | "secs" | "second" | "seconds" => DateUnit::Second,
+        "min" | "mins" | "minute" | "minutes" => DateUnit::Minute,
+        "hr" | "hrs" | "hour" | "hours" => DateUnit::Hour,
+        "d" | "day" | "days" => DateUnit::Day,
+        "w" | "week" | "weeks" => DateUnit::Week,
+        "mon" | "mons" | "month" | "months" => DateUnit::Month,
+        "qtr" | "quarter" => DateUnit::Quarter,
+        "y" | "yr" | "yrs" | "year" | "years" => DateUnit::Year,
+        "dec" | "decs" | "decade" | "decades" => DateUnit::Decade,
+        "c" | "cent" | "century" | "centuries" => DateUnit::Century,
+        "mil" | "mils" | "millennia" | "millennium" | "millenniums" => DateUnit::Millennium,
+        "dow" => DateUnit::Dow,
+        "isodow" => DateUnit::IsoDow,
+        "doy" => DateUnit::Doy,
+        "isoyear" => DateUnit::IsoYear,
+        "julian" | "jd" => DateUnit::Julian,
+        "epoch" => DateUnit::Epoch,
+        "timezone" => DateUnit::Timezone,
+        "timezone_hour" | "timezone_h" => DateUnit::TimezoneHour,
+        "timezone_minute" | "timezone_m" => DateUnit::TimezoneMinute,
+        _ => return None,
+    })
+}
+
+/// Postgres's `unit "…" not recognized for type …` — the unit is not in the
+/// vocabulary at all.
+fn unit_not_recognized(raw: &str, ty: &str) -> ExecError {
+    ExecError::TypeMismatch(format!("unit \"{raw}\" not recognized for type {ty}"))
+}
+
+/// Postgres's `unit "…" not supported for type …` — the unit is a real unit,
+/// but means nothing for this argument type. A different message from
+/// [`unit_not_recognized`], and the difference is load-bearing:
+/// `date_part('timezone', ts)` on a `timestamp without time zone` says "not
+/// supported", while `date_part('fortnight', ts)` says "not recognized".
+fn unit_not_supported(raw: &str, ty: &str) -> ExecError {
+    ExecError::TypeMismatch(format!("unit \"{raw}\" not supported for type {ty}"))
+}
+
+const TY_TIMESTAMP: &str = "timestamp without time zone";
+const TY_TIMESTAMPTZ: &str = "timestamp with time zone";
+const TY_INTERVAL: &str = "interval";
+
+/// Microseconds since the Unix epoch → a `NaiveDateTime` reading of the same
+/// instant in UTC.
+fn naive_from_micros(micros: i64) -> Result<NaiveDateTime, ExecError> {
+    DateTime::from_timestamp_micros(micros)
+        .map(|d| d.naive_utc())
+        .ok_or(ExecError::Overflow("timestamp"))
+}
+
+/// The inverse of [`naive_from_micros`].
+fn micros_from_naive(dt: NaiveDateTime) -> Result<i64, ExecError> {
+    dt.and_utc()
+        .timestamp_micros()
+        .checked_abs()
+        .map(|_| dt.and_utc().timestamp_micros())
+        .ok_or(ExecError::Overflow("timestamp"))
+}
+
+/// Truncate a broken-down local reading to `unit`.
+///
+/// `None` means "this unit does not truncate" — the caller turns that into
+/// Postgres's "not recognized"/"not supported" message, which one depending
+/// on the unit.
+///
+/// The decade/century/millennium arithmetic is Postgres's, not the obvious
+/// one. `date_trunc('century', '2024-03-10')` is **2001**-01-01, not
+/// 2000-01-01: the 21st century starts in 2001, and Postgres computes
+/// `((year + 99) / 100) * 100 - 99` to say so. Millennium is the same shape
+/// (`2001`, not 2000). Decade *is* the obvious one (`(year / 10) * 10` →
+/// 2020). All three verified live, including the case that proves the
+/// signs are handled: `date_trunc('decade', '0001-01-01')` is
+/// `0001-01-01 BC` — year 1 truncates to astronomical year 0, which is 1 BC.
+fn truncate_local(local: NaiveDateTime, unit: DateUnit) -> Option<NaiveDateTime> {
+    let date = local.date();
+    let midnight = |d: NaiveDate| d.and_hms_opt(0, 0, 0);
+    match unit {
+        // Arrow's timestamps are already microsecond-resolution, so this is
+        // the identity — as it is in Postgres, whose timestamps are too.
+        DateUnit::Microsecond => Some(local),
+        DateUnit::Millisecond => {
+            let ns = local.and_utc().timestamp_subsec_nanos();
+            local.with_nanosecond((ns / 1_000_000) * 1_000_000)
+        }
+        DateUnit::Second => local.with_nanosecond(0),
+        DateUnit::Minute => local.with_second(0)?.with_nanosecond(0),
+        DateUnit::Hour => local.with_minute(0)?.with_second(0)?.with_nanosecond(0),
+        DateUnit::Day => midnight(date),
+        // ISO weeks start on Monday, so this is "back up to the most recent
+        // Monday", not "back up to a multiple of 7 days from the epoch".
+        DateUnit::Week => {
+            let back = i64::from(date.weekday().num_days_from_monday());
+            midnight(date - TimeDelta::days(back))
+        }
+        DateUnit::Month => midnight(date.with_day(1)?),
+        DateUnit::Quarter => {
+            let first = ((date.month() - 1) / 3) * 3 + 1;
+            midnight(date.with_day(1)?.with_month(first)?)
+        }
+        DateUnit::Year | DateUnit::Decade | DateUnit::Century | DateUnit::Millennium => {
+            let y = date.year();
+            let truncated = match unit {
+                DateUnit::Year => y,
+                DateUnit::Decade => {
+                    if y > 0 {
+                        (y / 10) * 10
+                    } else {
+                        -(((8 - (y - 1)) / 10) * 10)
+                    }
+                }
+                DateUnit::Century => {
+                    if y > 0 {
+                        ((y + 99) / 100) * 100 - 99
+                    } else {
+                        -(((99 - (y - 1)) / 100) * 100) + 1
+                    }
+                }
+                _ => {
+                    if y > 0 {
+                        ((y + 999) / 1000) * 1000 - 999
+                    } else {
+                        -(((999 - (y - 1)) / 1000) * 1000) + 1
+                    }
+                }
+            };
+            midnight(NaiveDate::from_ymd_opt(truncated, 1, 1)?)
+        }
+        DateUnit::Dow
+        | DateUnit::IsoDow
+        | DateUnit::Doy
+        | DateUnit::IsoYear
+        | DateUnit::Julian
+        | DateUnit::Epoch
+        | DateUnit::Timezone
+        | DateUnit::TimezoneHour
+        | DateUnit::TimezoneMinute => None,
+    }
+}
+
+/// Does truncating to `unit` re-derive the UTC offset from the *truncated*
+/// local time, or keep the offset the input instant had?
+///
+/// This is the single subtlest thing about `date_trunc` on a `timestamptz`,
+/// it is invisible except across a DST transition, and getting it wrong
+/// produces an answer that is off by exactly the DST step. Postgres
+/// (`timestamptz_trunc_internal`) sets its `redotz` flag for units of a day
+/// and larger and leaves it clear for hour and below.
+///
+/// Verified live in `Australia/Lord_Howe`, whose DST step is **30 minutes**,
+/// on the instant `2024-04-06 15:00:00+00` — the first instant after that
+/// zone's 2024 fall-back, so the input's own offset is `+10:30` while the
+/// truncated local time sits back in `+11:00`:
+///
+/// ```text
+/// date_trunc('hour', …) = 2024-04-07 01:30:00+11   -- offset KEPT (+10:30)
+/// date_trunc('day',  …) = 2024-04-07 00:00:00+11   -- offset REDERIVED
+/// ```
+///
+/// The `hour` answer is the tell. Local time is `01:30:00`; truncating to
+/// the hour gives local `01:00:00`; re-attaching the *input's* `+10:30`
+/// gives `14:30Z`, which renders back as `01:30+11` — an answer whose
+/// displayed minutes are not zero even though the unit was `hour`. A
+/// naive implementation that re-derives the offset for every unit produces
+/// `01:00:00+11` here and is wrong.
+fn unit_redetermines_zone(unit: DateUnit) -> bool {
+    matches!(
+        unit,
+        DateUnit::Day
+            | DateUnit::Week
+            | DateUnit::Month
+            | DateUnit::Quarter
+            | DateUnit::Year
+            | DateUnit::Decade
+            | DateUnit::Century
+            | DateUnit::Millennium
+    )
+}
+
+/// Postgres's `DetermineTimeZoneOffset`: which UTC offset does a *local* wall
+/// reading correspond to?
+///
+/// Unambiguous local times are the easy case. The other two are not, and both
+/// were settled by asking the server rather than by choosing a convention:
+///
+/// * **Ambiguous** (a fall-back repeats an hour, so two instants render the
+///   same). Postgres takes the **second** occurrence — the smaller UTC
+///   offset, i.e. standard time. Verified in `America/Asuncion`, whose 2024
+///   fall-back happens at local midnight so `date_trunc('day', …)` lands
+///   exactly on the repeated reading: the answer is `2024-03-24 00:00:00-04`
+///   (`1711252800`), the `-04` occurrence, not the `-03` one an hour earlier.
+///
+/// * **Nonexistent** (a spring-forward skips the reading entirely).
+///   Postgres uses the offset in force **before** the transition, which
+///   yields an instant at or after it — so the result renders as a *different*
+///   local time than the one asked for. Verified in `America/Havana`, whose
+///   2024 DST start skips local midnight: `date_trunc('day', …)` answers
+///   `2024-03-10 01:00:00-04` (`1710046800`), i.e. local `00:00` resolved
+///   with the pre-transition `-05`.
+///
+/// Both cases collapse to one rule — *prefer the smaller UTC offset* — since
+/// an ambiguity always has the larger offset first and a gap always has the
+/// smaller offset before it. It is written out as three arms anyway, because
+/// the two situations are genuinely different and a future reader should not
+/// have to rediscover that they coincide.
+fn determine_time_zone_offset(tz: &Tz, local: NaiveDateTime) -> Result<i32, ExecError> {
+    match tz.offset_from_local_datetime(&local) {
+        MappedLocalTime::Single(o) => Ok(o.fix().local_minus_utc()),
+        MappedLocalTime::Ambiguous(a, b) => {
+            Ok(a.fix().local_minus_utc().min(b.fix().local_minus_utc()))
+        }
+        // The reading does not exist, so there is no offset to *look up* —
+        // the pre-transition one has to be found by probing away from the
+        // gap. 26 hours is comfortably wider than any DST step (the largest
+        // in the IANA database is one hour; Lord Howe's is half of one) and
+        // comfortably narrower than the gap between two transitions in any
+        // zone that has them, so the probe lands in the interval before the
+        // transition and reads its offset.
+        MappedLocalTime::None => {
+            let probe = local - TimeDelta::hours(26);
+            Ok(tz.offset_from_utc_datetime(&probe).fix().local_minus_utc())
+        }
+    }
+}
+
+/// `date_trunc(text, timestamp)` — oid 2020. No session involvement: a
+/// `timestamp without time zone` is already a civil reading, so truncating
+/// it is pure calendar arithmetic.
+fn eval_date_trunc_timestamp(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let u = downcast_array::<StringArray>(units, "text")?;
+    let v = downcast_array::<TimestampMicrosecondArray>(values, "timestamp")?;
+    let mut out: Vec<Option<i64>> = Vec::with_capacity(v.len());
+    for i in 0..v.len() {
+        if u.is_null(i) || v.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let unit = trunc_unit(u.value(i), TY_TIMESTAMP)?;
+        let local = naive_from_micros(v.value(i))?;
+        let truncated = truncate_local(local, unit)
+            .ok_or_else(|| unit_not_recognized(u.value(i), TY_TIMESTAMP))?;
+        out.push(Some(micros_from_naive(truncated)?));
+    }
+    Ok(Arc::new(TimestampMicrosecondArray::from(out)))
+}
+
+/// Resolve a unit for `date_trunc`, rejecting the two ways Postgres rejects.
+fn trunc_unit(raw: &str, ty: &str) -> Result<DateUnit, ExecError> {
+    let unit = parse_date_unit(raw).ok_or_else(|| unit_not_recognized(raw, ty))?;
+    match unit {
+        // Recognized units that name a *field*, not a resolution — Postgres
+        // has no truncation arm for them and reports "not recognized".
+        DateUnit::Dow
+        | DateUnit::IsoDow
+        | DateUnit::Doy
+        | DateUnit::IsoYear
+        | DateUnit::Julian
+        | DateUnit::Epoch => Err(unit_not_recognized(raw, ty)),
+        // Recognized, but a zone offset is not something a timestamp can be
+        // truncated to — Postgres reports "not supported" here, a different
+        // message from the arm above.
+        DateUnit::Timezone | DateUnit::TimezoneHour | DateUnit::TimezoneMinute => {
+            Err(unit_not_supported(raw, ty))
+        }
+        other => Ok(other),
+    }
+}
+
+/// `date_trunc(text, timestamptz)` — oid 1217. **Session-timezone
+/// dependent**: the truncation happens on the session-local rendering, not on
+/// the UTC instant. See [`unit_redetermines_zone`] and
+/// [`determine_time_zone_offset`] for the two rules that make it correct
+/// across a DST transition.
+fn eval_date_trunc_timestamptz(
+    units: &ArrayRef,
+    values: &ArrayRef,
+    session: &EvalSession,
+) -> Result<ArrayRef, ExecError> {
+    let u = downcast_array::<StringArray>(units, "text")?;
+    let v = downcast_array::<TimestampMicrosecondArray>(values, "timestamp with time zone")?;
+    let tz = session.time_zone()?;
+    let mut out: Vec<Option<i64>> = Vec::with_capacity(v.len());
+    for i in 0..v.len() {
+        if u.is_null(i) || v.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let unit = trunc_unit(u.value(i), TY_TIMESTAMPTZ)?;
+        let utc = naive_from_micros(v.value(i))?;
+        let offset = tz.offset_from_utc_datetime(&utc).fix().local_minus_utc();
+        let local = utc + TimeDelta::seconds(i64::from(offset));
+        let truncated = truncate_local(local, unit)
+            .ok_or_else(|| unit_not_recognized(u.value(i), TY_TIMESTAMPTZ))?;
+        let out_offset = if unit_redetermines_zone(unit) {
+            determine_time_zone_offset(&tz, truncated)?
+        } else {
+            offset
+        };
+        out.push(Some(micros_from_naive(
+            truncated - TimeDelta::seconds(i64::from(out_offset)),
+        )?));
+    }
+    // `timestamptz` is physically UTC micros (`basin_pgtype`'s mapping), so
+    // the output carries the same "UTC" marker the input did — dropping it
+    // would silently turn the result into a `timestamp without time zone`.
+    Ok(Arc::new(
+        TimestampMicrosecondArray::from(out).with_timezone("UTC"),
+    ))
+}
+
+/// `date_trunc(text, interval)` — oid 1218. Session-independent: an interval
+/// has no position on the calendar, so there is no zone to truncate in.
+///
+/// Two things here are not what the timestamp version does, both verified
+/// live. `week` is **not supported** for an interval at all (an interval has
+/// no weekday to back up to). And the year-scale units are plain division on
+/// the month component rather than Postgres's off-by-one century arithmetic:
+/// `date_trunc('century', interval '137 years 5 mons')` is `100 years`, not
+/// `101 years`, because there is no year 1 to count from.
+fn eval_date_trunc_interval(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let u = downcast_array::<StringArray>(units, "text")?;
+    let v = downcast_array::<IntervalMonthDayNanoArray>(values, "interval")?;
+    let mut out: Vec<Option<IntervalMonthDayNano>> = Vec::with_capacity(v.len());
+    for i in 0..v.len() {
+        if u.is_null(i) || v.is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let raw = u.value(i);
+        let unit = parse_date_unit(raw).ok_or_else(|| unit_not_recognized(raw, TY_INTERVAL))?;
+        let iv = v.value(i);
+        let (mut months, mut days, mut nanos) = (iv.months, iv.days, iv.nanoseconds);
+        // Month-scale units zero everything below the month, then round the
+        // month count down to a multiple of the unit's month width.
+        let month_width = match unit {
+            DateUnit::Millennium => Some(12_000),
+            DateUnit::Century => Some(1_200),
+            DateUnit::Decade => Some(120),
+            DateUnit::Year => Some(12),
+            DateUnit::Quarter => Some(3),
+            DateUnit::Month => Some(1),
+            _ => None,
+        };
+        if let Some(w) = month_width {
+            months = (months / w) * w;
+            days = 0;
+            nanos = 0;
+        } else {
+            let ns_width = match unit {
+                DateUnit::Day => Some(86_400_000_000_000_i64),
+                DateUnit::Hour => Some(3_600_000_000_000),
+                DateUnit::Minute => Some(60_000_000_000),
+                DateUnit::Second => Some(1_000_000_000),
+                DateUnit::Millisecond => Some(1_000_000),
+                DateUnit::Microsecond => Some(1_000),
+                _ => None,
+            };
+            match ns_width {
+                // `day` keeps the day count and drops the time of day; it is
+                // not a division, because an interval's days are already a
+                // separate component from its time.
+                Some(w) if unit == DateUnit::Day => {
+                    let _ = w;
+                    nanos = 0;
+                }
+                Some(w) => nanos = (nanos / w) * w,
+                None => return Err(unit_not_supported(raw, TY_INTERVAL)),
+            }
+        }
+        out.push(Some(IntervalMonthDayNano::new(months, days, nanos)));
+    }
+    Ok(Arc::new(IntervalMonthDayNanoArray::from(out)))
+}
+
+/// One `date_part` answer, off a broken-down local reading.
+///
+/// `offset` is the local reading's UTC offset in seconds, present only for a
+/// `timestamptz`; `epoch_micros` is what the `epoch` field reports. Splitting
+/// those two out is what lets the `timestamp`, `timestamptz` and `date`
+/// overloads share this function while still disagreeing where Postgres does:
+/// `epoch` on a `timestamp` counts from `1970-01-01 00:00:00` read as if it
+/// were UTC (no zone is applied), whereas on a `timestamptz` it is the real
+/// instant.
+fn date_part_of(
+    unit: DateUnit,
+    raw: &str,
+    local: NaiveDateTime,
+    offset: Option<i32>,
+    epoch_micros: i64,
+    ty: &str,
+) -> Result<f64, ExecError> {
+    // Postgres reports years before 1 AD as negative and has no year zero,
+    // while chrono counts astronomically (its year 0 *is* 1 BC). The two
+    // agree for every year from 1 AD on; below that Postgres's number is one
+    // further from zero.
+    let pg_year = |y: i32| -> i32 {
+        if y <= 0 {
+            y - 1
+        } else {
+            y
+        }
+    };
+    let secs = f64::from(local.second());
+    let frac = f64::from(local.and_utc().timestamp_subsec_nanos()) / 1e9;
+    Ok(match unit {
+        DateUnit::Epoch => epoch_micros as f64 / 1e6,
+        DateUnit::Year => f64::from(pg_year(local.year())),
+        DateUnit::IsoYear => f64::from(pg_year(local.iso_week().year())),
+        DateUnit::Quarter => f64::from((local.month() - 1) / 3 + 1),
+        DateUnit::Month => f64::from(local.month()),
+        DateUnit::Week => f64::from(local.iso_week().week()),
+        DateUnit::Day => f64::from(local.day()),
+        DateUnit::Doy => f64::from(local.ordinal()),
+        DateUnit::Dow => f64::from(local.weekday().num_days_from_sunday()),
+        DateUnit::IsoDow => f64::from(local.weekday().number_from_monday()),
+        DateUnit::Hour => f64::from(local.hour()),
+        DateUnit::Minute => f64::from(local.minute()),
+        DateUnit::Second => secs + frac,
+        DateUnit::Millisecond => (secs + frac) * 1e3,
+        DateUnit::Microsecond => (secs + frac) * 1e6,
+        DateUnit::Decade => {
+            let y = local.year();
+            f64::from(if y >= 0 { y / 10 } else { -((8 - (y - 1)) / 10) })
+        }
+        DateUnit::Century => {
+            let y = local.year();
+            f64::from(if y > 0 {
+                (y + 99) / 100
+            } else {
+                -((99 - (y - 1)) / 100)
+            })
+        }
+        DateUnit::Millennium => {
+            let y = local.year();
+            f64::from(if y > 0 {
+                (y + 999) / 1000
+            } else {
+                -((999 - (y - 1)) / 1000)
+            })
+        }
+        // Julian date: the Julian day number of the local date, plus the
+        // fraction of the day elapsed. `num_days_from_ce` counts from
+        // 0001-01-01 as day 1, whose (proleptic Gregorian) Julian day number
+        // is 1721426, so the two differ by the constant below. Checked
+        // against the server:
+        // `date_part('julian', '2024-03-10 12:34:56.789012')` is
+        // 2460380.5242683915.
+        DateUnit::Julian => {
+            let jdn = f64::from(local.date().num_days_from_ce()) + 1_721_425.0;
+            let secs_of_day = f64::from(local.num_seconds_from_midnight()) + frac;
+            jdn + secs_of_day / 86_400.0
+        }
+        DateUnit::Timezone | DateUnit::TimezoneHour | DateUnit::TimezoneMinute => {
+            let off = offset.ok_or_else(|| unit_not_supported(raw, ty))?;
+            match unit {
+                DateUnit::Timezone => f64::from(off),
+                DateUnit::TimezoneHour => f64::from(off / 3600),
+                _ => f64::from((off % 3600) / 60),
+            }
+        }
+    })
+}
+
+/// The shared body of all three `date_part` overloads. `reading` turns one
+/// row's stored value into `(local reading, UTC offset if any, epoch
+/// micros)`.
+fn eval_date_part_rows(
+    units: &ArrayRef,
+    len: usize,
+    is_null: impl Fn(usize) -> bool,
+    reading: impl Fn(usize) -> Result<(NaiveDateTime, Option<i32>, i64), ExecError>,
+    ty: &str,
+) -> Result<ArrayRef, ExecError> {
+    let u = downcast_array::<StringArray>(units, "text")?;
+    let mut out: Vec<Option<f64>> = Vec::with_capacity(len);
+    for i in 0..len {
+        if u.is_null(i) || is_null(i) {
+            out.push(None);
+            continue;
+        }
+        let raw = u.value(i);
+        let unit = parse_date_unit(raw).ok_or_else(|| unit_not_recognized(raw, ty))?;
+        let (local, offset, epoch_micros) = reading(i)?;
+        out.push(Some(date_part_of(
+            unit,
+            raw,
+            local,
+            offset,
+            epoch_micros,
+            ty,
+        )?));
+    }
+    Ok(Arc::new(Float64Array::from(out)))
+}
+
+/// `date_part(text, timestamp)` — oid 2021.
+fn eval_date_part_timestamp(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let v = downcast_array::<TimestampMicrosecondArray>(values, "timestamp")?.clone();
+    let n = v.len();
+    let w = v.clone();
+    eval_date_part_rows(
+        units,
+        n,
+        |i| v.is_null(i),
+        move |i| Ok((naive_from_micros(w.value(i))?, None, w.value(i))),
+        TY_TIMESTAMP,
+    )
+}
+
+/// `date_part(text, timestamptz)` — oid 1171. **Session-timezone
+/// dependent**: every field except `epoch` is read off the session-local
+/// rendering, and `timezone`/`timezone_hour`/`timezone_minute` report that
+/// rendering's UTC offset. Verified live in `Australia/Lord_Howe`, where the
+/// same instant gives `timezone = 37800` (`+10:30`) and `timezone_minute =
+/// 30` — a zone whose offset is not a whole number of hours, which is the
+/// case an implementation that stores offsets in hours gets wrong.
+fn eval_date_part_timestamptz(
+    units: &ArrayRef,
+    values: &ArrayRef,
+    session: &EvalSession,
+) -> Result<ArrayRef, ExecError> {
+    let v = downcast_array::<TimestampMicrosecondArray>(values, "timestamp with time zone")?
+        .clone();
+    let tz = session.time_zone()?;
+    let n = v.len();
+    let w = v.clone();
+    eval_date_part_rows(
+        units,
+        n,
+        |i| v.is_null(i),
+        move |i| {
+            let micros = w.value(i);
+            let utc = naive_from_micros(micros)?;
+            let offset = tz.offset_from_utc_datetime(&utc).fix().local_minus_utc();
+            Ok((
+                utc + TimeDelta::seconds(i64::from(offset)),
+                Some(offset),
+                micros,
+            ))
+        },
+        TY_TIMESTAMPTZ,
+    )
+}
+
+/// `date_part(text, date)` — oid 1384.
+///
+/// Postgres implements this by casting the `date` to a `timestamp` and
+/// reusing that path, which is visible in its error messages: an unknown unit
+/// on a `date` argument is reported against `timestamp without time zone`,
+/// not against `date`. That is reproduced here rather than corrected.
+fn eval_date_part_date(units: &ArrayRef, values: &ArrayRef) -> Result<ArrayRef, ExecError> {
+    let v = downcast_array::<Date32Array>(values, "date")?.clone();
+    let n = v.len();
+    let w = v.clone();
+    eval_date_part_rows(
+        units,
+        n,
+        |i| v.is_null(i),
+        move |i| {
+            let micros = i64::from(w.value(i)) * 86_400 * 1_000_000;
+            Ok((naive_from_micros(micros)?, None, micros))
+        },
+        TY_TIMESTAMP,
+    )
+}
+
 /// Evaluate one argument of a `VARIADIC "any"` function and materialize it
 /// as text. `"any"` means the argument arrives at whatever type it was
 /// written as, so arrow's `cast` kernel does the numeric/bool/date rendering
@@ -2253,9 +3149,10 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 fn eval_as_text(
     arg: &Expr,
     batch: &RecordBatch,
+    session: &EvalSession,
     what: &'static str,
 ) -> Result<StringArray, ExecError> {
-    let v = eval(arg, batch)?;
+    let v = eval_with(arg, batch, session)?;
     let v: ArrayRef = if v.data_type() == &DataType::Utf8 {
         v
     } else {
@@ -2271,11 +3168,12 @@ fn eval_as_text(
 /// live PostgreSQL 18: `concat('a', NULL, 'b') = 'ab'`, while
 /// `'a' || NULL || 'b'` is NULL. `concat(NULL, NULL)` is `''`, not NULL:
 /// this function never itself returns NULL.
-fn eval_concat(args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
+fn eval_concat(args: &[Expr], batch: &RecordBatch,
+    session: &EvalSession) -> Result<ArrayRef, ExecError> {
     let n = batch.num_rows();
     let mut cols: Vec<StringArray> = Vec::with_capacity(args.len());
     for arg in args {
-        cols.push(eval_as_text(arg, batch, "CONCAT")?);
+        cols.push(eval_as_text(arg, batch, session, "CONCAT")?);
     }
     let out: StringArray = (0..n)
         .map(|i| {
@@ -2309,7 +3207,8 @@ fn eval_concat(args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError
 /// skipped value contributes no separator either, so the separator lands
 /// *between surviving values only* — which is why this cannot be written as
 /// [`eval_concat`] with a separator interleaved up front.
-fn eval_concat_ws(args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
+fn eval_concat_ws(args: &[Expr], batch: &RecordBatch,
+    session: &EvalSession) -> Result<ArrayRef, ExecError> {
     let n = batch.num_rows();
     let sep_expr = args.first().ok_or_else(|| {
         ExecError::Internal(
@@ -2318,11 +3217,11 @@ fn eval_concat_ws(args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecEr
                 .to_string(),
         )
     })?;
-    let sep = eval_as_text(sep_expr, batch, "CONCAT_WS")?;
+    let sep = eval_as_text(sep_expr, batch, session, "CONCAT_WS")?;
 
     let mut cols: Vec<StringArray> = Vec::with_capacity(args.len().saturating_sub(1));
     for arg in &args[1..] {
-        cols.push(eval_as_text(arg, batch, "CONCAT_WS")?);
+        cols.push(eval_as_text(arg, batch, session, "CONCAT_WS")?);
     }
 
     let out: StringArray = (0..n)
@@ -6204,4 +7103,982 @@ mod tests {
             other => panic!("expected Internal (unimplemented), got {other:?}"),
         }
     }
+
+    // ─── date_trunc / date_part, and the session context they need ──────
+    //
+    // Every expected value in this section was produced by a live
+    // PostgreSQL 18.2 and is pasted here verbatim — never computed by this
+    // file, and never recalled. The generating query, per row, was
+    //
+    // ```sql
+    // SET TimeZone TO '<zone>';
+    // SELECT (extract(epoch from date_trunc('<unit>', '<instant>'::timestamptz))
+    //         * 1000000)::bigint;
+    // ```
+    //
+    // and the `date_part` rows are the same shape with `date_part` and no
+    // scaling. Zones are the three the differential battery
+    // (`tests/orphan_functions.rs`) runs these functions under: `UTC`,
+    // `America/New_York` (a whole-hour DST step) and
+    // `Australia/Lord_Howe` (a **half-hour** DST step, from `+10:30` to
+    // `+11:00`). Instants include both 2024 US transitions and both 2024
+    // Lord Howe transitions.
+
+    fn ts_batch(dt: DataType, micros: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", dt.clone(), true)]));
+        let arr: ArrayRef = match &dt {
+            DataType::Timestamp(_, Some(tz)) => Arc::new(
+                TimestampMicrosecondArray::from(vec![Some(micros)]).with_timezone(tz.clone()),
+            ),
+            _ => Arc::new(TimestampMicrosecondArray::from(vec![Some(micros)])),
+        };
+        RecordBatch::try_new(schema, vec![arr]).unwrap()
+    }
+
+    fn tstz_batch(micros: i64) -> RecordBatch {
+        ts_batch(
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            micros,
+        )
+    }
+
+    fn plain_ts_batch(micros: i64) -> RecordBatch {
+        ts_batch(
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            micros,
+        )
+    }
+
+    fn ts_micros(v: &ArrayRef) -> i64 {
+        v.as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("date_trunc must produce a timestamp")
+            .value(0)
+    }
+
+    fn f64_at0(v: &ArrayRef) -> f64 {
+        v.as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("date_part must produce double precision")
+            .value(0)
+    }
+
+    /// `date_trunc(text, timestamptz)` (oid 1217) in three session zones,
+    /// across both 2024 DST transitions in each — the case that was
+    /// previously unimplementable because `eval()` had no session at all.
+    #[test]
+    fn date_trunc_timestamptz_matches_postgres_in_every_session_zone() {
+        const CASES: &[(&str, i64, &str, i64)] = &[
+        ("UTC", 0, "microseconds", 0),
+        ("UTC", 0, "milliseconds", 0),
+        ("UTC", 0, "second", 0),
+        ("UTC", 0, "minute", 0),
+        ("UTC", 0, "hour", 0),
+        ("UTC", 0, "day", 0),
+        ("UTC", 0, "week", -259200000000),
+        ("UTC", 0, "month", 0),
+        ("UTC", 0, "quarter", 0),
+        ("UTC", 0, "year", 0),
+        ("UTC", 0, "decade", 0),
+        ("UTC", 0, "century", -2177452800000000),
+        ("UTC", 0, "millennium", -30578688000000000),
+        ("UTC", 1710052200000000, "microseconds", 1710052200000000),
+        ("UTC", 1710052200000000, "milliseconds", 1710052200000000),
+        ("UTC", 1710052200000000, "second", 1710052200000000),
+        ("UTC", 1710052200000000, "minute", 1710052200000000),
+        ("UTC", 1710052200000000, "hour", 1710050400000000),
+        ("UTC", 1710052200000000, "day", 1710028800000000),
+        ("UTC", 1710052200000000, "week", 1709510400000000),
+        ("UTC", 1710052200000000, "month", 1709251200000000),
+        ("UTC", 1710052200000000, "quarter", 1704067200000000),
+        ("UTC", 1710052200000000, "year", 1704067200000000),
+        ("UTC", 1710052200000000, "decade", 1577836800000000),
+        ("UTC", 1710052200000000, "century", 978307200000000),
+        ("UTC", 1710052200000000, "millennium", 978307200000000),
+        ("UTC", 1730611800000000, "microseconds", 1730611800000000),
+        ("UTC", 1730611800000000, "milliseconds", 1730611800000000),
+        ("UTC", 1730611800000000, "second", 1730611800000000),
+        ("UTC", 1730611800000000, "minute", 1730611800000000),
+        ("UTC", 1730611800000000, "hour", 1730610000000000),
+        ("UTC", 1730611800000000, "day", 1730592000000000),
+        ("UTC", 1730611800000000, "week", 1730073600000000),
+        ("UTC", 1730611800000000, "month", 1730419200000000),
+        ("UTC", 1730611800000000, "quarter", 1727740800000000),
+        ("UTC", 1730611800000000, "year", 1704067200000000),
+        ("UTC", 1730611800000000, "decade", 1577836800000000),
+        ("UTC", 1730611800000000, "century", 978307200000000),
+        ("UTC", 1730611800000000, "millennium", 978307200000000),
+        ("UTC", 1719835200000000, "microseconds", 1719835200000000),
+        ("UTC", 1719835200000000, "milliseconds", 1719835200000000),
+        ("UTC", 1719835200000000, "second", 1719835200000000),
+        ("UTC", 1719835200000000, "minute", 1719835200000000),
+        ("UTC", 1719835200000000, "hour", 1719835200000000),
+        ("UTC", 1719835200000000, "day", 1719792000000000),
+        ("UTC", 1719835200000000, "week", 1719792000000000),
+        ("UTC", 1719835200000000, "month", 1719792000000000),
+        ("UTC", 1719835200000000, "quarter", 1719792000000000),
+        ("UTC", 1719835200000000, "year", 1704067200000000),
+        ("UTC", 1719835200000000, "decade", 1577836800000000),
+        ("UTC", 1719835200000000, "century", 978307200000000),
+        ("UTC", 1719835200000000, "millennium", 978307200000000),
+        ("UTC", 1712415600000000, "microseconds", 1712415600000000),
+        ("UTC", 1712415600000000, "milliseconds", 1712415600000000),
+        ("UTC", 1712415600000000, "second", 1712415600000000),
+        ("UTC", 1712415600000000, "minute", 1712415600000000),
+        ("UTC", 1712415600000000, "hour", 1712415600000000),
+        ("UTC", 1712415600000000, "day", 1712361600000000),
+        ("UTC", 1712415600000000, "week", 1711929600000000),
+        ("UTC", 1712415600000000, "month", 1711929600000000),
+        ("UTC", 1712415600000000, "quarter", 1711929600000000),
+        ("UTC", 1712415600000000, "year", 1704067200000000),
+        ("UTC", 1712415600000000, "decade", 1577836800000000),
+        ("UTC", 1712415600000000, "century", 978307200000000),
+        ("UTC", 1712415600000000, "millennium", 978307200000000),
+        ("UTC", 1728142800000000, "microseconds", 1728142800000000),
+        ("UTC", 1728142800000000, "milliseconds", 1728142800000000),
+        ("UTC", 1728142800000000, "second", 1728142800000000),
+        ("UTC", 1728142800000000, "minute", 1728142800000000),
+        ("UTC", 1728142800000000, "hour", 1728140400000000),
+        ("UTC", 1728142800000000, "day", 1728086400000000),
+        ("UTC", 1728142800000000, "week", 1727654400000000),
+        ("UTC", 1728142800000000, "month", 1727740800000000),
+        ("UTC", 1728142800000000, "quarter", 1727740800000000),
+        ("UTC", 1728142800000000, "year", 1704067200000000),
+        ("UTC", 1728142800000000, "decade", 1577836800000000),
+        ("UTC", 1728142800000000, "century", 978307200000000),
+        ("UTC", 1728142800000000, "millennium", 978307200000000),
+        ("America/New_York", 0, "microseconds", 0),
+        ("America/New_York", 0, "milliseconds", 0),
+        ("America/New_York", 0, "second", 0),
+        ("America/New_York", 0, "minute", 0),
+        ("America/New_York", 0, "hour", 0),
+        ("America/New_York", 0, "day", -68400000000),
+        ("America/New_York", 0, "week", -241200000000),
+        ("America/New_York", 0, "month", -2660400000000),
+        ("America/New_York", 0, "quarter", -7934400000000),
+        ("America/New_York", 0, "year", -31518000000000),
+        ("America/New_York", 0, "decade", -315601200000000),
+        ("America/New_York", 0, "century", -2177434800000000),
+        ("America/New_York", 0, "millennium", -30578670238000000),
+        ("America/New_York", 1710052200000000, "microseconds", 1710052200000000),
+        ("America/New_York", 1710052200000000, "milliseconds", 1710052200000000),
+        ("America/New_York", 1710052200000000, "second", 1710052200000000),
+        ("America/New_York", 1710052200000000, "minute", 1710052200000000),
+        ("America/New_York", 1710052200000000, "hour", 1710050400000000),
+        ("America/New_York", 1710052200000000, "day", 1710046800000000),
+        ("America/New_York", 1710052200000000, "week", 1709528400000000),
+        ("America/New_York", 1710052200000000, "month", 1709269200000000),
+        ("America/New_York", 1710052200000000, "quarter", 1704085200000000),
+        ("America/New_York", 1710052200000000, "year", 1704085200000000),
+        ("America/New_York", 1710052200000000, "decade", 1577854800000000),
+        ("America/New_York", 1710052200000000, "century", 978325200000000),
+        ("America/New_York", 1710052200000000, "millennium", 978325200000000),
+        ("America/New_York", 1730611800000000, "microseconds", 1730611800000000),
+        ("America/New_York", 1730611800000000, "milliseconds", 1730611800000000),
+        ("America/New_York", 1730611800000000, "second", 1730611800000000),
+        ("America/New_York", 1730611800000000, "minute", 1730611800000000),
+        ("America/New_York", 1730611800000000, "hour", 1730610000000000),
+        ("America/New_York", 1730611800000000, "day", 1730606400000000),
+        ("America/New_York", 1730611800000000, "week", 1730088000000000),
+        ("America/New_York", 1730611800000000, "month", 1730433600000000),
+        ("America/New_York", 1730611800000000, "quarter", 1727755200000000),
+        ("America/New_York", 1730611800000000, "year", 1704085200000000),
+        ("America/New_York", 1730611800000000, "decade", 1577854800000000),
+        ("America/New_York", 1730611800000000, "century", 978325200000000),
+        ("America/New_York", 1730611800000000, "millennium", 978325200000000),
+        ("America/New_York", 1719835200000000, "microseconds", 1719835200000000),
+        ("America/New_York", 1719835200000000, "milliseconds", 1719835200000000),
+        ("America/New_York", 1719835200000000, "second", 1719835200000000),
+        ("America/New_York", 1719835200000000, "minute", 1719835200000000),
+        ("America/New_York", 1719835200000000, "hour", 1719835200000000),
+        ("America/New_York", 1719835200000000, "day", 1719806400000000),
+        ("America/New_York", 1719835200000000, "week", 1719806400000000),
+        ("America/New_York", 1719835200000000, "month", 1719806400000000),
+        ("America/New_York", 1719835200000000, "quarter", 1719806400000000),
+        ("America/New_York", 1719835200000000, "year", 1704085200000000),
+        ("America/New_York", 1719835200000000, "decade", 1577854800000000),
+        ("America/New_York", 1719835200000000, "century", 978325200000000),
+        ("America/New_York", 1719835200000000, "millennium", 978325200000000),
+        ("America/New_York", 1712415600000000, "microseconds", 1712415600000000),
+        ("America/New_York", 1712415600000000, "milliseconds", 1712415600000000),
+        ("America/New_York", 1712415600000000, "second", 1712415600000000),
+        ("America/New_York", 1712415600000000, "minute", 1712415600000000),
+        ("America/New_York", 1712415600000000, "hour", 1712415600000000),
+        ("America/New_York", 1712415600000000, "day", 1712376000000000),
+        ("America/New_York", 1712415600000000, "week", 1711944000000000),
+        ("America/New_York", 1712415600000000, "month", 1711944000000000),
+        ("America/New_York", 1712415600000000, "quarter", 1711944000000000),
+        ("America/New_York", 1712415600000000, "year", 1704085200000000),
+        ("America/New_York", 1712415600000000, "decade", 1577854800000000),
+        ("America/New_York", 1712415600000000, "century", 978325200000000),
+        ("America/New_York", 1712415600000000, "millennium", 978325200000000),
+        ("America/New_York", 1728142800000000, "microseconds", 1728142800000000),
+        ("America/New_York", 1728142800000000, "milliseconds", 1728142800000000),
+        ("America/New_York", 1728142800000000, "second", 1728142800000000),
+        ("America/New_York", 1728142800000000, "minute", 1728142800000000),
+        ("America/New_York", 1728142800000000, "hour", 1728140400000000),
+        ("America/New_York", 1728142800000000, "day", 1728100800000000),
+        ("America/New_York", 1728142800000000, "week", 1727668800000000),
+        ("America/New_York", 1728142800000000, "month", 1727755200000000),
+        ("America/New_York", 1728142800000000, "quarter", 1727755200000000),
+        ("America/New_York", 1728142800000000, "year", 1704085200000000),
+        ("America/New_York", 1728142800000000, "decade", 1577854800000000),
+        ("America/New_York", 1728142800000000, "century", 978325200000000),
+        ("America/New_York", 1728142800000000, "millennium", 978325200000000),
+        ("Australia/Lord_Howe", 0, "microseconds", 0),
+        ("Australia/Lord_Howe", 0, "milliseconds", 0),
+        ("Australia/Lord_Howe", 0, "second", 0),
+        ("Australia/Lord_Howe", 0, "minute", 0),
+        ("Australia/Lord_Howe", 0, "hour", 0),
+        ("Australia/Lord_Howe", 0, "day", -36000000000),
+        ("Australia/Lord_Howe", 0, "week", -295200000000),
+        ("Australia/Lord_Howe", 0, "month", -36000000000),
+        ("Australia/Lord_Howe", 0, "quarter", -36000000000),
+        ("Australia/Lord_Howe", 0, "year", -36000000000),
+        ("Australia/Lord_Howe", 0, "decade", -36000000000),
+        ("Australia/Lord_Howe", 0, "century", -2177488800000000),
+        ("Australia/Lord_Howe", 0, "millennium", -30578726180000000),
+        ("Australia/Lord_Howe", 1710052200000000, "microseconds", 1710052200000000),
+        ("Australia/Lord_Howe", 1710052200000000, "milliseconds", 1710052200000000),
+        ("Australia/Lord_Howe", 1710052200000000, "second", 1710052200000000),
+        ("Australia/Lord_Howe", 1710052200000000, "minute", 1710052200000000),
+        ("Australia/Lord_Howe", 1710052200000000, "hour", 1710050400000000),
+        ("Australia/Lord_Howe", 1710052200000000, "day", 1709989200000000),
+        ("Australia/Lord_Howe", 1710052200000000, "week", 1709470800000000),
+        ("Australia/Lord_Howe", 1710052200000000, "month", 1709211600000000),
+        ("Australia/Lord_Howe", 1710052200000000, "quarter", 1704027600000000),
+        ("Australia/Lord_Howe", 1710052200000000, "year", 1704027600000000),
+        ("Australia/Lord_Howe", 1710052200000000, "decade", 1577797200000000),
+        ("Australia/Lord_Howe", 1710052200000000, "century", 978267600000000),
+        ("Australia/Lord_Howe", 1710052200000000, "millennium", 978267600000000),
+        ("Australia/Lord_Howe", 1730611800000000, "microseconds", 1730611800000000),
+        ("Australia/Lord_Howe", 1730611800000000, "milliseconds", 1730611800000000),
+        ("Australia/Lord_Howe", 1730611800000000, "second", 1730611800000000),
+        ("Australia/Lord_Howe", 1730611800000000, "minute", 1730611800000000),
+        ("Australia/Lord_Howe", 1730611800000000, "hour", 1730610000000000),
+        ("Australia/Lord_Howe", 1730611800000000, "day", 1730552400000000),
+        ("Australia/Lord_Howe", 1730611800000000, "week", 1730034000000000),
+        ("Australia/Lord_Howe", 1730611800000000, "month", 1730379600000000),
+        ("Australia/Lord_Howe", 1730611800000000, "quarter", 1727703000000000),
+        ("Australia/Lord_Howe", 1730611800000000, "year", 1704027600000000),
+        ("Australia/Lord_Howe", 1730611800000000, "decade", 1577797200000000),
+        ("Australia/Lord_Howe", 1730611800000000, "century", 978267600000000),
+        ("Australia/Lord_Howe", 1730611800000000, "millennium", 978267600000000),
+        ("Australia/Lord_Howe", 1719835200000000, "microseconds", 1719835200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "milliseconds", 1719835200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "second", 1719835200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "minute", 1719835200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "hour", 1719833400000000),
+        ("Australia/Lord_Howe", 1719835200000000, "day", 1719754200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "week", 1719754200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "month", 1719754200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "quarter", 1719754200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "year", 1704027600000000),
+        ("Australia/Lord_Howe", 1719835200000000, "decade", 1577797200000000),
+        ("Australia/Lord_Howe", 1719835200000000, "century", 978267600000000),
+        ("Australia/Lord_Howe", 1719835200000000, "millennium", 978267600000000),
+        ("Australia/Lord_Howe", 1712415600000000, "microseconds", 1712415600000000),
+        ("Australia/Lord_Howe", 1712415600000000, "milliseconds", 1712415600000000),
+        ("Australia/Lord_Howe", 1712415600000000, "second", 1712415600000000),
+        ("Australia/Lord_Howe", 1712415600000000, "minute", 1712415600000000),
+        ("Australia/Lord_Howe", 1712415600000000, "hour", 1712413800000000),
+        ("Australia/Lord_Howe", 1712415600000000, "day", 1712408400000000),
+        ("Australia/Lord_Howe", 1712415600000000, "week", 1711890000000000),
+        ("Australia/Lord_Howe", 1712415600000000, "month", 1711890000000000),
+        ("Australia/Lord_Howe", 1712415600000000, "quarter", 1711890000000000),
+        ("Australia/Lord_Howe", 1712415600000000, "year", 1704027600000000),
+        ("Australia/Lord_Howe", 1712415600000000, "decade", 1577797200000000),
+        ("Australia/Lord_Howe", 1712415600000000, "century", 978267600000000),
+        ("Australia/Lord_Howe", 1712415600000000, "millennium", 978267600000000),
+        ("Australia/Lord_Howe", 1728142800000000, "microseconds", 1728142800000000),
+        ("Australia/Lord_Howe", 1728142800000000, "milliseconds", 1728142800000000),
+        ("Australia/Lord_Howe", 1728142800000000, "second", 1728142800000000),
+        ("Australia/Lord_Howe", 1728142800000000, "minute", 1728142800000000),
+        ("Australia/Lord_Howe", 1728142800000000, "hour", 1728140400000000),
+        ("Australia/Lord_Howe", 1728142800000000, "day", 1728135000000000),
+        ("Australia/Lord_Howe", 1728142800000000, "week", 1727616600000000),
+        ("Australia/Lord_Howe", 1728142800000000, "month", 1727703000000000),
+        ("Australia/Lord_Howe", 1728142800000000, "quarter", 1727703000000000),
+        ("Australia/Lord_Howe", 1728142800000000, "year", 1704027600000000),
+        ("Australia/Lord_Howe", 1728142800000000, "decade", 1577797200000000),
+        ("Australia/Lord_Howe", 1728142800000000, "century", 978267600000000),
+        ("Australia/Lord_Howe", 1728142800000000, "millennium", 978267600000000),
+        ];
+        for (zone, input, unit, expected) in CASES {
+            let session = EvalSession::with_time_zone(*zone);
+            let batch = tstz_batch(*input);
+            let expr = sf(
+                OID_DATE_TRUNC_TIMESTAMPTZ,
+                vec![lit_text(unit), col(0, "v")],
+            );
+            let got = eval_with(&expr, &batch, &session).unwrap();
+            assert_eq!(
+                ts_micros(&got),
+                *expected,
+                "date_trunc('{unit}', {input}) under TimeZone={zone}"
+            );
+        }
+    }
+
+    /// The result of `date_trunc` on a `timestamptz` must stay a
+    /// `timestamptz`. Arrow encodes that as the timestamp's zone marker, and
+    /// dropping it would silently demote the value to `timestamp without
+    /// time zone` — a type error the planner would not catch because the
+    /// physical width is identical.
+    #[test]
+    fn date_trunc_timestamptz_keeps_the_timestamptz_marker() {
+        let batch = tstz_batch(1_710_052_200_000_000);
+        let expr = sf(OID_DATE_TRUNC_TIMESTAMPTZ, vec![lit_text("day"), col(0, "v")]);
+        let got = eval_with(&expr, &batch, &EvalSession::with_time_zone("UTC")).unwrap();
+        assert_eq!(
+            got.data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+    }
+
+    /// The half-hour DST step, spelled out. `Australia/Lord_Howe` moves from
+    /// `+11:00` to `+10:30` at `2024-04-06 15:00:00+00`, and this instant is
+    /// the first one after it — so the input's own offset (`+10:30`) and the
+    /// offset of the truncated local time (`+11:00`) differ by exactly the
+    /// 30-minute step.
+    ///
+    /// `hour` keeps the input's offset, `day` re-derives it. Both numbers
+    /// below are the live server's; between them they pin the
+    /// [`unit_redetermines_zone`] rule, which is the one thing here that a
+    /// plausible implementation gets wrong in a way no UTC test can see.
+    #[test]
+    fn lord_howe_half_hour_dst_step_distinguishes_hour_from_day() {
+        let session = EvalSession::with_time_zone("Australia/Lord_Howe");
+        let batch = tstz_batch(1_712_415_600_000_000); // 2024-04-06 15:00:00+00
+        let trunc = |unit: &str| {
+            let expr = sf(OID_DATE_TRUNC_TIMESTAMPTZ, vec![lit_text(unit), col(0, "v")]);
+            ts_micros(&eval_with(&expr, &batch, &session).unwrap())
+        };
+        // 2024-04-07 01:30:00+11 (= 2024-04-06 14:30:00Z) — local 01:30
+        // truncated to 01:00, with the input's own +10:30 re-attached, lands
+        // back inside +11:00 and so renders with non-zero minutes despite
+        // the unit being `hour`. Re-deriving the offset here would give
+        // 14:00Z instead, half an hour out.
+        assert_eq!(trunc("hour"), 1_712_413_800_000_000);
+        // 2024-04-07 00:00:00+11 (= 2024-04-06 13:00:00Z) — offset
+        // re-derived from the truncated local midnight.
+        assert_eq!(trunc("day"), 1_712_408_400_000_000);
+    }
+
+    /// The same instant under three zones must give three different answers.
+    /// If the session context were ignored (or hard-coded to UTC), these
+    /// would all be equal — which is exactly the silent wrong answer the
+    /// context exists to prevent.
+    #[test]
+    fn the_session_zone_actually_changes_the_answer() {
+        let batch = tstz_batch(1_710_052_200_000_000); // 2024-03-10 06:30:00+00
+        let day = |zone: &str| {
+            let expr = sf(OID_DATE_TRUNC_TIMESTAMPTZ, vec![lit_text("day"), col(0, "v")]);
+            ts_micros(&eval_with(&expr, &batch, &EvalSession::with_time_zone(zone)).unwrap())
+        };
+        let utc = day("UTC");
+        let ny = day("America/New_York");
+        let lh = day("Australia/Lord_Howe");
+        assert_ne!(utc, ny);
+        assert_ne!(utc, lh);
+        assert_ne!(ny, lh);
+    }
+
+    /// `date_part(text, timestamptz)` (oid 1171) in the same three zones.
+    /// Includes `timezone`/`timezone_hour`/`timezone_minute`, whose answers
+    /// are the session offset itself — `37800`/`10`/`30` in Lord Howe, the
+    /// case a zone-offset-in-whole-hours implementation gets wrong.
+    #[test]
+    fn date_part_timestamptz_matches_postgres_in_every_session_zone() {
+        const CASES: &[(&str, i64, &str, f64)] = &[
+        ("UTC", 1710052200000000, "epoch", 1710052200.0),
+        ("UTC", 1710052200000000, "year", 2024.0),
+        ("UTC", 1710052200000000, "isoyear", 2024.0),
+        ("UTC", 1710052200000000, "quarter", 1.0),
+        ("UTC", 1710052200000000, "month", 3.0),
+        ("UTC", 1710052200000000, "week", 10.0),
+        ("UTC", 1710052200000000, "day", 10.0),
+        ("UTC", 1710052200000000, "doy", 70.0),
+        ("UTC", 1710052200000000, "dow", 0.0),
+        ("UTC", 1710052200000000, "isodow", 7.0),
+        ("UTC", 1710052200000000, "hour", 6.0),
+        ("UTC", 1710052200000000, "minute", 30.0),
+        ("UTC", 1710052200000000, "second", 0.0),
+        ("UTC", 1710052200000000, "milliseconds", 0.0),
+        ("UTC", 1710052200000000, "microseconds", 0.0),
+        ("UTC", 1710052200000000, "julian", 2460380.2708333335),
+        ("UTC", 1710052200000000, "timezone", 0.0),
+        ("UTC", 1710052200000000, "timezone_hour", 0.0),
+        ("UTC", 1710052200000000, "timezone_minute", 0.0),
+        ("UTC", 1710052200000000, "decade", 202.0),
+        ("UTC", 1710052200000000, "century", 21.0),
+        ("UTC", 1710052200000000, "millennium", 3.0),
+        ("UTC", 1712415600000000, "epoch", 1712415600.0),
+        ("UTC", 1712415600000000, "year", 2024.0),
+        ("UTC", 1712415600000000, "isoyear", 2024.0),
+        ("UTC", 1712415600000000, "quarter", 2.0),
+        ("UTC", 1712415600000000, "month", 4.0),
+        ("UTC", 1712415600000000, "week", 14.0),
+        ("UTC", 1712415600000000, "day", 6.0),
+        ("UTC", 1712415600000000, "doy", 97.0),
+        ("UTC", 1712415600000000, "dow", 6.0),
+        ("UTC", 1712415600000000, "isodow", 6.0),
+        ("UTC", 1712415600000000, "hour", 15.0),
+        ("UTC", 1712415600000000, "minute", 0.0),
+        ("UTC", 1712415600000000, "second", 0.0),
+        ("UTC", 1712415600000000, "milliseconds", 0.0),
+        ("UTC", 1712415600000000, "microseconds", 0.0),
+        ("UTC", 1712415600000000, "julian", 2460407.625),
+        ("UTC", 1712415600000000, "timezone", 0.0),
+        ("UTC", 1712415600000000, "timezone_hour", 0.0),
+        ("UTC", 1712415600000000, "timezone_minute", 0.0),
+        ("UTC", 1712415600000000, "decade", 202.0),
+        ("UTC", 1712415600000000, "century", 21.0),
+        ("UTC", 1712415600000000, "millennium", 3.0),
+        ("UTC", 0, "epoch", 0.0),
+        ("UTC", 0, "year", 1970.0),
+        ("UTC", 0, "isoyear", 1970.0),
+        ("UTC", 0, "quarter", 1.0),
+        ("UTC", 0, "month", 1.0),
+        ("UTC", 0, "week", 1.0),
+        ("UTC", 0, "day", 1.0),
+        ("UTC", 0, "doy", 1.0),
+        ("UTC", 0, "dow", 4.0),
+        ("UTC", 0, "isodow", 4.0),
+        ("UTC", 0, "hour", 0.0),
+        ("UTC", 0, "minute", 0.0),
+        ("UTC", 0, "second", 0.0),
+        ("UTC", 0, "milliseconds", 0.0),
+        ("UTC", 0, "microseconds", 0.0),
+        ("UTC", 0, "julian", 2440588.0),
+        ("UTC", 0, "timezone", 0.0),
+        ("UTC", 0, "timezone_hour", 0.0),
+        ("UTC", 0, "timezone_minute", 0.0),
+        ("UTC", 0, "decade", 197.0),
+        ("UTC", 0, "century", 20.0),
+        ("UTC", 0, "millennium", 2.0),
+        ("America/New_York", 1710052200000000, "epoch", 1710052200.0),
+        ("America/New_York", 1710052200000000, "year", 2024.0),
+        ("America/New_York", 1710052200000000, "isoyear", 2024.0),
+        ("America/New_York", 1710052200000000, "quarter", 1.0),
+        ("America/New_York", 1710052200000000, "month", 3.0),
+        ("America/New_York", 1710052200000000, "week", 10.0),
+        ("America/New_York", 1710052200000000, "day", 10.0),
+        ("America/New_York", 1710052200000000, "doy", 70.0),
+        ("America/New_York", 1710052200000000, "dow", 0.0),
+        ("America/New_York", 1710052200000000, "isodow", 7.0),
+        ("America/New_York", 1710052200000000, "hour", 1.0),
+        ("America/New_York", 1710052200000000, "minute", 30.0),
+        ("America/New_York", 1710052200000000, "second", 0.0),
+        ("America/New_York", 1710052200000000, "milliseconds", 0.0),
+        ("America/New_York", 1710052200000000, "microseconds", 0.0),
+        ("America/New_York", 1710052200000000, "julian", 2460380.0625),
+        ("America/New_York", 1710052200000000, "timezone", -18000.0),
+        ("America/New_York", 1710052200000000, "timezone_hour", -5.0),
+        ("America/New_York", 1710052200000000, "timezone_minute", 0.0),
+        ("America/New_York", 1710052200000000, "decade", 202.0),
+        ("America/New_York", 1710052200000000, "century", 21.0),
+        ("America/New_York", 1710052200000000, "millennium", 3.0),
+        ("America/New_York", 1712415600000000, "epoch", 1712415600.0),
+        ("America/New_York", 1712415600000000, "year", 2024.0),
+        ("America/New_York", 1712415600000000, "isoyear", 2024.0),
+        ("America/New_York", 1712415600000000, "quarter", 2.0),
+        ("America/New_York", 1712415600000000, "month", 4.0),
+        ("America/New_York", 1712415600000000, "week", 14.0),
+        ("America/New_York", 1712415600000000, "day", 6.0),
+        ("America/New_York", 1712415600000000, "doy", 97.0),
+        ("America/New_York", 1712415600000000, "dow", 6.0),
+        ("America/New_York", 1712415600000000, "isodow", 6.0),
+        ("America/New_York", 1712415600000000, "hour", 11.0),
+        ("America/New_York", 1712415600000000, "minute", 0.0),
+        ("America/New_York", 1712415600000000, "second", 0.0),
+        ("America/New_York", 1712415600000000, "milliseconds", 0.0),
+        ("America/New_York", 1712415600000000, "microseconds", 0.0),
+        ("America/New_York", 1712415600000000, "julian", 2460407.4583333335),
+        ("America/New_York", 1712415600000000, "timezone", -14400.0),
+        ("America/New_York", 1712415600000000, "timezone_hour", -4.0),
+        ("America/New_York", 1712415600000000, "timezone_minute", 0.0),
+        ("America/New_York", 1712415600000000, "decade", 202.0),
+        ("America/New_York", 1712415600000000, "century", 21.0),
+        ("America/New_York", 1712415600000000, "millennium", 3.0),
+        ("America/New_York", 0, "epoch", 0.0),
+        ("America/New_York", 0, "year", 1969.0),
+        ("America/New_York", 0, "isoyear", 1970.0),
+        ("America/New_York", 0, "quarter", 4.0),
+        ("America/New_York", 0, "month", 12.0),
+        ("America/New_York", 0, "week", 1.0),
+        ("America/New_York", 0, "day", 31.0),
+        ("America/New_York", 0, "doy", 365.0),
+        ("America/New_York", 0, "dow", 3.0),
+        ("America/New_York", 0, "isodow", 3.0),
+        ("America/New_York", 0, "hour", 19.0),
+        ("America/New_York", 0, "minute", 0.0),
+        ("America/New_York", 0, "second", 0.0),
+        ("America/New_York", 0, "milliseconds", 0.0),
+        ("America/New_York", 0, "microseconds", 0.0),
+        ("America/New_York", 0, "julian", 2440587.7916666665),
+        ("America/New_York", 0, "timezone", -18000.0),
+        ("America/New_York", 0, "timezone_hour", -5.0),
+        ("America/New_York", 0, "timezone_minute", 0.0),
+        ("America/New_York", 0, "decade", 196.0),
+        ("America/New_York", 0, "century", 20.0),
+        ("America/New_York", 0, "millennium", 2.0),
+        ("Australia/Lord_Howe", 1710052200000000, "epoch", 1710052200.0),
+        ("Australia/Lord_Howe", 1710052200000000, "year", 2024.0),
+        ("Australia/Lord_Howe", 1710052200000000, "isoyear", 2024.0),
+        ("Australia/Lord_Howe", 1710052200000000, "quarter", 1.0),
+        ("Australia/Lord_Howe", 1710052200000000, "month", 3.0),
+        ("Australia/Lord_Howe", 1710052200000000, "week", 10.0),
+        ("Australia/Lord_Howe", 1710052200000000, "day", 10.0),
+        ("Australia/Lord_Howe", 1710052200000000, "doy", 70.0),
+        ("Australia/Lord_Howe", 1710052200000000, "dow", 0.0),
+        ("Australia/Lord_Howe", 1710052200000000, "isodow", 7.0),
+        ("Australia/Lord_Howe", 1710052200000000, "hour", 17.0),
+        ("Australia/Lord_Howe", 1710052200000000, "minute", 30.0),
+        ("Australia/Lord_Howe", 1710052200000000, "second", 0.0),
+        ("Australia/Lord_Howe", 1710052200000000, "milliseconds", 0.0),
+        ("Australia/Lord_Howe", 1710052200000000, "microseconds", 0.0),
+        ("Australia/Lord_Howe", 1710052200000000, "julian", 2460380.7291666665),
+        ("Australia/Lord_Howe", 1710052200000000, "timezone", 39600.0),
+        ("Australia/Lord_Howe", 1710052200000000, "timezone_hour", 11.0),
+        ("Australia/Lord_Howe", 1710052200000000, "timezone_minute", 0.0),
+        ("Australia/Lord_Howe", 1710052200000000, "decade", 202.0),
+        ("Australia/Lord_Howe", 1710052200000000, "century", 21.0),
+        ("Australia/Lord_Howe", 1710052200000000, "millennium", 3.0),
+        ("Australia/Lord_Howe", 1712415600000000, "epoch", 1712415600.0),
+        ("Australia/Lord_Howe", 1712415600000000, "year", 2024.0),
+        ("Australia/Lord_Howe", 1712415600000000, "isoyear", 2024.0),
+        ("Australia/Lord_Howe", 1712415600000000, "quarter", 2.0),
+        ("Australia/Lord_Howe", 1712415600000000, "month", 4.0),
+        ("Australia/Lord_Howe", 1712415600000000, "week", 14.0),
+        ("Australia/Lord_Howe", 1712415600000000, "day", 7.0),
+        ("Australia/Lord_Howe", 1712415600000000, "doy", 98.0),
+        ("Australia/Lord_Howe", 1712415600000000, "dow", 0.0),
+        ("Australia/Lord_Howe", 1712415600000000, "isodow", 7.0),
+        ("Australia/Lord_Howe", 1712415600000000, "hour", 1.0),
+        ("Australia/Lord_Howe", 1712415600000000, "minute", 30.0),
+        ("Australia/Lord_Howe", 1712415600000000, "second", 0.0),
+        ("Australia/Lord_Howe", 1712415600000000, "milliseconds", 0.0),
+        ("Australia/Lord_Howe", 1712415600000000, "microseconds", 0.0),
+        ("Australia/Lord_Howe", 1712415600000000, "julian", 2460408.0625),
+        ("Australia/Lord_Howe", 1712415600000000, "timezone", 37800.0),
+        ("Australia/Lord_Howe", 1712415600000000, "timezone_hour", 10.0),
+        ("Australia/Lord_Howe", 1712415600000000, "timezone_minute", 30.0),
+        ("Australia/Lord_Howe", 1712415600000000, "decade", 202.0),
+        ("Australia/Lord_Howe", 1712415600000000, "century", 21.0),
+        ("Australia/Lord_Howe", 1712415600000000, "millennium", 3.0),
+        ("Australia/Lord_Howe", 0, "epoch", 0.0),
+        ("Australia/Lord_Howe", 0, "year", 1970.0),
+        ("Australia/Lord_Howe", 0, "isoyear", 1970.0),
+        ("Australia/Lord_Howe", 0, "quarter", 1.0),
+        ("Australia/Lord_Howe", 0, "month", 1.0),
+        ("Australia/Lord_Howe", 0, "week", 1.0),
+        ("Australia/Lord_Howe", 0, "day", 1.0),
+        ("Australia/Lord_Howe", 0, "doy", 1.0),
+        ("Australia/Lord_Howe", 0, "dow", 4.0),
+        ("Australia/Lord_Howe", 0, "isodow", 4.0),
+        ("Australia/Lord_Howe", 0, "hour", 10.0),
+        ("Australia/Lord_Howe", 0, "minute", 0.0),
+        ("Australia/Lord_Howe", 0, "second", 0.0),
+        ("Australia/Lord_Howe", 0, "milliseconds", 0.0),
+        ("Australia/Lord_Howe", 0, "microseconds", 0.0),
+        ("Australia/Lord_Howe", 0, "julian", 2440588.4166666665),
+        ("Australia/Lord_Howe", 0, "timezone", 36000.0),
+        ("Australia/Lord_Howe", 0, "timezone_hour", 10.0),
+        ("Australia/Lord_Howe", 0, "timezone_minute", 0.0),
+        ("Australia/Lord_Howe", 0, "decade", 197.0),
+        ("Australia/Lord_Howe", 0, "century", 20.0),
+        ("Australia/Lord_Howe", 0, "millennium", 2.0),
+        ];
+        for (zone, input, field, expected) in CASES {
+            let session = EvalSession::with_time_zone(*zone);
+            let batch = tstz_batch(*input);
+            let expr = sf(OID_DATE_PART_TIMESTAMPTZ, vec![lit_text(field), col(0, "v")]);
+            let got = f64_at0(&eval_with(&expr, &batch, &session).unwrap());
+            assert!(
+                (got - *expected).abs() <= expected.abs() * 1e-12 + 1e-9,
+                "date_part('{field}', {input}) under TimeZone={zone}: \
+                 basin {got}, postgres {expected}"
+            );
+        }
+    }
+
+    /// `date_trunc(text, timestamp)` (oid 2020) — no session involvement.
+    /// `0001-01-01` is in the battery because it is where Postgres's
+    /// decade/century/millennium arithmetic crosses into BC: truncating year
+    /// 1 to a decade gives astronomical year 0, which Postgres prints as
+    /// `0001-01-01 BC`.
+    #[test]
+    fn date_trunc_timestamp_matches_postgres() {
+        const CASES: &[(i64, &str, i64)] = &[
+        (1710074096789012, "microseconds", 1710074096789012),
+        (946684799999999, "microseconds", 946684799999999),
+        (-62135596800000000, "microseconds", -62135596800000000),
+        (1710074096789012, "milliseconds", 1710074096789000),
+        (946684799999999, "milliseconds", 946684799999000),
+        (-62135596800000000, "milliseconds", -62135596800000000),
+        (1710074096789012, "second", 1710074096000000),
+        (946684799999999, "second", 946684799000000),
+        (-62135596800000000, "second", -62135596800000000),
+        (1710074096789012, "minute", 1710074040000000),
+        (946684799999999, "minute", 946684740000000),
+        (-62135596800000000, "minute", -62135596800000000),
+        (1710074096789012, "hour", 1710072000000000),
+        (946684799999999, "hour", 946681200000000),
+        (-62135596800000000, "hour", -62135596800000000),
+        (1710074096789012, "day", 1710028800000000),
+        (946684799999999, "day", 946598400000000),
+        (-62135596800000000, "day", -62135596800000000),
+        (1710074096789012, "week", 1709510400000000),
+        (946684799999999, "week", 946252800000000),
+        (-62135596800000000, "week", -62135596800000000),
+        (1710074096789012, "month", 1709251200000000),
+        (946684799999999, "month", 944006400000000),
+        (-62135596800000000, "month", -62135596800000000),
+        (1710074096789012, "quarter", 1704067200000000),
+        (946684799999999, "quarter", 938736000000000),
+        (-62135596800000000, "quarter", -62135596800000000),
+        (1710074096789012, "year", 1704067200000000),
+        (946684799999999, "year", 915148800000000),
+        (-62135596800000000, "year", -62135596800000000),
+        (1710074096789012, "decade", 1577836800000000),
+        (946684799999999, "decade", 631152000000000),
+        (-62135596800000000, "decade", -62167219200000000),
+        (1710074096789012, "century", 978307200000000),
+        (946684799999999, "century", -2177452800000000),
+        (-62135596800000000, "century", -62135596800000000),
+        (1710074096789012, "millennium", 978307200000000),
+        (946684799999999, "millennium", -30578688000000000),
+        (-62135596800000000, "millennium", -62135596800000000),
+        ];
+        for (input, unit, expected) in CASES {
+            let batch = plain_ts_batch(*input);
+            let expr = sf(OID_DATE_TRUNC_TIMESTAMP, vec![lit_text(unit), col(0, "v")]);
+            let got = eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap();
+            assert_eq!(ts_micros(&got), *expected, "date_trunc('{unit}', {input})");
+        }
+    }
+
+    /// `date_part(text, timestamp)` (oid 2021).
+    #[test]
+    fn date_part_timestamp_matches_postgres() {
+        const CASES: &[(i64, &str, f64)] = &[
+        (1710074096789012, "epoch", 1710074096.789012),
+        (946684799999999, "epoch", 946684799.999999),
+        (1710074096789012, "year", 2024.0),
+        (946684799999999, "year", 1999.0),
+        (1710074096789012, "isoyear", 2024.0),
+        (946684799999999, "isoyear", 1999.0),
+        (1710074096789012, "quarter", 1.0),
+        (946684799999999, "quarter", 4.0),
+        (1710074096789012, "month", 3.0),
+        (946684799999999, "month", 12.0),
+        (1710074096789012, "week", 10.0),
+        (946684799999999, "week", 52.0),
+        (1710074096789012, "day", 10.0),
+        (946684799999999, "day", 31.0),
+        (1710074096789012, "doy", 70.0),
+        (946684799999999, "doy", 365.0),
+        (1710074096789012, "dow", 0.0),
+        (946684799999999, "dow", 5.0),
+        (1710074096789012, "isodow", 7.0),
+        (946684799999999, "isodow", 5.0),
+        (1710074096789012, "hour", 12.0),
+        (946684799999999, "hour", 23.0),
+        (1710074096789012, "minute", 34.0),
+        (946684799999999, "minute", 59.0),
+        (1710074096789012, "second", 56.789012),
+        (946684799999999, "second", 59.999999),
+        (1710074096789012, "milliseconds", 56789.012),
+        (946684799999999, "milliseconds", 59999.999),
+        (1710074096789012, "microseconds", 56789012.0),
+        (946684799999999, "microseconds", 59999999.0),
+        (1710074096789012, "julian", 2460380.5242683915),
+        (946684799999999, "julian", 2451545.0),
+        (1710074096789012, "decade", 202.0),
+        (946684799999999, "decade", 199.0),
+        (1710074096789012, "century", 21.0),
+        (946684799999999, "century", 20.0),
+        (1710074096789012, "millennium", 3.0),
+        (946684799999999, "millennium", 2.0),
+        ];
+        for (input, field, expected) in CASES {
+            let batch = plain_ts_batch(*input);
+            let expr = sf(OID_DATE_PART_TIMESTAMP, vec![lit_text(field), col(0, "v")]);
+            let got = f64_at0(&eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap());
+            assert!(
+                (got - *expected).abs() <= expected.abs() * 1e-12 + 1e-9,
+                "date_part('{field}', {input}): basin {got}, postgres {expected}"
+            );
+        }
+    }
+
+    /// `date_part(text, date)` (oid 1384). Postgres implements this by
+    /// casting the `date` up to a `timestamp`, so `julian` comes back whole
+    /// (a date has no time of day to contribute a fraction).
+    #[test]
+    fn date_part_date_matches_postgres() {
+        const CASES: &[(i32, &str, f64)] = &[
+        (19792, "epoch", 1710028800.0),
+        (19792, "year", 2024.0),
+        (19792, "quarter", 1.0),
+        (19792, "month", 3.0),
+        (19792, "week", 10.0),
+        (19792, "day", 10.0),
+        (19792, "doy", 70.0),
+        (19792, "dow", 0.0),
+        (19792, "isodow", 7.0),
+        (19792, "julian", 2460380.0),
+        ];
+        for (days, field, expected) in CASES {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Date32, true)]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Date32Array::from(vec![Some(*days)])) as ArrayRef],
+            )
+            .unwrap();
+            let expr = sf(OID_DATE_PART_DATE, vec![lit_text(field), col(0, "v")]);
+            let got = f64_at0(&eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap());
+            assert!(
+                (got - *expected).abs() <= expected.abs() * 1e-12 + 1e-9,
+                "date_part('{field}', date {days}): basin {got}, postgres {expected}"
+            );
+        }
+    }
+
+    /// `date_trunc(text, interval)` (oid 1218). Session-independent, and
+    /// deliberately *not* the same arithmetic as the timestamp version:
+    /// `century` on `interval '137 years 5 mons'` is `100 years`, not the
+    /// `101 years` Postgres's off-by-one century rule would give a date.
+    /// `week` is not supported for an interval at all.
+    #[test]
+    fn date_trunc_interval_matches_postgres() {
+        // interval '137 years 5 mons 17 days 04:05:06.789012'
+        const MONTHS: i32 = 137 * 12 + 5;
+        const DAYS: i32 = 17;
+        const NANOS: i64 = 14_706_789_012_000;
+        const CASES: &[(&str, i32, i32, i64)] = &[
+            ("millennium", 0, 0, 0),
+            ("century", 1200, 0, 0),
+            ("decade", 1560, 0, 0),
+            ("year", 1644, 0, 0),
+            ("quarter", 1647, 0, 0),
+            ("month", MONTHS, 0, 0),
+            ("day", MONTHS, DAYS, 0),
+            ("hour", MONTHS, DAYS, 14_400_000_000_000),
+            ("minute", MONTHS, DAYS, 14_700_000_000_000),
+            ("second", MONTHS, DAYS, 14_706_000_000_000),
+            ("milliseconds", MONTHS, DAYS, 14_706_789_000_000),
+            ("microseconds", MONTHS, DAYS, NANOS),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
+            true,
+        )]));
+        for (unit, m, d, n) in CASES {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(IntervalMonthDayNanoArray::from(vec![Some(
+                    IntervalMonthDayNano::new(MONTHS, DAYS, NANOS),
+                )])) as ArrayRef],
+            )
+            .unwrap();
+            let expr = sf(OID_DATE_TRUNC_INTERVAL, vec![lit_text(unit), col(0, "v")]);
+            let got = eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap();
+            let iv = got
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .expect("date_trunc on an interval must produce an interval")
+                .value(0);
+            assert_eq!(
+                (iv.months, iv.days, iv.nanoseconds),
+                (*m, *d, *n),
+                "date_trunc('{unit}', interval)"
+            );
+        }
+        // `week` is recognized but not supported for an interval.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(IntervalMonthDayNanoArray::from(vec![Some(
+                IntervalMonthDayNano::new(MONTHS, DAYS, NANOS),
+            )])) as ArrayRef],
+        )
+        .unwrap();
+        let expr = sf(OID_DATE_TRUNC_INTERVAL, vec![lit_text("week"), col(0, "v")]);
+        let err = eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "type mismatch: unit \"week\" not supported for type interval"
+        );
+    }
+
+    /// Postgres's two *different* rejections, both reproduced verbatim. The
+    /// distinction matters: a unit can be unknown ("not recognized") or known
+    /// but meaningless for the argument type ("not supported"), and a single
+    /// catch-all message would agree with Postgres on neither. `' day '` is
+    /// in here because Postgres does **not** trim — a `trim()` in the unit
+    /// parser would turn this error into a wrong success.
+    #[test]
+    fn unit_errors_match_postgres_word_for_word() {
+        let cases: &[(&str, u32, &str)] = &[
+            (
+                "fortnight",
+                OID_DATE_TRUNC_TIMESTAMP,
+                "type mismatch: unit \"fortnight\" not recognized for type timestamp without time zone",
+            ),
+            (
+                " day ",
+                OID_DATE_TRUNC_TIMESTAMP,
+                "type mismatch: unit \" day \" not recognized for type timestamp without time zone",
+            ),
+            (
+                "",
+                OID_DATE_TRUNC_TIMESTAMP,
+                "type mismatch: unit \"\" not recognized for type timestamp without time zone",
+            ),
+            (
+                "epoch",
+                OID_DATE_TRUNC_TIMESTAMP,
+                "type mismatch: unit \"epoch\" not recognized for type timestamp without time zone",
+            ),
+            (
+                "timezone",
+                OID_DATE_TRUNC_TIMESTAMP,
+                "type mismatch: unit \"timezone\" not supported for type timestamp without time zone",
+            ),
+            (
+                "timezone",
+                OID_DATE_PART_TIMESTAMP,
+                "type mismatch: unit \"timezone\" not supported for type timestamp without time zone",
+            ),
+            (
+                "fortnight",
+                OID_DATE_TRUNC_TIMESTAMPTZ,
+                "type mismatch: unit \"fortnight\" not recognized for type timestamp with time zone",
+            ),
+        ];
+        for (unit, oid, expected) in cases {
+            let batch = if *oid == OID_DATE_TRUNC_TIMESTAMPTZ {
+                tstz_batch(0)
+            } else {
+                plain_ts_batch(0)
+            };
+            let expr = sf(*oid, vec![lit_text(unit), col(0, "v")]);
+            let err = eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap_err();
+            assert_eq!(err.to_string(), *expected, "unit {unit:?} on oid {oid}");
+        }
+    }
+
+    /// `date_trunc` on a `date` argument reports its errors against
+    /// `timestamp without time zone`, because that is the type Postgres
+    /// actually evaluates after its implicit cast. Reproduced rather than
+    /// corrected.
+    #[test]
+    fn date_part_on_a_date_reports_errors_against_timestamp() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Date32, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Date32Array::from(vec![Some(19_792)])) as ArrayRef],
+        )
+        .unwrap();
+        let expr = sf(OID_DATE_PART_DATE, vec![lit_text("timezone"), col(0, "v")]);
+        let err = eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "type mismatch: unit \"timezone\" not supported for type timestamp without time zone"
+        );
+    }
+
+    /// NULL in either argument is NULL out, for every overload — Postgres's
+    /// strictness, and the thing a per-row loop most easily gets wrong by
+    /// evaluating the unit before checking the value.
+    #[test]
+    fn date_trunc_and_date_part_are_strict() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>])) as ArrayRef],
+        )
+        .unwrap();
+        for oid in [OID_DATE_TRUNC_TIMESTAMP, OID_DATE_PART_TIMESTAMP] {
+            let expr = sf(oid, vec![lit_text("day"), col(0, "v")]);
+            let got = eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap();
+            assert!(got.is_null(0), "oid {oid} must be NULL for a NULL value");
+        }
+        // A NULL *unit* with a non-NULL value is also NULL, not an error —
+        // note this means an invalid unit is never reported for a NULL row.
+        let batch = plain_ts_batch(0);
+        let expr = sf(
+            OID_DATE_TRUNC_TIMESTAMP,
+            vec![lit_text_null(), col(0, "v")],
+        );
+        let got = eval_with(&expr, &batch, &EvalSession::DEFAULT).unwrap();
+        assert!(got.is_null(0));
+    }
+
+    /// An unknown `TimeZone` is Postgres's `invalid_parameter_value`, raised
+    /// by the function that needs the zone rather than at session
+    /// construction — so a session carrying a bad zone still answers every
+    /// query that does not read it.
+    #[test]
+    fn an_unknown_session_zone_is_reported_not_guessed() {
+        let session = EvalSession::with_time_zone("Mars/Olympus_Mons");
+        let batch = tstz_batch(0);
+        let expr = sf(OID_DATE_TRUNC_TIMESTAMPTZ, vec![lit_text("day"), col(0, "v")]);
+        let err = eval_with(&expr, &batch, &session).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "type mismatch: invalid value for parameter \"TimeZone\": \"Mars/Olympus_Mons\""
+        );
+        // …but a session-independent overload is unaffected.
+        let batch = plain_ts_batch(0);
+        let expr = sf(OID_DATE_TRUNC_TIMESTAMP, vec![lit_text("day"), col(0, "v")]);
+        assert!(eval_with(&expr, &batch, &session).is_ok());
+    }
+
+    /// The default session is UTC with **no** clock, and the two-argument
+    /// [`eval`] uses it. A default that carried a wall clock would make
+    /// `now()`答 differ row to row; a default that carried a non-UTC zone
+    /// would be a guess.
+    #[test]
+    fn the_default_session_is_utc_with_no_clock() {
+        assert_eq!(EvalSession::DEFAULT.transaction_timestamp(), None);
+        assert_eq!(EvalSession::DEFAULT.statement_timestamp(), None);
+        assert_eq!(EvalSession::DEFAULT.time_zone_name(), "");
+        let batch = tstz_batch(1_710_052_200_000_000);
+        let expr = sf(OID_DATE_TRUNC_TIMESTAMPTZ, vec![lit_text("day"), col(0, "v")]);
+        assert_eq!(
+            ts_micros(&eval(&expr, &batch).unwrap()),
+            ts_micros(&eval_with(&expr, &batch, &EvalSession::with_time_zone("UTC")).unwrap())
+        );
+    }
+
+    /// A session-dependent call nested inside an expression that is not
+    /// session-dependent still sees the session. This is what
+    /// [`eval_with`]'s full threading buys: a partially-threaded context
+    /// would answer this one under the default zone.
+    #[test]
+    fn the_session_reaches_a_nested_call() {
+        let session = EvalSession::with_time_zone("Australia/Lord_Howe");
+        let batch = tstz_batch(1_712_415_600_000_000);
+        let inner = sf(OID_DATE_TRUNC_TIMESTAMPTZ, vec![lit_text("day"), col(0, "v")]);
+        let nested = Expr::Case {
+            operand: None,
+            whens: vec![(
+                Expr::Literal(Datum::Bool(true), PgType::BOOL),
+                inner.clone(),
+            )],
+            else_: None,
+        };
+        let direct = eval_with(&inner, &batch, &session).unwrap();
+        let through_case = eval_with(&nested, &batch, &session).unwrap();
+        assert_eq!(ts_micros(&direct), ts_micros(&through_case));
+        assert_eq!(ts_micros(&direct), 1_712_408_400_000_000);
+    }
+
 }

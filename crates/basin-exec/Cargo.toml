@@ -23,9 +23,21 @@ basin-plan = { workspace = true }
 basin-common = { workspace = true }
 basin-storage = { workspace = true }
 arrow = { workspace = true }
-arrow-array = { workspace = true }
+# `chrono-tz` is what makes `arrow_array::timezone::Tz` parse an IANA zone
+# name, and that is the whole of Basin's timezone database: `eval`'s session
+# context (`eval::EvalSession`) resolves `SET TimeZone TO 'Australia/
+# Lord_Howe'` through it, and `date_trunc`/`date_part` on `timestamptz` are
+# session-zone dependent (see `eval.rs`'s "Session context" docs). The
+# feature is enabled EXPLICITLY here rather than inherited: it is on today
+# only because `datafusion` happens to turn it on, and this crate must keep
+# working the day `datafusion = "53"` leaves the workspace.
+arrow-array = { workspace = true, features = ["chrono-tz"] }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
+# The calendar arithmetic behind `date_trunc`/`date_part`, and the `TimeZone`
+# trait `arrow_array::timezone::Tz` implements. Already in the graph via
+# `arrow-array`; named here because `eval.rs` calls it directly.
+chrono = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 # `storage_source` names `object_store::path::Path`: a SQL scan's file set is
