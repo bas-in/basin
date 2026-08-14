@@ -570,14 +570,23 @@ impl TableResolver for StorageTableResolver {
             opts.projection = Some(names);
             pushed.projection_applied = true;
         }
-        let translated: Vec<_> = filters
+        // Take PARTIAL pushdown rather than all-or-nothing. `filters` is a
+        // conjunct list, so pushing a SUBSET can only remove rows the full
+        // predicate would remove too, and `build.rs` re-applies every filter
+        // at the `Scan` whenever `filters_applied` is false — so a partial
+        // `opts.filters` is safe by construction, not by care.
+        //
+        // The old form assigned nothing unless every conjunct translated, and
+        // that blanked the file-level prune on the next line as well:
+        // `WHERE id = 5 AND name ILIKE 'a%'` translated `id = 5` fine, threw
+        // it away because `ILIKE` did not translate, and then opened every
+        // live file in the table. The cost was never a wrong answer, only a
+        // full scan — which is exactly why nothing caught it.
+        opts.filters = filters
             .iter()
             .filter_map(|f| expr_to_predicate(f, &entry.schema, projection))
             .collect();
-        if !filters.is_empty() && translated.len() == filters.len() {
-            opts.filters = translated;
-            pushed.filters_applied = true;
-        }
+        pushed.filters_applied = !filters.is_empty() && opts.filters.len() == filters.len();
 
         // File-level prune first, over the LIVE set only. `Storage::read` did
         // this inside `resolve_table_read_paths`; the live-paths read cannot,
@@ -1103,6 +1112,117 @@ mod tests {
             "the predicate must prune two of three files AT STORAGE, not after decode — \
              a build() that opens everything and filters Arrow-side gives the same rows \
              and throws away the scan advantage silently"
+        );
+    }
+
+    /// One untranslatable conjunct must not disable pushdown for the others.
+    ///
+    /// `expr_to_predicate` handles only `Eq`/`Gt`/`Lt`; `>=` is refused. The
+    /// pushdown used to be all-or-nothing — it assigned `opts.filters` only
+    /// when *every* conjunct translated — so a single refused conjunct left
+    /// the filter list empty, which also blanked the file-level prune that
+    /// reads it on the next line. `WHERE id > 250 AND id >= 0` opened all
+    /// three files instead of one.
+    ///
+    /// Partial pushdown is safe because the conjuncts are AND-ed (a subset can
+    /// only remove rows the whole predicate removes too) and because `build`
+    /// re-applies every filter at the `Scan` whenever `filters_applied` is
+    /// false. This test pins BOTH halves: the row set stays exact, and the
+    /// prune still happens.
+    ///
+    /// The old bug was invisible to every oracle in this program — it never
+    /// changed an answer, only how much of the table was read.
+    #[test]
+    fn one_untranslatable_conjunct_does_not_disable_pushdown_for_the_rest() {
+        use basin_plan::{ColId, ColumnRef, Datum, Expr, LogicalPlan, OpId, SnapshotId, TableId};
+
+        let dir = TempDir::new().unwrap();
+        let storage = storage_in(&dir);
+        let project = ProjectId::new();
+        let table = TableName::new("partial").unwrap();
+        rt().block_on(async {
+            for chunk in [(0i64, 100i64), (100, 200), (200, 300)] {
+                let ids: Vec<i64> = vec![chunk.0, chunk.1 - 1];
+                let names: Vec<String> = ids.iter().map(|i| format!("n{i}")).collect();
+                let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+                storage
+                    .write_batch(
+                        &project,
+                        &table,
+                        &basin_common::PartitionKey::default_key(),
+                        &batch_id_name(&ids, &name_refs),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let live = all_files_as_live(&storage, &project, &table);
+        let mut resolver = StorageTableResolver::new(storage.clone());
+        resolver.register(TableId(9), project, schema_id_name(), live);
+
+        let id_col = || {
+            Expr::Column(ColumnRef {
+                relation: 0,
+                index: 0,
+                name: "id".into(),
+            })
+        };
+        let before = storage.read_counters().snapshot();
+        let plan = LogicalPlan::Scan {
+            table: TableId(9),
+            projection: vec![ColId(0), ColId(1)],
+            filters: vec![
+                // `id > 250` — oid 413 is `>`(bigint, bigint); verified against
+                // pg_operator on the live server. (Oid 521, which a sibling
+                // test's comment calls int8 `>`, is actually `>`(integer,
+                // integer) — expr_to_predicate maps both, so that test passes
+                // for the wrong reason.)
+                Expr::Binary {
+                    op: OpId(basin_pgtype::Oid(413)),
+                    lhs: Box::new(id_col()),
+                    rhs: Box::new(Expr::Literal(Datum::Int64(250), basin_pgtype::PgType::INT8)),
+                },
+                // `id >= 0` — oid 415 is `>=`(bigint, bigint). Not in
+                // expr_to_predicate's table, so it cannot be pushed. It is
+                // true of every row, so it cannot change the answer: any row
+                // difference here is the partial pushdown dropping rows it
+                // must not.
+                Expr::Binary {
+                    op: OpId(basin_pgtype::Oid(415)),
+                    lhs: Box::new(id_col()),
+                    rhs: Box::new(Expr::Literal(Datum::Int64(0), basin_pgtype::PgType::INT8)),
+                },
+            ],
+            snapshot: SnapshotId(0),
+        };
+
+        let mut op = build::build(&plan, &resolver).unwrap();
+        let mut ids = Vec::new();
+        while let Some(b) = op.next_batch().unwrap() {
+            ids.extend(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        assert_eq!(
+            ids,
+            vec![299],
+            "the untranslatable `id >= 0` conjunct must still be applied Arrow-side, \
+             and the pushed `id > 250` must not drop a row it should keep"
+        );
+
+        let delta = storage.read_counters().snapshot().delta(&before);
+        assert_eq!(
+            delta.files_opened, 1,
+            "`id > 250` is pushable on its own and must prune two of three files even \
+             though `id >= 0` sitting beside it cannot be translated — all-or-nothing \
+             pushdown opened all three and no oracle in this program could see it"
         );
     }
 
