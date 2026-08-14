@@ -590,3 +590,71 @@ what the owned engine uses today.
 The scan-track work that remains is the DataFusion-side table providers (122
 errors) and `ExecutionPlan` nodes (89), which exist to serve the *incumbent*
 path. Those are removals, not ports.
+
+---
+
+## The dependency lattice is totally ordered — finishing the literal deps buys nothing
+
+Measured by set arithmetic over `cargo tree -p <crate> -e normal`, all v53.1.0:
+
+    three literal deps → 16 crates  ⊂  vortex-datafusion → 18  ⊂  umbrella → 31
+
+`comm -23 three.txt vdf.txt` is **empty**: the three literal deps contribute zero
+crates `vortex-datafusion` does not already pull. `comm -13 umbrella.txt vdf.txt`
+is **empty**: `vortex-datafusion` contributes zero the umbrella does not.
+
+| Action | tree 31 → |
+|---|---:|
+| delete the three literal lines | **31** (zero removed) |
+| delete `vortex-datafusion` alone | **31** (zero removed) |
+| delete `Cargo.toml:149` alone | 18 |
+| delete umbrella + three literals | 18 |
+| delete umbrella + `vortex-datafusion` + three | **0** |
+
+**So the count 4 → 0 is not a gradual path.** The only tree-moving cuts are the
+umbrella (−13) and then `vortex-datafusion` (−18). Doc 22 §5's "these
+literal-versioned direct deps **and** `vortex-datafusion`" should read
+"`vortex-datafusion`, which subsumes them" — the 18 residual crates are
+*exactly* its closure, and the literals were never responsible for any of them.
+
+### All three literals are genuinely in use — none qualifies for the `ab73dff2` treatment
+
+    datafusion-datasource      20 sites / 4 files   FileSource, FileScanConfig,
+                                                    FileOpener, TableSchema
+    datafusion-physical-expr   11 sites / 3 files   LexOrdering, PhysicalSortExpr
+    datafusion-physical-plan   14 sites / 7 files   mostly Boundedness/EmissionType
+
+Distribution corrects the guess in doc 22 §4: `-physical-plan` is spread thinly
+across the seven `ExecutionPlan` files (one site each in five of them), while
+`-datasource` and `-physical-expr` concentrate in `vortex_listing_format.rs` and
+the two surviving optimizer rules — **not** in the table providers.
+
+### A cosmetic 4 → 1 was available and was rejected
+
+The manifest comment at `basin-engine/Cargo.toml:62-64` — "they must be direct
+deps to name their types in method signatures" — is **false**. The umbrella
+re-exports `datafusion_physical_expr::*` and `datafusion_physical_plan::*`
+wholesale, and 8 of 9 `datafusion_datasource` paths resolve through
+`datafusion::datasource::*`. Only `MemorySourceConfig` has no umbrella path, and
+it appears solely in two `#[cfg(test)]` blocks.
+
+Re-routing would move the declared count from 4 to 1 and remove **zero** crates —
+while making the umbrella's removal *strictly harder*, because those 45 sites
+currently survive deletion of `Cargo.toml:149` by resolving through the literals.
+Re-routed, they break too, and the 802 grows. Not applied.
+
+Feature-trimming the umbrella to shed its 13 unique crates is also unavailable:
+`sql` is load-bearing at 41 `.sql()` call sites, and `nested_expressions` serves
+the `array_*` functions. Disabling either is a silent behaviour regression, not a
+removal.
+
+### The good news, and it is real
+
+`vortex-datafusion` is used at **8 sites in 2 files** — `vortex_listing_format.rs`
+(7) and `session.rs:3474` (1) — the legacy `ListingTable` path only. Every core
+Vortex crate `basin-storage` uses measures **0 datafusion crates** in its own
+tree, and `basin-exec/src/storage_source.rs` already consumes that path with a
+passing round-trip test.
+
+So `vortex-datafusion` is not a separate un-costed scan track. It rides with
+`session.rs` and leaves with the umbrella.
